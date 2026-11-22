@@ -1995,7 +1995,13 @@ void prewarmCuda(int durationMs) {
 }
 
 GUID getNvencPresetGuid(const std::string& encodingMode) {
-    return encodingMode == "fast" ? NV_ENC_PRESET_HP_GUID : NV_ENC_PRESET_HQ_GUID;
+    if (encodingMode == "fast") {
+        return NV_ENC_PRESET_P3_GUID;
+    }
+    if (encodingMode == "quality") {
+        return NV_ENC_PRESET_P5_GUID;
+    }
+    return NV_ENC_PRESET_P4_GUID;
 }
 
 uint32_t getNvencMaxBitrate(uint32_t bitrate, const std::string& encodingMode) {
@@ -2010,6 +2016,56 @@ uint32_t getNvencBufferSize(uint32_t bitrate, const std::string& encodingMode) {
     return static_cast<uint32_t>(
         std::min<uint64_t>(0xffffffffu, static_cast<uint64_t>(bitrate) * multiplier));
 }
+
+class H264Encoder : public NvEncoderCuda {
+public:
+    using NvEncoderCuda::NvEncoderCuda;
+
+    void initialize(int fps, uint32_t bitrate, const std::string& encodingMode) {
+        const auto width = static_cast<uint32_t>(GetEncodeWidth());
+        const auto height = static_cast<uint32_t>(GetEncodeHeight());
+        NV_ENC_INITIALIZE_PARAMS params = {NV_ENC_INITIALIZE_PARAMS_VER};
+        params.encodeGUID = NV_ENC_CODEC_H264_GUID;
+        params.presetGUID = getNvencPresetGuid(encodingMode);
+        params.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+        params.encodeWidth = params.darWidth = params.maxEncodeWidth = width;
+        params.encodeHeight = params.darHeight = params.maxEncodeHeight = height;
+        params.frameRateNum = static_cast<uint32_t>(fps);
+        params.frameRateDen = 1;
+        params.enablePTD = 1;
+        params.enableEncodeAsync = 1;
+
+        NV_ENC_PRESET_CONFIG preset = {NV_ENC_PRESET_CONFIG_VER, {NV_ENC_CONFIG_VER}};
+        NVENC_API_CALL(m_nvenc.nvEncGetEncodePresetConfigEx(
+            m_hEncoder, params.encodeGUID, params.presetGUID, params.tuningInfo, &preset));
+        auto& config = preset.presetCfg;
+        config.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+        config.gopLength = static_cast<uint32_t>(fps * 2);
+        config.frameIntervalP = 1;
+        auto& rateControl = config.rcParams;
+        rateControl.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+        rateControl.averageBitRate = bitrate;
+        rateControl.maxBitRate = getNvencMaxBitrate(bitrate, encodingMode);
+        rateControl.vbvBufferSize = getNvencBufferSize(bitrate, encodingMode);
+        rateControl.vbvInitialDelay = bitrate;
+        rateControl.enableLookahead = 0;
+        rateControl.lookaheadDepth = 0;
+        rateControl.enableAQ = encodingMode != "fast";
+        rateControl.aqStrength = encodingMode == "quality" ? 10 : 8;
+        config.encodeCodecConfig.h264Config.idrPeriod = config.gopLength;
+        params.encodeConfig = &config;
+
+        try {
+            CreateEncoder(&params);
+        } catch (const NVENCException& error) {
+            const char* detail = m_nvenc.nvEncGetLastErrorString(m_hEncoder);
+            if (detail && *detail) {
+                throw std::runtime_error(error.getErrorString() + detail);
+            }
+            throw;
+        }
+    }
+};
 
 class NvencSink {
 public:
@@ -2041,31 +2097,7 @@ public:
             checkCuda(cudaStreamCreateWithFlags(&copyStream_, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
         }
 
-        NV_ENC_INITIALIZE_PARAMS initializeParams = {NV_ENC_INITIALIZE_PARAMS_VER};
-        NV_ENC_CONFIG encodeConfig = {NV_ENC_CONFIG_VER};
-        initializeParams.encodeConfig = &encodeConfig;
-        encoder_.CreateDefaultEncoderParams(
-            &initializeParams,
-            NV_ENC_CODEC_H264_GUID,
-            getNvencPresetGuid(layoutOptions_.encodingMode));
-
-        initializeParams.frameRateNum = static_cast<uint32_t>(fps);
-        initializeParams.frameRateDen = 1;
-        initializeParams.enableEncodeAsync = 1;
-        encodeConfig.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-        encodeConfig.gopLength = static_cast<uint32_t>(fps * 2);
-        encodeConfig.frameIntervalP = 1;
-        encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-        encodeConfig.rcParams.averageBitRate = bitrate;
-        encodeConfig.rcParams.maxBitRate = getNvencMaxBitrate(bitrate, layoutOptions_.encodingMode);
-        encodeConfig.rcParams.vbvBufferSize = getNvencBufferSize(bitrate, layoutOptions_.encodingMode);
-        encodeConfig.rcParams.vbvInitialDelay = bitrate;
-        if (layoutOptions_.encodingMode != "fast") {
-            encodeConfig.rcParams.enableAQ = 1;
-            encodeConfig.rcParams.aqStrength = layoutOptions_.encodingMode == "quality" ? 10 : 8;
-        }
-        encodeConfig.encodeCodecConfig.h264Config.idrPeriod = encodeConfig.gopLength;
-        encoder_.CreateEncoder(&initializeParams);
+        encoder_.initialize(fps, bitrate, layoutOptions_.encodingMode);
 
         output_.open(outputPath, std::ios::binary);
         if (!output_) {
@@ -2759,7 +2791,7 @@ private:
         }
     }
 
-    NvEncoderCuda encoder_;
+    H264Encoder encoder_;
     std::ofstream output_;
     int width_ = 0;
     int height_ = 0;

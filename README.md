@@ -1,10 +1,10 @@
 # LeadCut
 
-LeadCut 是一款基于 Recordly 的开源屏幕录制与视频剪辑工具。它可以在本机完成录屏、编辑和导出。首个公开预览版为 Windows x64 的 0.1.0。
+LeadCut 是一款基于 Recordly 的开源屏幕录制与视频剪辑工具。它可以在本机完成录屏、编辑和导出。支持 Windows x64。
 
 ## 安装
 
-打开本仓库的 Releases 下载 LeadCut-0.1.0-windows-x64.exe，运行安装向导。Windows 会将 .leadcut 工程文件关联到 LeadCut。应用数据默认位于 %APPDATA%\LeadCut。
+打开本仓库的 Releases 下载 LeadCut-0.1.1-windows-x64.exe，运行安装向导。Windows 会将 .leadcut 工程文件关联到 LeadCut。应用数据默认位于 %APPDATA%\LeadCut。
 
 如果之前安装过本地开发版，请先保存项目并备份项目文件。工程引用原始视频和音频文件，移动或备份工程时请一并保留源素材。
 

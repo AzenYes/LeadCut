@@ -258,6 +258,18 @@ function verifyNativeHelpers(unpackedRoot) {
 				},
 			);
 		}
+		if (archTag === "win32-x64") {
+			assertFile(
+				path.join(
+					unpackedRoot,
+					"electron",
+					"native",
+					"nvidia-cuda-compositor",
+					"run-mp4-pipeline.mjs",
+				),
+				"NVIDIA CUDA MP4 export script",
+			);
+		}
 	}
 }
 
