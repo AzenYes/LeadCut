@@ -233,7 +233,7 @@ const TimelineEditor = forwardRef<TimelineEditorHandle, TimelineEditorProps>(
 
 		const timelineContainerRef = useRef<HTMLDivElement>(null);
 		const isTimelineFocusedRef = useRef(false);
-		const { setRange, clampedRange, handleTimelineWheel } = useTimelineRange({
+		const { setRange, clampedRange } = useTimelineRange({
 			totalMs,
 			timelineContainerRef,
 			sourceKey: videoSourcePath ?? videoPath,
@@ -287,7 +287,7 @@ const TimelineEditor = forwardRef<TimelineEditorHandle, TimelineEditorProps>(
 				}
 			}
 
-			return { previewSpans, hiddenZoomIds };
+			return { previewSpans, hiddenZoomIds: [...hiddenZoomIds] };
 		}, [clipRegions, liveSpanPreviewById, zoomRegions]);
 		const { isMac } = useShortcuts();
 		const sourceWaveform = useTimelineAudioPeaks(
@@ -486,6 +486,36 @@ const TimelineEditor = forwardRef<TimelineEditorHandle, TimelineEditorProps>(
 		const displayedVideoRegions = useMemo(() => focusRange
 			? videoTrackRegions?.filter(region => spansOverlap({ start: region.startMs, end: region.endMs }, focusRange))
 			: videoTrackRegions, [videoTrackRegions, focusRange]);
+		const videoRows = useMemo(() => videoTrackControls
+			? <VideoTrackRows {...videoTrackControls} regions={displayedVideoRegions ?? []} />
+			: null, [videoTrackControls, displayedVideoRegions]);
+		const onVideoSpanChange = videoTrackControls?.onChangeSpan;
+		const applyItemSpan = useCallback((id: string, span: ClipSequenceSpan, rowId?: string) => {
+			const region = videoTrackRegions?.find((region) => region.id === id);
+			if (region) onVideoSpanChange?.(id, span, rowId?.startsWith("row-video:") ? rowId.slice(10) : region.trackId);
+			else handleItemSpanChange(id, span, rowId);
+		}, [videoTrackRegions, onVideoSpanChange, handleItemSpanChange]);
+		const resolveTargetRowId = useCallback((id: string, proposed: string) => {
+			const region = videoTrackRegions?.find((region) => region.id === id);
+			return region ? (proposed.startsWith("row-video:") ? proposed : videoRowId(region.trackId)) : getResolvedDropRowId(id, proposed);
+		}, [videoTrackRegions, getResolvedDropRowId]);
+		const previewItemSpan = useCallback((id: string, span: Span | null) => {
+			setLiveSpanPreviewById((previous) => {
+				const current = previous[id];
+				if (!span) {
+					if (!current) return previous;
+					const next = { ...previous };
+					delete next[id];
+					return next;
+				}
+				if (current?.start === span.start && current.end === span.end) return previous;
+				return { ...previous, [id]: span };
+			});
+		}, []);
+		const clearCanvasSelection = useCallback(() => {
+			clearSelectedBlocks();
+			onClearSelection?.();
+		}, [clearSelectedBlocks, onClearSelection]);
 
 		if (!videoDuration || videoDuration === 0) {
 			return (
@@ -534,7 +564,6 @@ const TimelineEditor = forwardRef<TimelineEditorHandle, TimelineEditorProps>(
 						setSelectedKeyframeId(null);
 						setSelectAllBlocksActive(false);
 					}}
-					onWheel={handleTimelineWheel}
 				>
 					<TimelineWrapper
 						range={clampedRange}
@@ -543,37 +572,11 @@ const TimelineEditor = forwardRef<TimelineEditorHandle, TimelineEditorProps>(
 						onRangeChange={setRange}
 						minItemDurationMs={timelineScale.minItemDurationMs}
 						minVisibleRangeMs={timelineScale.minVisibleRangeMs}
-						onItemSpanChange={(id, span, rowId) => {
-							const region = videoTrackControls?.regions.find((region) => region.id === id);
-							if (region) videoTrackControls?.onChangeSpan(id, span, rowId?.startsWith("row-video:") ? rowId.slice(10) : region.trackId);
-							else handleItemSpanChange(id, span, rowId);
-						}}
-						resolveTargetRowId={(id, proposed) => {
-							const region = videoTrackControls?.regions.find((region) => region.id === id);
-							if (region) return proposed.startsWith("row-video:") ? proposed : videoRowId(region.trackId);
-							return getResolvedDropRowId(id, proposed);
-						}}
+						onItemSpanChange={applyItemSpan}
+						resolveTargetRowId={resolveTargetRowId}
 						allRegionSpans={timelineRegionSpans}
 						onDraggingChange={setIsDragging}
-						onLiveSpanPreviewChange={(id, span) => {
-							setLiveSpanPreviewById((prev) => {
-								if (!span) {
-									if (!(id in prev)) return prev;
-									const next = { ...prev };
-									delete next[id];
-									return next;
-								}
-								const current = prev[id];
-								if (
-									current &&
-									current.start === span.start &&
-									current.end === span.end
-								) {
-									return prev;
-								}
-								return { ...prev, [id]: span };
-							});
-						}}
+						onLiveSpanPreviewChange={previewItemSpan}
 					>
 						<KeyframeMarkers
 							keyframes={keyframes}
@@ -593,7 +596,7 @@ const TimelineEditor = forwardRef<TimelineEditorHandle, TimelineEditorProps>(
 							forwardSelectionActive={forwardSelectionActive}
 							onForwardSelect={onForwardSelect}
 							videoRowCount={videoTrackControls?.tracks.length ?? 0}
-							videoRows={videoTrackControls ? <VideoTrackRows {...videoTrackControls} regions={displayedVideoRegions ?? []} /> : null}
+							videoRows={videoRows}
 							videoPath={videoPath}
 							items={displayedItems}
 							videoDurationMs={totalMs}
@@ -617,14 +620,14 @@ const TimelineEditor = forwardRef<TimelineEditorHandle, TimelineEditorProps>(
 							selectedAudioId={selectedAudioId}
 							selectedCaptionId={selectedCaptionId}
 							selectAllBlocksActive={selectAllBlocksActive}
-							onClearBlockSelection={() => { clearSelectedBlocks(); onClearSelection?.(); }}
+							onClearBlockSelection={clearCanvasSelection}
 							keyframes={keyframes}
 							sourceAudioTracks={sourceAudioTracks}
 							getSourceAudioTrackSettingsForClip={getSourceAudioTrackSettingsForClip}
 							onSourceAudioRangeDelete={onSourceAudioRangeDelete}
 							showSourceAudioTrack={showSourceAudioTrack}
 							liveSpanPreviewById={liveZoomPreview.previewSpans}
-							liveHiddenItemIds={Array.from(liveZoomPreview.hiddenZoomIds)}
+							liveHiddenItemIds={liveZoomPreview.hiddenZoomIds}
 							isDragging={isDragging}
 							isLoading={isLoading}
 						/>

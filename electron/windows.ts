@@ -1006,11 +1006,18 @@ function loadPackagedEditorWindow(win: BrowserWindow) {
 		});
 	};
 
-	const handleDidFinishLoad = () => {
-		if (webContents.getURL() !== targetUrl) {
+	const handleDidFinishLoad = async () => {
+		if (settled || webContents.getURL() !== targetUrl) return;
+		clearTimeoutIfNeeded();
+		timeoutId = setTimeout(() => fallbackToFile("editor-preload-check-timeout"), 750);
+		const bridgeReady = await webContents.mainFrame.executeJavaScript(
+			"typeof window.electronAPI?.onWindowChromeChanged === 'function'",
+		).catch(() => false);
+		if (settled || win.isDestroyed() || webContents.getURL() !== targetUrl) return;
+		if (!bridgeReady) {
+			fallbackToFile("missing-editor-preload");
 			return;
 		}
-
 		settled = true;
 		detachLoadListeners();
 	};

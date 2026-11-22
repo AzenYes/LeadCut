@@ -255,6 +255,7 @@ interface Window {
 			enabled: boolean,
 		) => Promise<{ success: boolean; enabled: boolean }>;
 		getAssetBasePath: () => Promise<string | null>;
+		listLocalFontFamilies: (refresh?: boolean) => Promise<string[]>;
 		getSources: (opts: Electron.SourcesOptions) => Promise<ProcessedDesktopSource[]>;
 		onCaptureSourceListFailed: (callback: () => void) => () => void;
 		showProjectDashboard: () => Promise<void>;

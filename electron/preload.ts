@@ -250,6 +250,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	getAssetBasePath: async () => {
 		return await ipcRenderer.invoke("get-asset-base-path");
 	},
+	listLocalFontFamilies: (refresh?: boolean): Promise<string[]> =>
+		ipcRenderer.invoke("list-local-font-families", refresh),
 	listAssetDirectory: (relativeDir: string) => {
 		return ipcRenderer.invoke("list-asset-directory", relativeDir);
 	},

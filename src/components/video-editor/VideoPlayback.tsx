@@ -12,6 +12,7 @@ import type React from "react";
 import { createPortal } from "react-dom";
 import {
 	forwardRef,
+	startTransition,
 	useCallback,
 	useEffect,
 	useImperativeHandle,
@@ -124,6 +125,7 @@ import {
 import { updateOverlayIndicator } from "./videoPlayback/overlayUtils";
 import { applyPreviewPlaybackRate } from "./videoPlayback/playbackRate";
 import { PreviewVideoSource } from "./videoPlayback/previewVideoSource";
+import { setTimelinePreviewVideo } from "./timeline/core/timelineViewportSchedule";
 import { usePreviewVideoReady } from "./videoPlayback/usePreviewVideoReady";
 import { getSceneEffectMetrics } from "./videoPlayback/sceneEffects";
 import {
@@ -413,6 +415,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			// React detaches the element, never during a layout effect cleanup.
 			previewVideoSourceRef.current.setVideo(video);
 			videoRef.current = video;
+			setTimelinePreviewVideo(window, video);
 		}, []);
 		const previewFrameRef = useRef<HTMLDivElement | null>(null);
 		const containerRef = useRef<HTMLDivElement | null>(null);
@@ -511,7 +514,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		}, [pixiReady, timelineTime, isPlaying, previewPlaybackRate, videoRegions, videoTracks, webcam, suspendRendering, videoLayersViewportVersion]);
 		useEffect(() => {
 			onPlaybackErrorRef.current = onError;
-			timelineTimeRef.current = timelineTime;
+			if (!clipPlaybackRef.current?.isPlaying) timelineTimeRef.current = timelineTime;
 		}, [onError, timelineTime]);
 		const currentTimeRef = useRef(0);
 		useEffect(() => {
@@ -1624,8 +1627,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		}, [cursorSway, requestPausedFrameRefresh]);
 
 		useEffect(() => {
-			const timeMs = currentTime * 1000;
-			currentTimeRef.current = timeMs;
+			if (!clipPlaybackRef.current?.isPlaying) currentTimeRef.current = currentTime * 1000;
 		}, [currentTime]);
 
 		useEffect(() => {
@@ -1983,6 +1985,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			video.pause();
 
 			let preserveCameraAcrossCut = false;
+			const updateClock = (time: number, source: number | null) => {
+				timelineTimeRef.current = time;
+				if (source !== null) currentTimeRef.current = source * 1000;
+			};
+			const uiFrameMs = 1000 / 60;
+			let nextUiUpdate = 0;
 			const transport = createClipPlayback({
 				video,
 				getClips: () => clipRegionsRef.current,
@@ -1992,11 +2000,21 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					preserveCameraAcrossCut = reason === "cut";
 				},
 				onTime: (time, source) => {
-					timelineTimeRef.current = time;
-					if (source !== null) currentTimeRef.current = source * 1000;
+					updateClock(time, source);
+					nextUiUpdate = performance.now() + uiFrameMs;
 					onTimeUpdate(time);
 				},
+				onPlaybackTick: (time, source) => {
+					updateClock(time, source);
+					// Keep the transport and compositor clocks exact, and publish
+					// UI snapshots at display cadence without blocking media work.
+					const now = performance.now();
+					if (now < nextUiUpdate) return;
+					nextUiUpdate = Math.max(now, nextUiUpdate + uiFrameMs);
+					startTransition(() => onTimeUpdate(time));
+				},
 				onPlaying: (playing) => {
+					if (!playing && isPlayingRef.current) onTimeUpdate(timelineTimeRef.current);
 					isPlayingRef.current = playing;
 					onPlayStateChange(playing);
 				},

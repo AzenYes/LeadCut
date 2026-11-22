@@ -5,7 +5,7 @@ import { VideoLayerCompositor } from "../videoLayerCompositor";
 import { Application, BlurFilter, Container, Graphics, Rectangle, Sprite, Texture } from "pixi.js";
 import { MotionBlurFilter } from "pixi-filters/motion-blur";
 import { ZoomBlurFilter } from "pixi-filters/zoom-blur";
-import { buildActiveCaptionLayout } from "@/components/video-editor/captionLayout";
+import { getActiveCaptionLayout, prepareCaptionLayout } from "@/components/video-editor/captionLayout";
 import { getCaptionTimeMs } from "@/components/video-editor/captionTimeline";
 import {
 	getCaptionFontStack, getCaptionFontWeight,
@@ -236,7 +236,7 @@ interface ExportCompositeCanvasState {
 	context: CanvasRenderingContext2D;
 }
 
-type ResolvedCaptionLayout = NonNullable<ReturnType<typeof buildActiveCaptionLayout>>;
+type ResolvedCaptionLayout = NonNullable<ReturnType<typeof getActiveCaptionLayout>>;
 
 interface CaptionRenderState {
 	key: string;
@@ -423,6 +423,8 @@ export class FrameRenderer {
 	private webcamVideoFrameStagingCtx: CanvasRenderingContext2D | null = null;
 	private captionMeasureCanvas: HTMLCanvasElement | null = null;
 	private captionMeasureCtx: CanvasRenderingContext2D | null = null;
+	private preparedCaptionLayout: ReturnType<typeof prepareCaptionLayout> | undefined;
+	private readonly captionSettings: FrameRenderConfig["autoCaptionSettings"];
 	private captionCanvas: HTMLCanvasElement | null = null;
 	private captionCtx: CanvasRenderingContext2D | null = null;
 	private captionSprite: Sprite | null = null;
@@ -460,6 +462,7 @@ export class FrameRenderer {
 
 	constructor(config: FrameRenderConfig) {
 		this.config = config;
+		this.captionSettings = chapterCaptionSettings(config.autoCaptionSettings, config.chapterProgress, config.width, config.height);
 		this.animationState = createAnimationState();
 		this.motionBlurState = createMotionBlurState();
 		this.springScale = createSpringState(1);
@@ -1599,7 +1602,7 @@ export class FrameRenderer {
 	}
 
 	private buildCaptionRenderState(timeMs: number): CaptionRenderState | null {
-		const settings = chapterCaptionSettings(this.config.autoCaptionSettings, this.config.chapterProgress, this.config.width, this.config.height);
+		const settings = this.captionSettings;
 		const cues = this.config.autoCaptions;
 		const measureCtx = this.captionMeasureCtx;
 
@@ -1613,15 +1616,16 @@ export class FrameRenderer {
 			this.config.width,
 			settings.maxWidth,
 		);
-		measureCtx.font = `${getCaptionFontWeight(settings)} ${fontSize}px ${fontFamily}`;
-
-		const layout = buildActiveCaptionLayout({
-			cues,
-			timeMs,
-			settings,
-			maxWidthPx: getCaptionTextMaxWidth(this.config.width, settings.maxWidth, fontSize),
-			measureText: (text) => measureCtx.measureText(text).width,
-		});
+		if (this.preparedCaptionLayout === undefined) {
+			measureCtx.font = `${getCaptionFontWeight(settings)} ${fontSize}px ${fontFamily}`;
+			this.preparedCaptionLayout = prepareCaptionLayout({
+				cues,
+				settings,
+				maxWidthPx: getCaptionTextMaxWidth(this.config.width, settings.maxWidth, fontSize),
+				measureText: (text) => measureCtx.measureText(text).width,
+			});
+		}
+		const layout = getActiveCaptionLayout(this.preparedCaptionLayout, { cues, timeMs, settings });
 		if (!layout) {
 			return null;
 		}
@@ -1700,7 +1704,7 @@ export class FrameRenderer {
 		}
 
 		const ctx = this.captionCtx;
-		const settings = chapterCaptionSettings(this.config.autoCaptionSettings, this.config.chapterProgress, this.config.width, this.config.height);
+		const settings = this.captionSettings;
 		if (!settings) {
 			return;
 		}
@@ -3361,6 +3365,7 @@ export class FrameRenderer {
 		this.captionCtx = null;
 		this.captionMeasureCanvas = null;
 		this.captionMeasureCtx = null;
+		this.preparedCaptionLayout = undefined;
 		this.captionSprite = null;
 		this.captionTextureSource = null;
 		this.captionRenderKey = null;

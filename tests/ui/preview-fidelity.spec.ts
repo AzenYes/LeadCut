@@ -12,6 +12,16 @@ test("screen pixels survive pending seeks, texture eviction and WebGL restoratio
 		document.body.appendChild(app.canvas);
 		const video = document.createElement("video"); video.muted = true; video.src = `${location.origin}/tests/ui/fixtures/filmstrip.mp4`; document.body.appendChild(video);
 		await new Promise<void>((resolve, reject) => { video.onloadeddata = () => resolve(); video.onerror = () => reject(new Error("fixture load")); });
+		let supportsDecodedFrame = false;
+		if (typeof VideoFrame === "function") {
+			try {
+				const frame = new VideoFrame(video, { timestamp: 0 });
+				frame.close();
+				supportsDecodedFrame = true;
+			} catch {
+				// Some browser/decoder combinations only allow copying through Canvas 2D.
+			}
+		}
 		const owner = new PreviewVideoSource(); owner.setVideo(video);
 		const source = owner.getSource(); const sprite = new Sprite(new Texture({ source })); sprite.width = 320; sprite.height = 180; app.stage.addChild(sprite);
 		const pixels = () => { app.render(); const c = document.createElement("canvas"); c.width = 320; c.height = 180; const ctx = c.getContext("2d")!; ctx.drawImage(app.canvas, 0, 0); return [...ctx.getImageData(0, 0, 320, 180).data]; };
@@ -25,10 +35,13 @@ test("screen pixels survive pending seeks, texture eviction and WebGL restoratio
 		extension.loseContext(); await new Promise(resolve => setTimeout(resolve, 150)); extension.restoreContext(); await restored;
 		const afterRestore = pixels();
 		const difference = (a: number[], b: number[]) => a.reduce((sum, n, i) => sum + Math.abs(n - b[i]), 0) / a.length;
-		const out = { pendingDifference: difference(before, duringSeek), restoredDifference: difference(afterSeek, afterRestore), seekChanged: difference(before, afterSeek), retainedCanvas: source.resource instanceof HTMLCanvasElement };
+		const validResource = supportsDecodedFrame
+			? source.resource instanceof VideoFrame
+			: source.resource instanceof HTMLCanvasElement;
+		const out = { pendingDifference: difference(before, duringSeek), restoredDifference: difference(afterSeek, afterRestore), seekChanged: difference(before, afterSeek), validResource };
 		owner.setVideo(null); video.remove(); app.destroy(true, { children: true }); return out;
 	});
-	expect(result.retainedCanvas).toBe(true);
+	expect(result.validResource).toBe(true);
 	expect(result.pendingDifference).toBeLessThan(0.01);
 	expect(result.restoredDifference).toBeLessThan(0.1);
 	expect(result.seekChanged).toBeGreaterThan(5);

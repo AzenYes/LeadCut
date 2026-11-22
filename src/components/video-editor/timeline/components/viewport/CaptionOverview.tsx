@@ -27,14 +27,16 @@ export function CaptionOverview({
 	onSelect?: (id: string) => void;
 }) {
 	const ref = useRef<HTMLCanvasElement>(null);
+	const sizeRef = useRef({ width: 0, height: 0 });
+	const drawRef = useRef<(() => void) | null>(null);
 
 	useLayoutEffect(() => {
 		const canvas = ref.current;
 		if (!canvas) return;
 		const draw = () => {
 			const dpr = window.devicePixelRatio || 1;
-			const width = canvas.clientWidth;
-			const height = canvas.clientHeight;
+			const { width, height } = sizeRef.current;
+			if (!width || !height) return;
 			const pixelWidth = Math.round(width * dpr);
 			const pixelHeight = Math.round(height * dpr);
 			if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
@@ -47,13 +49,13 @@ export function CaptionOverview({
 			const markHeight = height * 0.85;
 			const y = (height - markHeight) / 2;
 			for (const mark of marks) {
+				if (mark.offset >= width || mark.offset + mark.width <= 0) continue;
 				const start = rtl ? width - mark.offset - mark.width : mark.offset;
 				context.fillRect(start, y, mark.width, markHeight);
 			}
 		};
+		drawRef.current = draw;
 		draw();
-		const observer = new ResizeObserver(draw);
-		observer.observe(canvas);
 		selectionRef.current = ({ left, right, top, bottom }) => {
 			const rect = canvas.getBoundingClientRect();
 			if (rect.height <= 0 || rect.width <= 0 || rect.top >= bottom || rect.bottom <= top)
@@ -63,10 +65,23 @@ export function CaptionOverview({
 			return marks.filter(mark => mark.offset < end && mark.offset + mark.width > start).map(mark => mark.id);
 		};
 		return () => {
-			observer.disconnect();
+			drawRef.current = null;
 			selectionRef.current = null;
 		};
 	}, [marks, rtl, selectionRef]);
+
+	useLayoutEffect(() => {
+		const canvas = ref.current;
+		if (!canvas) return;
+		const observer = new ResizeObserver(([entry]) => {
+			if (!entry) return;
+			const { width, height } = entry.contentRect;
+			sizeRef.current = { width, height };
+			drawRef.current?.();
+		});
+		observer.observe(canvas);
+		return () => observer.disconnect();
+	}, []);
 
 	const hitMark = (event: PointerEvent<HTMLCanvasElement>) => {
 		const rect = event.currentTarget.getBoundingClientRect();

@@ -25,6 +25,18 @@ export function getEmbeddedCaptionSpan(
 
 export type ClipPresentation = { span: Span; displaySpan: Span };
 
+const identityLayouts = new WeakMap<ClipPresentation[], boolean>();
+
+function hasIdentityLayout(clips: ClipPresentation[]): boolean {
+	const cached = identityLayouts.get(clips);
+	if (cached !== undefined) return cached;
+	const identity = clips.every(
+		({ span, displaySpan }) => span.start === displaySpan.start && span.end === displaySpan.end,
+	);
+	identityLayouts.set(clips, identity);
+	return identity;
+}
+
 function mapSpanTime(time: number, from: Span, to: Span): number {
 	if (from.end <= from.start) return to.start;
 	return to.start + ((time - from.start) / (from.end - from.start)) * (to.end - to.start);
@@ -39,6 +51,7 @@ export function getPlayheadDisplayTime(
 	clips: ClipPresentation[],
 	edge: "start" | "end" = "start",
 ): number {
+	if (hasIdentityLayout(clips)) return time;
 	if (edge === "end") {
 		const ending = clips.find(({ span }) => time > span.start && time <= span.end);
 		if (ending) return mapSpanTime(time, ending.span, ending.displaySpan);
@@ -52,6 +65,7 @@ export function getPlayheadDisplayTime(
 
 /** Scrubbing a shared gutter selects the cut, which has no media duration. */
 export function getTimeAtClipSeam(time: number, clips: ClipPresentation[]): number {
+	if (hasIdentityLayout(clips)) return time;
 	for (const left of clips) {
 		const right = clips.find(({ span }) => span.start === left.span.end);
 		if (right && time >= left.displaySpan.end && time <= right.displaySpan.start) {
@@ -66,6 +80,7 @@ export function getTimeAtClipSeam(time: number, clips: ClipPresentation[]): numb
 
 /** Both sides of a cut share a timestamp, but occupy different visual edges. */
 export function getRegionDisplaySpan(span: Span, clips: ClipPresentation[]): Span {
+	if (hasIdentityLayout(clips)) return span;
 	return {
 		start: getPlayheadDisplayTime(span.start, clips, "start"),
 		end: getPlayheadDisplayTime(span.end, clips, "end"),

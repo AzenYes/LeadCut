@@ -124,9 +124,13 @@ test("system audio range deletion preserves mic, picture and timing through prev
 });
 
 async function inkAt(waveform: Locator, fraction: number) {
-	return waveform.locator("canvas").evaluate((canvas: HTMLCanvasElement, fraction) => {
+	return waveform.evaluate((clip, fraction) => {
+		const canvas = clip.parentElement!.querySelector<HTMLCanvasElement>("[data-source-audio-waveform]")!;
 		const context = canvas.getContext("2d")!;
-		const x = Math.min(canvas.width - 1, Math.floor(canvas.width * fraction));
+		const bounds = canvas.getBoundingClientRect();
+		const clipBounds = clip.getBoundingClientRect();
+		const clipX = clipBounds.left + clipBounds.width * fraction - bounds.left;
+		const x = Math.min(canvas.width - 1, Math.floor(clipX / bounds.width * canvas.width));
 		const pixels = context.getImageData(x, 0, 1, canvas.height).data;
 		let ink = 0;
 		for (let y = 0; y < canvas.height; y++) {
@@ -176,6 +180,7 @@ test("split, speed changes, deletion and undo preserve source audio alignment", 
 	await waves.click({ position: { x: box.width / 2, y: 12 } });
 	await page.getByRole("button", { name: "Split Clip (F2)", exact: true }).click();
 	await expect(waves).toHaveCount(2);
+	await expect(page.locator("[data-source-audio-waveform]")).toHaveCount(1);
 	const sourceStart = await waves.nth(1).getAttribute("data-source-start-ms");
 	const sourceEnd = await waves.nth(1).getAttribute("data-source-end-ms");
 	const clipWidth = (await clips.nth(1).boundingBox())!.width;

@@ -1,5 +1,5 @@
 import { DOMAdapter, Texture } from "pixi.js";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { PreviewVideoSource } from "./previewVideoSource";
 
 class TestVideo extends EventTarget {
@@ -51,6 +51,7 @@ beforeAll(() => {
 	});
 });
 afterAll(() => DOMAdapter.set(originalAdapter));
+afterEach(() => vi.unstubAllGlobals());
 
 describe("PreviewVideoSource", () => {
 	it("reuses a single source and listener set across repeated texture lifecycles", async () => {
@@ -125,28 +126,67 @@ describe("PreviewVideoSource", () => {
 
 	it("retains decoded pixels while seeking or stalled, including after a GPU unload", () => {
 		const video = new TestVideo();
-		const owner = new PreviewVideoSource(); owner.setVideo(video.asElement());
+		const owner = new PreviewVideoSource();
+		owner.setVideo(video.asElement());
 		const source = owner.getSource();
-		const canvas = source.resource;
-		const draw = source.context2D.drawImage as ReturnType<typeof vi.fn>;
+		const canvas = source.resource as HTMLCanvasElement;
+		const draw = canvas.getContext("2d")!.drawImage as ReturnType<typeof vi.fn>;
 		const before = draw.mock.calls.length;
-		video.seeking = true; video.readyState = 1;
-		source.unload(); owner.getSource(); video.dispatchEvent(new Event("resize"));
+		video.seeking = true;
+		video.readyState = 1;
+		source.unload();
+		owner.getSource();
+		video.dispatchEvent(new Event("resize"));
 		expect(source.resource).toBe(canvas);
-		expect(source.pixelWidth).toBe(5120); expect(source.pixelHeight).toBe(2880);
+		expect(source.pixelWidth).toBe(5120);
+		expect(source.pixelHeight).toBe(2880);
 		expect(draw).toHaveBeenCalledTimes(before);
-		video.seeking = false; video.readyState = 4;
+		video.seeking = false;
+		video.readyState = 4;
 		video.dispatchEvent(new Event("seeked"));
 		expect(draw).toHaveBeenCalledTimes(before + 1);
 		owner.setVideo(null);
 	});
 
+	it("uploads retained video frames and releases each frame after replacing it", () => {
+		const frames: TestFrame[] = [];
+		class TestFrame {
+			displayWidth = 5120;
+			displayHeight = 2880;
+			close = vi.fn();
+			constructor() {
+				frames.push(this);
+			}
+		}
+		vi.stubGlobal("VideoFrame", TestFrame);
+		const video = new TestVideo();
+		const owner = new PreviewVideoSource();
+		owner.setVideo(video.asElement());
+		const source = owner.getSource();
+		expect(source.resource).toBe(frames[0]);
+		video.seeking = true;
+		video.dispatchEvent(new Event("resize"));
+		expect(source.resource).toBe(frames[0]);
+		expect(frames[0].close).not.toHaveBeenCalled();
+		video.seeking = false;
+		video.dispatchEvent(new Event("seeked"));
+		expect(source.resource).toBe(frames[1]);
+		expect(frames[0].close).toHaveBeenCalledOnce();
+		owner.setVideo(null);
+		expect(frames[1].close).toHaveBeenCalledOnce();
+	});
+
 	it("ignores already queued callbacks belonging to a replaced video", () => {
-		const first = new TestVideo(); const next = new TestVideo();
-		const owner = new PreviewVideoSource(); owner.setVideo(first.asElement()); owner.getSource();
+		const first = new TestVideo();
+		const next = new TestVideo();
+		const owner = new PreviewVideoSource();
+		owner.setVideo(first.asElement());
+		owner.getSource();
 		const stale = first.requestVideoFrameCallback.mock.calls[0] as unknown as [() => void];
-		owner.setVideo(next.asElement()); const source = owner.getSource();
-		const update = vi.fn(); source.on("update", update);
+		owner.setVideo(next.asElement());
+		const source = owner.getSource();
+		const update = vi.fn();
+		source.on("update", update);
 		stale[0]();
 		expect(update).not.toHaveBeenCalled();
 		expect(next.requestVideoFrameCallback).toHaveBeenCalledOnce();

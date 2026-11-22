@@ -1,4 +1,7 @@
 import { useI18n } from "@/contexts/I18nContext";
+import { useDndContext } from "@dnd-kit/core";
+import { useTimelineContext } from "dnd-timeline";
+import { useMemo } from "react";
 import type { VideoRegion, VideoTrack } from "../../videoTracks";
 import Row from "../Row";
 import Item from "../Item";
@@ -22,7 +25,23 @@ export function VideoTrackRows({ tracks, regions, selectedIds, onSelect, onTrack
 	onImport: (trackId: string) => void;
 }) {
 	const { t } = useI18n();
+	const { range } = useTimelineContext();
+	const activeId = useDndContext().active?.id;
+	const overscan = range.end - range.start;
+	const selected = useMemo(() => new Set(selectedIds), [selectedIds]);
+	const regionsByTrack = useMemo(() => {
+		const tracks = new Map<string, VideoRegion[]>();
+		for (const region of regions) {
+			const items = tracks.get(region.trackId);
+			if (items) items.push(region);
+			else tracks.set(region.trackId, [region]);
+		}
+		return tracks;
+	}, [regions]);
 	return <>{[...tracks].reverse().map((track, index) => {
+		const trackRegions = regionsByTrack.get(track.id) ?? [];
+		const visible = trackRegions.filter((region) => selected.has(region.id) || region.id === activeId ||
+			(region.startMs < range.end + overscan && region.endMs > range.start - overscan));
 		const hideLabel = `${t("editor.tracks.hide", "Hide track")} ${track.name}`;
 		const muteLabel = `${t("editor.tracks.mute", "Mute track")} ${track.name}`;
 		const lockLabel = `${t("editor.tracks.lock", "Lock track")} ${track.name}`;
@@ -34,8 +53,8 @@ export function VideoTrackRows({ tracks, regions, selectedIds, onSelect, onTrack
 			<button type="button" className="rounded px-1 text-[9px] hover:bg-foreground/10" title={lockLabel} aria-label={lockLabel} aria-pressed={Boolean(track.locked)} onClick={() => onTrackChange(track.id, { locked: !track.locked })}>{track.locked ? "◆" : "◇"}</button>
 			<button type="button" className="rounded px-1 text-[11px] hover:bg-foreground/10" disabled={track.locked} aria-label={`${t("editor.tracks.import", "Import B-roll")} ${track.name}`} onClick={() => onImport(track.id)}>+</button>
 		</div>
-	</>} isEmpty={!regions.some((region) => region.trackId === track.id)} hint={t("editor.tracks.empty", "Import video into this track")}>
-		{regions.filter((region) => region.trackId === track.id).map((region) => <Item key={region.id} id={region.id} rowId={videoRowId(track.id)} variant="video" videoPath={region.sourcePath} span={{ start: region.startMs, end: region.endMs }} sourceSpan={{ start: region.sourceStartMs, end: region.sourceStartMs + (region.endMs - region.startMs) * region.speed }} disabled={track.locked} isSelected={selectedIds.includes(region.id)} onSelect={() => onSelect(region.id)} muted={track.muted || region.muted}>
+	</>} isEmpty={!trackRegions.length} hint={t("editor.tracks.empty", "Import video into this track")}>
+		{visible.map((region) => <Item key={region.id} id={region.id} rowId={videoRowId(track.id)} variant="video" videoPath={region.sourcePath} span={{ start: region.startMs, end: region.endMs }} sourceSpan={{ start: region.sourceStartMs, end: region.sourceStartMs + (region.endMs - region.startMs) * region.speed }} disabled={track.locked} isSelected={selected.has(region.id)} onSelect={() => onSelect(region.id)} muted={track.muted || region.muted}>
 			{region.sourcePath.split(/[\\/]/).pop()}
 		</Item>)}
 	</Row>;

@@ -5,8 +5,6 @@ import type { useTimelineState } from "../state/useTimelineState";
 import { getDefaultCaptionFontFamily } from "../types";
 import { collectExportPreflightIssues } from "./exportPreflight";
 
-let localFonts: Promise<string[] | null> | undefined;
-
 export async function checkProjectExport(timeline: ReturnType<typeof useTimelineState>) {
 	const captionsEnabled = timeline.autoCaptionSettings.enabled && timeline.autoCaptions.some(cue => cue.text.trim());
 	const family = timeline.autoCaptionSettings.fontFamily;
@@ -20,8 +18,7 @@ export async function checkProjectExport(timeline: ReturnType<typeof useTimeline
 	);
 	let availableFonts: string[] | null = customFamilies;
 	if (needsLocalFonts) {
-		localFonts ??= listLocalFontFamilies().catch(() => null);
-		const families = await localFonts;
+		const families = await listLocalFontFamilies().catch(() => null);
 		availableFonts = families ? [...families, ...customFamilies] : null;
 	}
 	return collectExportPreflightIssues({

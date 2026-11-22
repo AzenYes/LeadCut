@@ -1,6 +1,10 @@
-import { buildActiveCaptionLayout } from "@/components/video-editor/captionLayout";
 import {
-	getCaptionFontStack, getCaptionFontWeight,
+	getActiveCaptionLayout,
+	prepareCaptionLayout,
+} from "@/components/video-editor/captionLayout";
+import {
+	getCaptionFontStack,
+	getCaptionFontWeight,
 	getCaptionAnchor,
 	drawCaptionText,
 	CAPTION_LINE_HEIGHT,
@@ -10,11 +14,10 @@ import {
 	getCaptionTextMaxWidth,
 	getCaptionWordVisualState,
 } from "@/components/video-editor/captionStyle";
-import {
-	type AutoCaptionSettings,
-	type CaptionCue,
-} from "@/components/video-editor/types";
+import { type AutoCaptionSettings, type CaptionCue } from "@/components/video-editor/types";
 import { drawSquircleOnCanvas } from "@/lib/geometry/squircle";
+
+export type CaptionLayoutCache = { layout?: ReturnType<typeof prepareCaptionLayout> };
 
 /** Draw the active caption using the same typography and timing as preview. */
 export function renderCaptions(
@@ -24,6 +27,7 @@ export function renderCaptions(
 	width: number,
 	height: number,
 	timeMs: number,
+	cache: CaptionLayoutCache = {},
 ) {
 	if (!settings.enabled || cues.length === 0) {
 		return;
@@ -35,13 +39,15 @@ export function renderCaptions(
 	ctx.font = `${getCaptionFontWeight(settings)} ${fontSize}px ${getCaptionFontStack(settings)}`;
 	const padding = getCaptionPadding(fontSize);
 
-	const activeCaptionLayout = buildActiveCaptionLayout({
-		cues,
-		timeMs,
-		settings,
-		maxWidthPx: getCaptionTextMaxWidth(width, settings.maxWidth, fontSize),
-		measureText: (text) => ctx.measureText(text).width,
-	});
+	if (cache.layout === undefined) {
+		cache.layout = prepareCaptionLayout({
+			cues,
+			settings,
+			maxWidthPx: getCaptionTextMaxWidth(width, settings.maxWidth, fontSize),
+			measureText: (text) => ctx.measureText(text).width,
+		});
+	}
+	const activeCaptionLayout = getActiveCaptionLayout(cache.layout, { cues, settings, timeMs });
 	if (!activeCaptionLayout) {
 		ctx.restore();
 		return;

@@ -171,6 +171,7 @@ function getExpectedNativeHelperFiles(archTag) {
 				executable: true,
 			},
 			{ name: "helpers-manifest.json", label: "Windows helper manifest" },
+			{ name: "leadcut-local-font-catalog.exe", label: "Windows local font catalog", executable: true },
 			{ name: "whisper-cli.exe", label: "Whisper CLI runtime", executable: true },
 			{ name: "whisper-runtime.json", label: "Whisper runtime manifest" },
 		];

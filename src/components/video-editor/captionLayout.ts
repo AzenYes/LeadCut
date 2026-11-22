@@ -133,23 +133,33 @@ function getActiveCaptionCue(cues: CaptionCue[], timeMs: number) {
 	return null;
 }
 
-function isWithinCaptionCoverage(cues: CaptionCue[], timeMs: number) {
+function getCaptionCoverage(cues: CaptionCue[]) {
 	const sorted = [...cues].sort((left, right) => left.startMs - right.startMs);
+	const coverage: { startMs: number; endMs: number }[] = [];
 	for (let index = 0; index < sorted.length; index += 1) {
 		const cue = sorted[index];
-		if (timeMs < cue.startMs) {
-			return false;
-		}
 		const next = sorted[index + 1];
 		const bridgesGap =
 			next !== undefined && next.startMs - cue.endMs < CAPTION_BLOCK_GAP_BREAK_MS;
-		const effectiveEndMs = bridgesGap ? Math.max(cue.endMs, next.startMs) : cue.endMs;
-		if (timeMs <= effectiveEndMs) {
-			return true;
-		}
+		const endMs = bridgesGap ? Math.max(cue.endMs, next.startMs) : cue.endMs;
+		if (endMs < cue.startMs) continue;
+		const previous = coverage[coverage.length - 1];
+		if (previous && cue.startMs <= previous.endMs)
+			previous.endMs = Math.max(previous.endMs, endMs);
+		else coverage.push({ startMs: cue.startMs, endMs });
 	}
+	return coverage;
+}
 
-	return false;
+function isWithinCaptionCoverage(coverage: ReturnType<typeof getCaptionCoverage>, timeMs: number) {
+	let low = 0;
+	let high = coverage.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (coverage[middle].startMs <= timeMs) low = middle + 1;
+		else high = middle;
+	}
+	return low > 0 && timeMs <= coverage[low - 1].endMs;
 }
 
 export function flattenCaptionWords(cues: CaptionCue[]) {
@@ -477,11 +487,17 @@ export function prepareCaptionLayout(options: CaptionLayoutOptions) {
 			text: "",
 		},
 	});
-	return { sourceWords, words, lines, pages, maxRows };
+	return {
+		sourceWords,
+		words,
+		lines,
+		pages,
+		maxRows,
+		coverage: getCaptionCoverage(options.cues),
+	};
 }
 
 export function buildActiveCaptionLayout(options: CaptionLayoutOptions & { timeMs: number }) {
-	if (!isWithinCaptionCoverage(options.cues, options.timeMs)) return null;
 	return getActiveCaptionLayout(prepareCaptionLayout(options), options);
 }
 
@@ -489,7 +505,7 @@ export function getActiveCaptionLayout(
 	layout: ReturnType<typeof prepareCaptionLayout>,
 	options: Pick<CaptionLayoutOptions, "cues" | "settings"> & { timeMs: number },
 ) {
-	if (!layout || !isWithinCaptionCoverage(options.cues, options.timeMs)) return null;
+	if (!layout || !isWithinCaptionCoverage(layout.coverage, options.timeMs)) return null;
 	const { sourceWords, words, lines, pages, maxRows } = layout;
 	let activeWordIndex = sourceWords.findIndex(
 		(word) => options.timeMs >= word.startMs && options.timeMs < word.endMs,
@@ -503,12 +519,19 @@ export function getActiveCaptionLayout(
 		return null;
 	}
 	const visiblePage = pages[visiblePageIndex] ?? null;
-	const visibleLines = (visiblePage?.lines ?? lines.slice(0, maxRows)).map(line => ({
+	const visibleLines = (visiblePage?.lines ?? lines.slice(0, maxRows)).map((line) => ({
 		...line,
-		words: line.words.map((word): CaptionWordLayout => ({
-			...word,
-			state: word.index < activeWordIndex ? "spoken" : word.index === activeWordIndex ? "active" : "upcoming",
-		})),
+		words: line.words.map(
+			(word): CaptionWordLayout => ({
+				...word,
+				state:
+					word.index < activeWordIndex
+						? "spoken"
+						: word.index === activeWordIndex
+							? "active"
+							: "upcoming",
+			}),
+		),
 	}));
 	const activeWord = activeWordIndex >= 0 ? words[activeWordIndex] : null;
 	const activeWordProgress = activeWord
@@ -542,7 +565,7 @@ export function getActiveCaptionLayout(
 	);
 	const willDisappear =
 		options.settings.animationStyle !== "none" &&
-		!isWithinCaptionCoverage(options.cues, visibleContentEndMs + 1);
+		!isWithinCaptionCoverage(layout.coverage, visibleContentEndMs + 1);
 	const exitAnchorMs = willDisappear ? visibleContentEndMs : animationEndMs;
 	const enterProgress = clamp01((options.timeMs - animationStartMs) / CAPTION_ENTER_MS);
 	const exitProgress = clamp01((exitAnchorMs - options.timeMs) / CAPTION_EXIT_MS);

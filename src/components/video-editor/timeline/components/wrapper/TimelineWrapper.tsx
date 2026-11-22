@@ -15,6 +15,15 @@ import { useCallback, useRef } from "react";
 import type { ClipSequenceSpan, TimelineRegionSpan } from "../../core/timelineTypes";
 import { clampRange, resolveDragEnd, resolveResizeEnd } from "../../dnd/engine";
 
+const POINTER_SENSOR_OPTIONS = { activationConstraint: { distance: 4 } };
+const TIMELINE_AUTO_SCROLL = {
+	enabled: true,
+	threshold: { x: 0.08, y: 0.08 },
+	acceleration: 3,
+	interval: 16,
+	layoutShiftCompensation: { x: false, y: false },
+};
+
 interface TimelineWrapperProps {
 	children: ReactNode;
 	range: Range;
@@ -48,7 +57,7 @@ export default function TimelineWrapper({
 }: TimelineWrapperProps) {
 	// Treat small pointer jitter as a selection, never as a persisted timeline edit.
 	const sensors = useSensors(
-		useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+		useSensor(PointerSensor, POINTER_SENSOR_OPTIONS),
 		useSensor(KeyboardSensor),
 	);
 	const totalMs = Math.max(0, Math.round(videoDuration * 1000));
@@ -267,13 +276,7 @@ export default function TimelineWrapper({
 			onDragMove={onDragMove}
 			onDragEnd={onDragEndWithTooltip}
 			onDragCancel={onDragCancel}
-			autoScroll={{
-				enabled: true,
-				threshold: { x: 0.08, y: 0.08 },
-				acceleration: 3,
-				interval: 16,
-				layoutShiftCompensation: { x: false, y: false },
-			}}
+			autoScroll={TIMELINE_AUTO_SCROLL}
 			resizeHandleWidth={28}
 		>
 			<div className="relative h-full min-h-0">

@@ -1,6 +1,7 @@
 import type { Range } from "dnd-timeline";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject, type SetStateAction, type WheelEvent } from "react";
+import { startTransition, useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject, type SetStateAction } from "react";
 import { createInitialRange, normalizeWheelDeltaToPixels } from "../core/time";
+import { scheduleTimelineViewportUpdate } from "../core/timelineViewportSchedule";
 
 interface UseTimelineRangeParams {
 	totalMs: number;
@@ -68,67 +69,72 @@ export function useTimelineRange({ totalMs, timelineContainerRef, sourceKey, foc
 	// Editing duration must not change the viewport's origin or pixels per second.
 	// Empty space beyond the new end is intentional, including deleting the tail.
 	const clampedRange = focusRange ?? range;
+	const pendingRangeUpdates = useRef<SetStateAction<Range>[]>([]);
+	const cancelViewportUpdate = useRef<(() => void) | null>(null);
+	useLayoutEffect(() => () => {
+		cancelViewportUpdate.current?.();
+		cancelViewportUpdate.current = null;
+		pendingRangeUpdates.current = [];
+	}, [focused, sourceKey]);
+
 	const setViewportRange = useCallback((update: SetStateAction<Range>) => {
-		if (!focused) setRange(update);
+		if (focused) return;
+		pendingRangeUpdates.current.push(update);
+		if (cancelViewportUpdate.current) return;
+		cancelViewportUpdate.current = scheduleTimelineViewportUpdate(window, () => {
+			cancelViewportUpdate.current = null;
+			const updates = pendingRangeUpdates.current;
+			pendingRangeUpdates.current = [];
+			startTransition(() => {
+				setRange(previous => updates.reduce<Range>(
+					(next, change) => typeof change === "function" ? change(next) : change,
+					previous,
+				));
+			});
+		});
 	}, [focused]);
 
-	const panTimelineRange = useCallback(
-		(deltaMs: number) => {
-			if (!Number.isFinite(deltaMs) || deltaMs === 0 || totalMs <= 0) {
-				return;
-			}
+	useLayoutEffect(() => {
+		const container = timelineContainerRef.current;
+		if (!container || focused || totalMs <= 0) return;
 
-			setRange((previous) => {
-				const visibleSpan = Math.max(1, previous.end - previous.start);
-				const maxStart = Math.max(0, totalMs - visibleSpan);
-				const nextStart = Math.max(0, Math.min(previous.start + deltaMs, maxStart));
-				if (nextStart === previous.start) return previous;
-				return { start: nextStart, end: nextStart + visibleSpan };
-			});
-		},
-		[totalMs],
-	);
-
-	const handleTimelineWheel = useCallback(
-		(event: WheelEvent<HTMLDivElement>) => {
-			if (focused || ((event.ctrlKey || event.metaKey) && !event.shiftKey) || totalMs <= 0) {
-				return;
-			}
-
-			const container = timelineContainerRef.current;
+		let width = container.clientWidth;
+		const observer = new ResizeObserver(() => {
+			width = container.clientWidth;
+		});
+		observer.observe(container);
+		const handleTimelineWheel = (event: WheelEvent) => {
+			// The timeline's native zoom handler owns modified wheel events.
+			if (event.ctrlKey || event.metaKey) return;
 			const horizontalDeltaPx = resolveTimelineWheelPanDeltaPx({
 				deltaX: event.deltaX,
 				deltaY: event.deltaY,
 				deltaMode: event.deltaMode,
 				shiftKey: event.shiftKey,
-				ctrlKey: event.ctrlKey,
-				metaKey: event.metaKey,
-				canScrollVertically: container
-					? container.scrollHeight > container.clientHeight + 1
-					: true,
+				canScrollVertically: event.deltaX !== 0 || event.shiftKey ||
+					container.scrollHeight > container.clientHeight + 1,
 			});
-
-			if (horizontalDeltaPx === 0) {
-				return;
-			}
-
-			const containerWidth = container?.clientWidth ?? 0;
-			const visibleRangeMs = clampedRange.end - clampedRange.start;
-			if (containerWidth <= 0 || visibleRangeMs <= 0) {
-				return;
-			}
-
+			if (!Number.isFinite(horizontalDeltaPx) || horizontalDeltaPx === 0 || width <= 0) return;
 			event.preventDefault();
-			const deltaMs = (horizontalDeltaPx / containerWidth) * visibleRangeMs;
-			panTimelineRange(deltaMs);
-		},
-		[clampedRange.end, clampedRange.start, focused, panTimelineRange, timelineContainerRef, totalMs],
-	);
+			const fraction = horizontalDeltaPx / width;
+			setViewportRange(previous => {
+				const visibleSpan = Math.max(1, previous.end - previous.start);
+				const maxStart = Math.max(0, totalMs - visibleSpan);
+				const nextStart = Math.max(0, Math.min(previous.start + fraction * visibleSpan, maxStart));
+				if (nextStart === previous.start) return previous;
+				return { start: nextStart, end: nextStart + visibleSpan };
+			});
+		};
+		container.addEventListener("wheel", handleTimelineWheel, { passive: false });
+		return () => {
+			observer.disconnect();
+			container.removeEventListener("wheel", handleTimelineWheel);
+		};
+	}, [focused, setViewportRange, timelineContainerRef, totalMs]);
 
 	return {
 		range,
 		setRange: setViewportRange,
 		clampedRange,
-		handleTimelineWheel,
 	};
 }

@@ -48,6 +48,7 @@ import {
 } from "./ipc/handlers";
 import { ensureMediaServer } from "./mediaServer";
 import { hardenWebContentsNavigation, shouldHardenWebContentsType } from "./navigationPolicy";
+import { getSystemFontFamilies } from "./localFontCatalog";
 import { shouldGrantDisplayCapture, shouldGrantLocalFontsPermission, shouldGrantMediaPermission } from "./permissionPolicy";
 import { ensurePackagedRendererServer, getPackagedRendererBaseUrl } from "./rendererServer";
 import { migratePackagedRendererSettings } from "./rendererSettingsMigration";
@@ -188,6 +189,7 @@ const IS_DEV = Boolean(VITE_DEV_SERVER_URL);
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
 	? path.join(process.env.APP_ROOT, "public")
 	: RENDERER_DIST;
+const LOCAL_FONT_CATALOG_PATH = path.join(process.env.VITE_PUBLIC, "local-font-catalog.html");
 
 function getTrustedCaptureDocumentBaseUrls(): string[] {
 	const trustedUrls = [pathToFileURL(path.join(RENDERER_DIST, "index.html")).href];
@@ -912,6 +914,7 @@ function createEditorWindowWrapper() {
 	mainWindow = editorWindow;
 	editorHasUnsavedChanges = false;
 	if (!IS_AUTOMATED_EXPORT) {
+		void getSystemFontFamilies(LOCAL_FONT_CATALOG_PATH).catch(() => undefined);
 		let ownedProjectPath: string | null = null;
 		const watchProject = (file: string | null) => {
 			const previous = ownedProjectPath;
@@ -1215,6 +1218,18 @@ app.whenReady().then(async () => {
 	]);
 
 	registerLiveAnnotationIpc();
+	ipcMain.handle("list-local-font-families", (event, refresh: unknown) => {
+		const frame = event.senderFrame;
+		if (!shouldGrantLocalFontsPermission({
+			permission: "local-fonts",
+			isMainFrame: frame !== null && frame === event.sender.mainFrame,
+			currentDocumentUrl: event.sender.getURL(),
+			requestingUrl: frame?.url ?? "",
+		}, getTrustedCaptureDocumentBaseUrls())) {
+			throw new Error("Local font access is limited to the editor");
+		}
+		return getSystemFontFamilies(LOCAL_FONT_CATALOG_PATH, refresh === true);
+	});
 	registerIpcHandlers(
 		createEditorWindowWrapper,
 		createSourceSelectorWindowWrapper,

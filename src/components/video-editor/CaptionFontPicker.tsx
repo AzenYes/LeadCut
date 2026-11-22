@@ -1,10 +1,19 @@
-import { useId, useState } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CaretDown, Check } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useScopedT } from "@/contexts/I18nContext";
-import { fontFamilyDisplayName, listLocalFontFamilies, localFontCssFamily } from "@/lib/localFonts";
+import {
+	fontFamilyDisplayName,
+	getCachedLocalFontFamilies,
+	listLocalFontFamilies,
+	localFontCssFamily,
+} from "@/lib/localFonts";
+
+const ROW_HEIGHT = 36;
+const LIST_HEIGHT = 256;
+const OVERSCAN_ROWS = 3;
 
 export function CaptionFontPicker({
 	value,
@@ -22,23 +31,88 @@ export function CaptionFontPicker({
 	const [search, setSearch] = useState("");
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState(false);
+	const [scrollTop, setScrollTop] = useState(0);
+	const [focusedIndex, setFocusedIndex] = useState<number | null>(null);
+	const listRef = useRef<HTMLDivElement>(null);
+	const pendingFocus = useRef<number | null>(null);
 	const family = fontFamilyDisplayName(value);
 	const fontLabel = label ?? t("captions.fontFamily", "Font");
-	const filtered = fonts.filter((font) =>
-		font.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()),
+	const query = search.trim().toLocaleLowerCase();
+	const names = useMemo(
+		() => fonts.map((name) => ({ name, searchKey: name.toLocaleLowerCase() })),
+		[fonts],
 	);
+	const filtered = useMemo(
+		() => (query ? names.filter((font) => font.searchKey.includes(query)) : names),
+		[names, query],
+	);
+	const visibleStart = Math.min(
+		Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN_ROWS),
+		filtered.length,
+	);
+	const visibleEnd = Math.min(
+		filtered.length,
+		Math.ceil((scrollTop + LIST_HEIGHT) / ROW_HEIGHT) + OVERSCAN_ROWS,
+	);
+	const visibleIndices = Array.from(
+		{ length: visibleEnd - visibleStart },
+		(_, index) => visibleStart + index,
+	);
+	if (
+		focusedIndex !== null &&
+		focusedIndex < filtered.length &&
+		!visibleIndices.includes(focusedIndex)
+	) {
+		visibleIndices.push(focusedIndex);
+		visibleIndices.sort((a, b) => a - b);
+	}
+	const focusElement = (index: number) => {
+		const element = listRef.current?.ownerDocument.getElementById(`${listId}-${index}`);
+		if (!element) return false;
+		element.focus({ preventScroll: true });
+		return true;
+	};
+	useLayoutEffect(() => {
+		const index = pendingFocus.current;
+		if (index !== null && focusElement(index)) pendingFocus.current = null;
+	});
+	const focusOption = (index: number) => {
+		const list = listRef.current;
+		if (!list || !filtered.length) return;
+		const next = Math.max(0, Math.min(filtered.length - 1, index));
+		const top = next * ROW_HEIGHT;
+		if (top < list.scrollTop) list.scrollTop = top;
+		else if (top + ROW_HEIGHT > list.scrollTop + list.clientHeight) {
+			list.scrollTop = top + ROW_HEIGHT - list.clientHeight;
+		}
+		setScrollTop(list.scrollTop);
+		if (!focusElement(next)) {
+			pendingFocus.current = next;
+			setFocusedIndex(next);
+		}
+	};
+	const changeSearch = (text: string) => {
+		setSearch(text);
+		setScrollTop(0);
+		setFocusedIndex(null);
+		pendingFocus.current = null;
+		if (listRef.current) listRef.current.scrollTop = 0;
+	};
 	const choose = (font: string) => {
 		if (!font.trim()) return;
-		onChange(localFontCssFamily(font.trim()));
+		const next = localFontCssFamily(font.trim());
+		if (next !== value) onChange(next);
 		setOpen(false);
 	};
-	const loadFonts = async () => {
-		setLoading(true);
+	const loadFonts = async (refresh = false) => {
+		const cached = !refresh && getCachedLocalFontFamilies();
+		if (cached) setFonts(cached);
+		else setLoading(true);
 		setError(false);
 		try {
-			setFonts(await listLocalFontFamilies());
+			setFonts(await listLocalFontFamilies(refresh));
 		} catch {
-			setError(true);
+			if (!cached) setError(true);
 		} finally {
 			setLoading(false);
 		}
@@ -51,8 +125,8 @@ export function CaptionFontPicker({
 				onOpenChange={(next) => {
 					setOpen(next);
 					if (next) {
-						setSearch("");
-						if (!fonts.length) void loadFonts();
+						changeSearch("");
+						void loadFonts();
 					}
 				}}
 			>
@@ -82,18 +156,16 @@ export function CaptionFontPicker({
 						aria-label={t("captions.searchFonts", "Search fonts")}
 						placeholder={t("captions.searchFonts", "Search fonts")}
 						value={search}
-						onChange={(event) => setSearch(event.target.value)}
+						onChange={(event) => changeSearch(event.target.value)}
 						onKeyDown={(event) => {
+							if (event.nativeEvent.isComposing) return;
 							if (event.key === "Enter" && !loading) {
 								event.preventDefault();
-								choose(filtered[0] ?? search);
+								choose(filtered[0]?.name ?? search);
 							}
 							if (event.key === "ArrowDown") {
 								event.preventDefault();
-								document
-									.getElementById(listId)
-									?.querySelector<HTMLButtonElement>("[role=option]")
-									?.focus();
+								focusOption(0);
 							}
 						}}
 					/>
@@ -109,55 +181,71 @@ export function CaptionFontPicker({
 									"Could not read local fonts. Retry or enter an installed font name.",
 								)}
 							</p>
-							<Button type="button" size="sm" onClick={() => void loadFonts()}>
+							<Button type="button" size="sm" onClick={() => void loadFonts(true)}>
 								{t("captions.retryFonts", "Retry")}
 							</Button>
 						</div>
 					) : (
 						<div
+							ref={listRef}
 							id={listId}
 							role="listbox"
 							aria-label={t("captions.fontList", "Installed fonts")}
 							className="max-h-64 overflow-y-auto overscroll-contain"
-							onKeyDown={(event) => {
-								const options = Array.from(
-									event.currentTarget.querySelectorAll<HTMLButtonElement>(
-										"[role=option]",
-									),
-								);
-								const index = options.indexOf(event.target as HTMLButtonElement);
-								const next =
-									event.key === "ArrowDown"
-										? Math.min(index + 1, options.length - 1)
-										: event.key === "ArrowUp"
-											? Math.max(index - 1, 0)
-											: event.key === "Home"
-												? 0
-												: event.key === "End"
-													? options.length - 1
-													: null;
-								if (next !== null) {
-									event.preventDefault();
-									options[next]?.focus();
-								}
-							}}
+							style={{ maxHeight: LIST_HEIGHT }}
+							onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
 						>
-							{filtered.map((font) => (
-								<button
-									key={font}
-									role="option"
-									aria-selected={font === family}
-									type="button"
-									className="flex w-full items-center justify-between gap-2 rounded-lg px-2 py-2 text-left text-sm font-normal hover:bg-default focus-visible:bg-default focus-visible:outline-none aria-selected:bg-default"
-									style={{ fontFamily: localFontCssFamily(font) }}
-									onClick={() => choose(font)}
+							{filtered.length > 0 && (
+								<div
+									role="presentation"
+									className="relative"
+									style={{ height: filtered.length * ROW_HEIGHT }}
 								>
-									<span className="truncate">{font}</span>
-									{font === family && (
-										<Check className="size-4 shrink-0" aria-hidden="true" />
-									)}
-								</button>
-							))}
+									{visibleIndices.map((index) => {
+										const { name: font } = filtered[index];
+										return (
+											<button
+												key={font}
+												id={`${listId}-${index}`}
+												role="option"
+												aria-selected={font === family}
+												aria-posinset={index + 1}
+												aria-setsize={filtered.length}
+												type="button"
+												tabIndex={index === (focusedIndex ?? 0) ? 0 : -1}
+												className="absolute inset-x-0 flex w-full items-center justify-between gap-2 rounded-lg px-2 text-left text-sm font-normal hover:bg-default focus-visible:bg-default focus-visible:outline-none aria-selected:bg-default"
+												style={{
+													fontFamily: localFontCssFamily(font),
+													top: index * ROW_HEIGHT,
+													height: ROW_HEIGHT,
+												}}
+												onFocus={() => setFocusedIndex(index)}
+												onKeyDown={(event) => {
+													const targets: Record<string, number> = {
+														ArrowDown: index + 1,
+														ArrowUp: index - 1,
+														Home: 0,
+														End: filtered.length - 1,
+													};
+													const target = targets[event.key];
+													if (typeof target !== "number") return;
+													event.preventDefault();
+													focusOption(target);
+												}}
+												onClick={() => choose(font)}
+											>
+												<span className="truncate">{font}</span>
+												{font === family && (
+													<Check
+														className="size-4 shrink-0"
+														aria-hidden="true"
+													/>
+												)}
+											</button>
+										);
+									})}
+								</div>
+							)}
 							{!filtered.length && (
 								<p className="p-2 text-sm text-muted-foreground">
 									{t("captions.noFonts", "No fonts found.")}
@@ -165,23 +253,18 @@ export function CaptionFontPicker({
 							)}
 						</div>
 					)}
-					{search.trim() &&
-						!loading &&
-						!fonts.some(
-							(font) =>
-								font.toLocaleLowerCase() === search.trim().toLocaleLowerCase(),
-						) && (
-							<Button
-								type="button"
-								variant="secondary"
-								className="w-full justify-start truncate"
-								onClick={() => choose(search)}
-							>
-								{t("captions.useFontName", "Use font name: {{name}}", {
-									name: search.trim(),
-								})}
-							</Button>
-						)}
+					{query && !loading && !filtered.some((font) => font.searchKey === query) && (
+						<Button
+							type="button"
+							variant="secondary"
+							className="w-full justify-start truncate"
+							onClick={() => choose(search)}
+						>
+							{t("captions.useFontName", "Use font name: {{name}}", {
+								name: search.trim(),
+							})}
+						</Button>
+					)}
 				</PopoverContent>
 			</Popover>
 		</div>

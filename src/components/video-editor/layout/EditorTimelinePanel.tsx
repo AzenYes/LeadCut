@@ -1,7 +1,7 @@
 import { TIMELINE_HEIGHT_STORAGE_KEY } from "@/lib/storageKeys";
-import type { Range } from "dnd-timeline";
+import type { Range, Span } from "dnd-timeline";
 import { readRendererSetting, writeRendererSetting } from "@/lib/durableRendererSettings";
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useI18n } from "@/contexts/I18nContext";
 import { useShortcuts } from "@/contexts/ShortcutsContext";
 import { formatBinding } from "@/lib/shortcuts";
@@ -90,6 +90,42 @@ export function EditorTimelinePanel(props: Props) {
 		currentTime,
 		handleSelectAnnotation,
 	} = props;
+	const captionById = useMemo(() => new Map(projection.effectiveCaptionRegions.map((cue) => [cue.id, cue])), [projection.effectiveCaptionRegions]);
+	const selectedCaptionFragments = useMemo(() => timeline.selectedCaptionId
+		? projection.effectiveCaptionRegions.filter((cue) => cue.sourceCueId === timeline.selectedCaptionId)
+		: [], [projection.effectiveCaptionRegions, timeline.selectedCaptionId]);
+	const selectedIds = useMemo(() => {
+		const selected = new Set(timeline.selectedRegionIds);
+		if (!selected.size) return timeline.selectedRegionIds;
+		return [...selected, ...projection.effectiveCaptionRegions.filter((cue) => selected.has(cue.sourceCueId)).map((cue) => cue.id)];
+	}, [timeline.selectedRegionIds, projection.effectiveCaptionRegions]);
+	const handleSelectCaption = useCallback((id: string | null) => {
+		const fragment = id === null ? undefined : captionById.get(id);
+		captionCommands.handleSelectCaption(fragment?.sourceCueId ?? null, fragment?.startMs);
+	}, [captionById, captionCommands.handleSelectCaption]);
+	const handleCaptionSpanChange = useCallback((id: string, span: Span) => {
+		const fragment = captionById.get(id);
+		if (fragment) captionCommands.handleCaptionRetime(fragment.sourceCueId, retimeCaptionFragment(fragment, span));
+	}, [captionById, captionCommands.handleCaptionRetime]);
+	const handleCaptionDelete = useCallback((id: string) => {
+		const fragment = captionById.get(id);
+		if (fragment) captionCommands.handleCaptionDelete(fragment.sourceCueId);
+	}, [captionById, captionCommands.handleCaptionDelete]);
+	const clearSelection = useCallback(() => {
+		timeline.setSelectedRegionIds([]);
+		timeline.setSelectedVideoId(null);
+	}, [timeline.setSelectedRegionIds, timeline.setSelectedVideoId]);
+	const { select, changeSpan, importVideo } = props.videoCommands;
+	const videoTrackControls = useMemo(() => ({
+		tracks: timeline.videoTracks,
+		regions: timeline.videoRegions,
+		selectedIds: timeline.selectedRegionIds.length ? timeline.selectedRegionIds : timeline.selectedVideoId ? [timeline.selectedVideoId] : [],
+		onSelect: select,
+		onChangeSpan: changeSpan,
+		onImport: (id: string) => void importVideo(id),
+		onTrackChange: (id: string, patch: Partial<(typeof timeline.videoTracks)[number]>) =>
+			timeline.setVideoTracks((tracks) => tracks.map((track) => track.id === id ? { ...track, ...patch } : track)),
+	}), [timeline.videoTracks, timeline.videoRegions, timeline.selectedRegionIds, timeline.selectedVideoId, timeline.setVideoTracks, select, changeSpan, importVideo]);
 
 	return (
 		<div
@@ -160,12 +196,12 @@ export function EditorTimelinePanel(props: Props) {
 			<TimelineEditor
 				focusRange={props.focusRange}
 				changeMarkers={props.changeMarkers}
-				selectedIds={[...timeline.selectedRegionIds, ...projection.effectiveCaptionRegions.filter((cue) => timeline.selectedRegionIds.includes(cue.sourceCueId)).map((cue) => cue.id)]}
+				selectedIds={selectedIds}
 				onSelectRegions={props.sequenceTools.selectRegions}
 				forwardSelectionActive={props.sequenceTools.forwardSelectionActive}
 				onForwardSelect={props.sequenceTools.selectForward}
-				onClearSelection={() => { timeline.setSelectedRegionIds([]); timeline.setSelectedVideoId(null); }}
-				videoTrackControls={{ tracks: timeline.videoTracks, regions: timeline.videoRegions, selectedIds: timeline.selectedRegionIds.length ? timeline.selectedRegionIds : timeline.selectedVideoId ? [timeline.selectedVideoId] : [], onSelect: props.videoCommands.select, onChangeSpan: props.videoCommands.changeSpan, onImport: (id) => void props.videoCommands.importVideo(id), onTrackChange: (id, patch) => timeline.setVideoTracks((tracks) => tracks.map((track) => track.id === id ? { ...track, ...patch } : track)) }}
+				onClearSelection={clearSelection}
+				videoTrackControls={videoTrackControls}
 				ref={timelineRef}
 				videoDuration={projection.timelineDuration}
 				currentTime={currentTime}
@@ -208,40 +244,18 @@ export function EditorTimelinePanel(props: Props) {
 				selectedAudioId={timeline.selectedAudioId}
 				onSelectAudio={audioCommands.handleSelectAudio}
 				captionRegions={projection.effectiveCaptionRegions}
-				onCaptionSpanChange={(id, span) => {
-					const fragment = projection.effectiveCaptionRegions.find(
-						(cue) => cue.id === id,
-					);
-					if (!fragment) return;
-					captionCommands.handleCaptionRetime(
-						fragment.sourceCueId,
-						retimeCaptionFragment(fragment, span),
-					);
-				}}
+				onCaptionSpanChange={handleCaptionSpanChange}
 				selectedCaptionId={
-					projection.effectiveCaptionRegions.find(
+					selectedCaptionFragments.find(
 						(cue) =>
-							cue.sourceCueId === timeline.selectedCaptionId &&
 							currentTime * 1000 >= cue.startMs &&
 							currentTime * 1000 < cue.endMs,
 					)?.id ??
-					projection.effectiveCaptionRegions.find(
-						(cue) => cue.sourceCueId === timeline.selectedCaptionId,
-					)?.id ??
+					selectedCaptionFragments[0]?.id ??
 					null
 				}
-				onSelectCaption={(id) => {
-					const fragment = projection.effectiveCaptionRegions.find(
-						(cue) => cue.id === id,
-					);
-					captionCommands.handleSelectCaption(fragment?.sourceCueId ?? null, fragment?.startMs);
-				}}
-				onCaptionDelete={(id) => {
-					const fragment = projection.effectiveCaptionRegions.find(
-						(cue) => cue.id === id,
-					);
-					if (fragment) captionCommands.handleCaptionDelete(fragment.sourceCueId);
-				}}
+				onSelectCaption={handleSelectCaption}
+				onCaptionDelete={handleCaptionDelete}
 				onCaptionAdded={captionCommands.handleCaptionAdded}
 				captionsEnabled={timeline.autoCaptionSettings.enabled}
 				captionQuickAddEnabled={timeline.autoCaptionSettings.timelineQuickAdd}

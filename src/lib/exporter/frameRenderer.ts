@@ -76,7 +76,7 @@ import {
 } from "@/lib/pixiApplicationLifecycle";
 import { isVideoWallpaperSource } from "@/lib/wallpapers";
 import { renderAnnotations } from "./annotationRenderer";
-import { renderCaptions } from "./captionRenderer";
+import { renderCaptions, type CaptionLayoutCache } from "./captionRenderer";
 import { getCaptionTimeMs } from "@/components/video-editor/captionTimeline";
 import { ForwardFrameSource } from "./forwardFrameSource";
 import { resolveMediaElementSource } from "./localMediaSource";
@@ -255,6 +255,8 @@ export class FrameRenderer {
 	private lastSyncedBackgroundLoopTimeSec: number | null = null;
 	private cleanupBackgroundSource: (() => void) | null = null;
 	private config: FrameRenderConfig;
+	private readonly captionSettings: FrameRenderConfig["autoCaptionSettings"];
+	private readonly captionLayoutCache: CaptionLayoutCache = {};
 	private animationState: AnimationState;
 	private motionBlurState: MotionBlurState;
 	private layoutCache: LayoutCache | null = null;
@@ -278,6 +280,7 @@ export class FrameRenderer {
 
 	constructor(config: FrameRenderConfig) {
 		this.config = config;
+		this.captionSettings = chapterCaptionSettings(config.autoCaptionSettings, config.chapterProgress, config.width, config.height);
 		this.animationState = createAnimationState();
 		this.motionBlurState = createMotionBlurState();
 		this.springScale = createSpringState(1);
@@ -1411,7 +1414,7 @@ export class FrameRenderer {
 			this.app.renderer.render(this.app.stage);
 			this.compositeWithShadows(false);
 			if (this.compositeCtx && this.config.autoCaptionSettings && this.config.autoCaptions?.[0]?.timeBasis === "timeline") {
-				renderCaptions(this.compositeCtx, this.config.autoCaptions, chapterCaptionSettings(this.config.autoCaptionSettings, this.config.chapterProgress, this.config.width, this.config.height)!, this.config.width, this.config.height, backgroundTimelineTimestamp / 1000);
+				renderCaptions(this.compositeCtx, this.config.autoCaptions, this.captionSettings!, this.config.width, this.config.height, backgroundTimelineTimestamp / 1000, this.captionLayoutCache);
 			}
 			drawChapterProgress(this.compositeCtx, this.config.chapterProgress, this.config.width, this.config.height, backgroundTimelineTimestamp / 1000);
 			drawKeystrokes(this.compositeCtx, this.config, getVisibleKeystrokes(this.config.keystrokes, backgroundTimelineTimestamp / 1000));
@@ -1540,10 +1543,11 @@ export class FrameRenderer {
 			renderCaptions(
 				this.compositeCtx,
 				this.config.autoCaptions,
-				chapterCaptionSettings(this.config.autoCaptionSettings, this.config.chapterProgress, this.config.width, this.config.height)!,
+				this.captionSettings!,
 				this.config.width,
 				this.config.height,
 				getCaptionTimeMs(this.config.autoCaptions, timestamp / 1000, backgroundTimelineTimestamp / 1000),
+				this.captionLayoutCache,
 			);
 		}
 		drawChapterProgress(this.compositeCtx, this.config.chapterProgress, this.config.width, this.config.height, backgroundTimelineTimestamp / 1000);

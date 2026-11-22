@@ -83,6 +83,28 @@ describe("clip timeline playback", () => {
 		advance(16);
 		expect(video.play).toHaveBeenCalledTimes(calls + 1);
 	});
+	it("reports playback ticks separately from explicit transport seeks", async () => {
+		const { video } = setup();
+		const onTime = vi.fn();
+		const onPlaybackTick = vi.fn();
+		const playback = createClipPlayback({
+			video,
+			getClips: () => [{ id: "clip", startMs: 0, endMs: 4000, sourceStartMs: 1000, speed: 1 }],
+			onTime,
+			onPlaybackTick,
+			onPlaying: vi.fn(),
+			onError: vi.fn(),
+		});
+		await playback.play();
+		expect(onTime).toHaveBeenLastCalledWith(0, 1);
+		video.currentTime = 1.5;
+		advance(500);
+		expect(onPlaybackTick).toHaveBeenLastCalledWith(0.5, 1.5);
+		expect(onTime).toHaveBeenCalledTimes(1);
+		playback.seek(2);
+		expect(onTime).toHaveBeenLastCalledWith(2, 3);
+		expect(onPlaybackTick).toHaveBeenCalledTimes(1);
+	});
 	it("crosses a source cut at the same 2.8s timeline timestamp without playing the removed footage", async () => {
 		const { video, playback, onTime, onSourceSeek } = setup([
 			{ id: "a", startMs: 0, endMs: 2800, sourceStartMs: 0, speed: 1 },
@@ -102,6 +124,36 @@ describe("clip timeline playback", () => {
 		video.currentTime = 3.501;
 		advance(1);
 		expect(onTime).toHaveBeenLastCalledWith(2.801, 3.501);
+	});
+	it("carries the media clock past a continuous cut without seeking or restarting playback", async () => {
+		const { video, playback, onTime, onSourceSeek } = setup([
+			{ id: "a", startMs: 0, endMs: 1000, sourceStartMs: 0, speed: 1 },
+			{ id: "b", startMs: 1000, endMs: 1100, sourceStartMs: 1000, speed: 1 },
+			{ id: "c", startMs: 1100, endMs: 2000, sourceStartMs: 1100, speed: 1 },
+		]);
+		await playback.play();
+		video.currentTime = 1.04;
+		advance(1040);
+		expect(onTime).toHaveBeenLastCalledWith(1.04, 1.04);
+		video.currentTime = 1.14;
+		advance(100);
+		expect(onTime).toHaveBeenLastCalledWith(1.14, 1.14);
+		expect(video.currentTime).toBe(1.14);
+		expect(onSourceSeek).not.toHaveBeenCalled();
+		expect(video.play).toHaveBeenCalledTimes(1);
+	});
+	it("applies a neighboring clip's different speed at its exact source in-point", async () => {
+		const { video, playback, onTime, onSourceSeek } = setup([
+			{ id: "a", startMs: 0, endMs: 1000, sourceStartMs: 0, speed: 1 },
+			{ id: "b", startMs: 1000, endMs: 2000, sourceStartMs: 1000, speed: 2 },
+		]);
+		await playback.play();
+		video.currentTime = 1.04;
+		advance(1040);
+		expect(video.currentTime).toBe(1);
+		expect(video.playbackRate).toBe(2);
+		expect(onTime).toHaveBeenLastCalledWith(1, 1);
+		expect(onSourceSeek).toHaveBeenLastCalledWith("cut");
 	});
 	it("cannot simulate playback after the final clip is deleted", async () => {
 		const { video, playback, onTime } = setup([]);

@@ -2,7 +2,6 @@ import { enablePitchPreservingPlayback } from "@/lib/mediaTiming";
 import { applyPreviewPlaybackRate } from "./playbackRate";
 import {
 	type ClipRegion,
-	findClipAtTimelineTime,
 	getClipSourceStartMs,
 	getTimelineDurationMs,
 	sortClipRegions,
@@ -13,10 +12,21 @@ export function findPreviewClipAtTimelineTime(
 	timeMs: number,
 	clips: ClipRegion[],
 ): ClipRegion | null {
-	const active = findClipAtTimelineTime(timeMs, clips);
+	return findPreviewClip(timeMs, sortClipRegions(clips));
+}
+
+function findPreviewClip(timeMs: number, sortedClips: ClipRegion[]): ClipRegion | null {
+	const active = sortedClips.find((clip) => timeMs >= clip.startMs && timeMs < clip.endMs);
 	if (active) return active;
-	const last = sortClipRegions(clips)[clips.length - 1];
+	const last = sortedClips[sortedClips.length - 1];
 	return last && Math.abs(timeMs - last.endMs) < 1e-7 ? last : null;
+}
+
+function isContinuousSourceCut(left: ClipRegion, right: ClipRegion): boolean {
+	if (left.endMs !== right.startMs || left.speed !== right.speed) return false;
+	const sourceEnd = getClipSourceStartMs(left) + (left.endMs - left.startMs) * left.speed;
+	// Sequence edits can round source in-points to whole milliseconds.
+	return Math.abs(sourceEnd - getClipSourceStartMs(right)) <= 0.5;
 }
 
 /** Timeline time advances at 1x; only the source media uses the clip's speed. */
@@ -26,6 +36,7 @@ export function createClipPlayback({
 	getPlaybackRate = () => 1,
 	getDurationMs = () => undefined,
 	onTime,
+	onPlaybackTick = onTime,
 	onPlaying,
 	onError,
 	onSourceSeek,
@@ -35,6 +46,7 @@ export function createClipPlayback({
 	getPlaybackRate?: () => number;
 	getDurationMs?: () => number | undefined;
 	onTime: (timelineSeconds: number, sourceSeconds: number | null) => void;
+	onPlaybackTick?: (timelineSeconds: number, sourceSeconds: number | null) => void;
 	onPlaying: (playing: boolean) => void;
 	onError: (error: unknown) => void;
 	onSourceSeek?: (reason: "cut" | "seek") => void;
@@ -45,12 +57,31 @@ export function createClipPlayback({
 	let frameWindow: Window | null = null;
 	const schedule = (callback: FrameRequestCallback) => {
 		frameWindow = video.ownerDocument?.defaultView ?? null;
-		return frameWindow ? frameWindow.requestAnimationFrame(callback) : requestAnimationFrame(callback);
+		return frameWindow
+			? frameWindow.requestAnimationFrame(callback)
+			: requestAnimationFrame(callback);
 	};
 	let lastTick = 0;
 	let activeClip: ClipRegion | null = null;
 	let playRequest = 0;
-	const duration = () => getDurationMs() ?? getTimelineDurationMs(getClips(), 0);
+	let clipSnapshot: ClipRegion[] | undefined;
+	let sortedClips: ClipRegion[] = [];
+	let clipDuration = 0;
+	const currentClips = () => {
+		const clips = getClips();
+		if (clips !== clipSnapshot) {
+			clipSnapshot = clips;
+			sortedClips = sortClipRegions(clips);
+			clipDuration = getTimelineDurationMs(clips, 0);
+		}
+		return sortedClips;
+	};
+	const duration = () => {
+		const explicit = getDurationMs();
+		if (explicit !== undefined) return explicit;
+		currentClips();
+		return clipDuration;
+	};
 
 	const pause = () => {
 		playRequest++;
@@ -72,15 +103,31 @@ export function createClipPlayback({
 			onError(error);
 		});
 	};
-	const sync = (seek = false) => {
-		const clips = getClips();
+	const sync = (seek = false, notifyTime = onTime) => {
+		const clips = currentClips();
+		let clip = findPreviewClip(timeMs, clips);
 		// Empty timeline space is skipped during playback. Clip positions and
 		// paused seeks stay intact so editing a gap never moves source footage.
-		if (playing && !findPreviewClipAtTimelineTime(timeMs, clips)) {
-			const next = sortClipRegions(clips).find((clip) => clip.startMs > timeMs);
-			if (next) timeMs = next.startMs;
+		if (playing && !clip) {
+			clip = clips.find((candidate) => candidate.startMs > timeMs) ?? null;
+			if (clip) timeMs = clip.startMs;
 		}
-		const clip = findPreviewClipAtTimelineTime(timeMs, clips);
+		const changedClip = clip !== activeClip;
+		const continuous =
+			playing &&
+			!seek &&
+			!video.seeking &&
+			!video.ended &&
+			changedClip &&
+			activeClip &&
+			clip &&
+			timeMs === clip.startMs &&
+			isContinuousSourceCut(activeClip, clip);
+		if (continuous && clip) {
+			// Keep the decoder running and carry forward any progress past the seam.
+			const offset = (video.currentTime * 1000 - getClipSourceStartMs(clip)) / clip.speed;
+			timeMs = Math.min(clip.endMs, duration(), clip.startMs + Math.max(0, offset));
+		}
 		const sourceMs = clip
 			? getClipSourceStartMs(clip) + (timeMs - clip.startMs) * clip.speed
 			: null;
@@ -93,7 +140,8 @@ export function createClipPlayback({
 				onError(error);
 				return;
 			}
-			if (seek || clip !== activeClip) {
+			const jump = seek || (changedClip && !continuous);
+			if (jump) {
 				// Clip out-points are exclusive. At the final timeline endpoint,
 				// request a frame inside the clip, not EOF or the following footage.
 				const atEnd = timeMs >= clip.endMs - 1e-7;
@@ -118,13 +166,13 @@ export function createClipPlayback({
 			}
 			// Adopting a live media element into the floating monitor can make Chromium
 			// pause it asynchronously. The transport still owns the user's play intent.
-			if (playing && (seek || clip !== activeClip || video.paused)) playSource();
+			if (playing && (jump || video.paused)) playSource();
 		} else {
 			playRequest++;
 			video.pause();
 		}
 		activeClip = clip;
-		onTime(timeMs / 1000, sourceMs === null ? null : sourceMs / 1000);
+		notifyTime(timeMs / 1000, sourceMs === null ? null : sourceMs / 1000);
 	};
 	const tick = (now: number) => {
 		request = null;
@@ -147,7 +195,7 @@ export function createClipPlayback({
 		}
 		timeMs = Math.min(duration(), timeMs);
 		lastTick = now;
-		sync();
+		sync(false, onPlaybackTick);
 		if (!playing) return;
 		if (timeMs >= duration()) pause();
 		else request = schedule(tick);
@@ -172,6 +220,7 @@ export function createClipPlayback({
 			sync(true);
 		},
 		refresh: (seek = true) => {
+			clipSnapshot = undefined;
 			timeMs = Math.min(timeMs, duration());
 			sync(seek);
 		},

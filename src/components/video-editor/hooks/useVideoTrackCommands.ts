@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "@/contexts/I18nContext";
 import { toast } from "@/components/ui/toast";
 import { getRenderableVideoUrl } from "@/lib/assetPath";
@@ -11,6 +11,8 @@ type Input = { timeline: ReturnType<typeof useTimelineState>; appearance: Return
 export function useVideoTrackCommands({ timeline, appearance, sourceDuration, currentTime }: Input) {
 	const { t } = useI18n();
 	const [importing, setImporting] = useState(false);
+	const currentTimeRef = useRef(currentTime);
+	currentTimeRef.current = currentTime;
 	useEffect(() => {
 		const sourcePath = appearance.webcam.sourcePath;
 		if (!sourcePath || sourceDuration <= 0 || timeline.clipRegions.length === 0 || timeline.videoTracks.some((track) => track.kind === "webcam")) return;
@@ -32,6 +34,7 @@ export function useVideoTrackCommands({ timeline, appearance, sourceDuration, cu
 	}, [timeline.setSelectedVideoId, timeline.setSelectedRegionIds, timeline.setSelectedClipId, timeline.setSelectedZoomId, timeline.setSelectedAudioId, timeline.setSelectedAnnotationId, timeline.setSelectedCaptionId]);
 	const importVideo = useCallback(async (targetTrackId?: string) => {
 		if (importing) return;
+		const startMs = Math.max(0, Math.round(currentTimeRef.current * 1000));
 		setImporting(true);
 		try {
 			const picked = await window.electronAPI.openVideoFilePicker();
@@ -50,7 +53,6 @@ export function useVideoTrackCommands({ timeline, appearance, sourceDuration, cu
 			} finally { video.removeAttribute("src"); video.load(); }
 			if (!(sourceDurationMs > 0) || !Number.isFinite(sourceDurationMs)) throw new Error(t("editor.tracks.invalidDuration", "Video duration is invalid"));
 			const metadata = await window.electronAPI.probeNativeVideoMetadata?.(sourcePath).catch(() => undefined);
-			const startMs = Math.max(0, Math.round(currentTime * 1000));
 			const available = timeline.videoTracks.find((track) => !track.locked && !timeline.videoRegions.some((region) => region.trackId === track.id && region.startMs < startMs + sourceDurationMs && region.endMs > startMs));
 			const trackId = targetTrackId ?? available?.id ?? addTrack();
 			if (timeline.videoTracks.find((track) => track.id === trackId)?.locked || timeline.videoRegions.some((region) => region.trackId === trackId && region.startMs < startMs + sourceDurationMs && region.endMs > startMs)) throw new Error(t("editor.tracks.occupied", "This track is locked or the selected interval is occupied."));
@@ -59,7 +61,7 @@ export function useVideoTrackCommands({ timeline, appearance, sourceDuration, cu
 			select(region.id);
 		} catch (error) { toast.error(String(error instanceof Error ? error.message : error)); }
 		finally { setImporting(false); }
-	}, [importing, currentTime, addTrack, timeline.videoTracks, timeline.videoRegions, timeline.setVideoRegions, select, t]);
+	}, [importing, addTrack, timeline.videoTracks, timeline.videoRegions, timeline.setVideoRegions, select, t]);
 	const changeSpan = useCallback((id: string, span: { start: number; end: number }, trackId?: string) => {
 		timeline.setVideoRegions((current) => current.map((region) => {
 			if (region.id !== id || timeline.videoTracks.find((track) => track.id === region.trackId)?.locked || timeline.videoTracks.find((track) => track.id === trackId)?.locked) return region;

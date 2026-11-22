@@ -218,3 +218,41 @@ test("font access failure supports retry and manual font names", async ({ page }
 		.poll(async () => (await saved(page))?.autoCaptionSettings.fontFamily)
 		.toBe('"Microsoft YaHei"');
 });
+
+test("large font menus keep keyboard navigation and search over the entire cached catalog", async ({ page }) => {
+	await prepare(page);
+	await page.evaluate(() => {
+		let reads = 0;
+		Object.assign(window, {
+			fontReadCount: () => reads,
+			queryLocalFonts: async () => {
+				reads++;
+				return Array.from({ length: 600 }, (_, index) => ({
+					family: `Test Font ${String(index).padStart(3, "0")}`,
+				}));
+			},
+		});
+	});
+	const captions = page.getByRole("radio", { name: "字幕", exact: true });
+	const font = page.getByRole("button", { name: "字体", exact: true });
+	const search = page.getByRole("textbox", { name: "搜索字体" });
+	const options = page.getByRole("option", { name: /^Test Font/ });
+	await captions.click();
+	await font.click();
+	await expect(options.first()).toHaveAttribute("aria-setsize", "600");
+	expect(await options.count()).toBeLessThan(25);
+	await search.press("ArrowDown");
+	await page.keyboard.press("End");
+	await expect(page.getByRole("option", { name: "Test Font 599", exact: true })).toBeFocused();
+	await page.keyboard.press("Home");
+	await expect(page.getByRole("option", { name: "Test Font 000", exact: true })).toBeFocused();
+	await search.fill("537");
+	await expect(options).toHaveCount(1);
+	await search.press("Enter");
+	await expect(font).toHaveText("Test Font 537");
+	await page.getByRole("radio", { name: "设置", exact: true }).click();
+	await captions.click();
+	await font.click();
+	await expect(options.first()).toHaveAttribute("aria-setsize", "600");
+	expect(await page.evaluate(() => (window as Window & { fontReadCount: () => number }).fontReadCount())).toBe(1);
+});

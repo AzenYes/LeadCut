@@ -55,7 +55,7 @@ import {
 	TIMELINE_AXIS_HEIGHT_PX,
 } from "../../timelineLayout";
 import PlaybackCursor from "../playhead/PlaybackCursor";
-import { SourceAudioWaveform, WaveformLoadStatus } from "../waveform/SourceAudioWaveform";
+import { SourceAudioWaveformLane, WaveformLoadStatus } from "../waveform/SourceAudioWaveform";
 import { CaptionOverview, type CaptionOverviewMark, type CaptionOverviewSelection } from "./CaptionOverview";
 
 
@@ -601,11 +601,11 @@ const TimelineCanvasRows = memo(function TimelineCanvasRows({
 	const selected = useMemo(() => new Set(selectedIds), [selectedIds]);
 	const keepIds = useMemo(() => {
 		const kept = new Set(selected);
-		for (const id of [selectedZoomId, selectedAnnotationId, selectedAudioId, selectedCaptionId, activeId]) {
+		for (const id of [selectedZoomId, selectedClipId, selectedAnnotationId, selectedAudioId, selectedCaptionId, activeId]) {
 			if (typeof id === "string") kept.add(id);
 		}
 		return kept;
-	}, [selected, selectedZoomId, selectedAnnotationId, selectedAudioId, selectedCaptionId, activeId]);
+	}, [selected, selectedZoomId, selectedClipId, selectedAnnotationId, selectedAudioId, selectedCaptionId, activeId]);
 	const overscanMs = range.end - range.start;
 	const hiddenIds = useMemo(() => new Set(liveHiddenItemIds ?? []), [liveHiddenItemIds]);
 	const { clipItems, zoomItems, captionItems, annotationRows, audioRows } = useMemo(() => {
@@ -684,13 +684,25 @@ const TimelineCanvasRows = memo(function TimelineCanvasRows({
 			})),
 		[clipItems, clips],
 	);
+	const visibleClips = useMemo(
+		() => filterItemsInRange(clipPresentation, range, overscanMs, keepIds),
+		[clipPresentation, range, overscanMs, keepIds],
+	);
+	const embeddedCaptionIds = useMemo(() => {
+		if (captionItems.length <= 200) return null;
+		const ids = new Set<string>();
+		for (const item of captionItems) {
+			if (getEmbeddedCaptionSpan(item.span, clipPresentation)) ids.add(item.id);
+		}
+		return ids;
+	}, [captionItems, clipPresentation]);
 	const { captionMarks, interactiveCaptions } = useMemo(() => {
 		const captionMarks: CaptionOverviewMark[] = [];
 		const interactiveCaptions: TimelineRenderItem[] = [];
 		for (const item of visibleCaptions) {
 			const width = valueToPixels(item.span.end - item.span.start);
 			if (denseCaptions && width < 24 && item.id !== inspectedCaptionId && !keepIds.has(item.id)) {
-				if (getEmbeddedCaptionSpan(item.span, clipPresentation)) {
+				if (embeddedCaptionIds?.has(item.id)) {
 					captionMarks.push({
 						id: item.id,
 						offset: valueToPixels(item.span.start - rangeStart),
@@ -702,7 +714,7 @@ const TimelineCanvasRows = memo(function TimelineCanvasRows({
 			}
 		}
 		return { captionMarks, interactiveCaptions };
-	}, [visibleCaptions, valueToPixels, denseCaptions, inspectedCaptionId, keepIds, clipPresentation, rangeStart]);
+	}, [visibleCaptions, valueToPixels, denseCaptions, inspectedCaptionId, keepIds, embeddedCaptionIds, rangeStart]);
 	const clipBoundaries = useMemo(() => {
 		const starts = new Map<number, (typeof clipPresentation)[number]>();
 		const ends = new Set<number>();
@@ -749,7 +761,7 @@ const TimelineCanvasRows = memo(function TimelineCanvasRows({
 					onMouseDown={onCaptionRowMouseDown}
 					onClick={onCaptionRowClick}
 				>
-					{clipPresentation.map((clip) => (
+					{visibleClips.map((clip) => (
 						<div
 							key={clip.id}
 							data-caption-add-target
@@ -818,7 +830,7 @@ const TimelineCanvasRows = memo(function TimelineCanvasRows({
 			)}
 			{videoRows}
 			<Row filmstrip id={CLIP_ROW_ID} isEmpty={clipItems.length === 0} hint={uiText("pressCToSplitClip")}>
-				{clipPresentation.map((item) => (
+				{visibleClips.map((item) => (
 					<Item
 						id={item.id}
 						key={item.id}
@@ -839,7 +851,7 @@ const TimelineCanvasRows = memo(function TimelineCanvasRows({
 						{item.label}
 					</Item>
 				))}
-				{clipPresentation.map((left) => {
+				{visibleClips.map((left) => {
 					const right = clipBoundaries.starts.get(left.span.end);
 					if (!right) return null;
 					const seam = (left.displaySpan.end + right.displaySpan.start) / 2;
@@ -870,20 +882,14 @@ const TimelineCanvasRows = memo(function TimelineCanvasRows({
 			{showSourceAudioTrack &&
 				sourceAudioTracks.map((track) => (
 					<Row key={track.id} id={`${SOURCE_AUDIO_ROW_ID}-${track.id}`} label={track.label} labelColor="currentColor">
-						{clipPresentation.map((item) => (
-							<SourceAudioWaveform
-								key={`source-audio-${track.id}-${item.id}`}
-								clipId={item.id}
-								track={track}
-								displaySpan={item.displaySpan}
-								sourceSpan={item.sourceSpan ?? item.span}
-								selected={item.id === selectedClipId}
-								muted={item.muted}
-								setting={getSourceAudioTrackSettingsForClip?.(item.id)[track.id]}
-								onDeleteRange={onSourceAudioRangeDelete}
-								onSeek={onSeek}
-							/>
-						))}
+						<SourceAudioWaveformLane
+							track={track}
+							clips={visibleClips}
+							selectedClipId={selectedClipId}
+							getSettingForClip={getSourceAudioTrackSettingsForClip}
+							onDeleteRange={onSourceAudioRangeDelete}
+							onSeek={onSeek}
+						/>
 					</Row>
 				))}
 

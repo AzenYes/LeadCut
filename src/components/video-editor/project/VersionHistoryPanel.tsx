@@ -22,9 +22,9 @@ type Props = { history: ReturnType<typeof useProjectVersionHistory> };
 
 export function VersionHistoryPanel({ history }: Props) {
 	const { locale, t } = useI18n();
+	if (!history.open) return null;
 	const text = (key: string, vars?: Record<string, string>) => t(`common.interface.${key}`, undefined, vars);
 	const date = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" });
-	if (!history.open) return null;
 	return (
 		<Dialog open onOpenChange={open => { if (!open) history.close(); }}>
 			<DialogContent className="max-w-2xl">

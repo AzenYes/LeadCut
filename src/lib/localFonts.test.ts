@@ -22,6 +22,31 @@ it("does not silently replace denied access with a hardcoded list", async () => 
 	});
 	await expect(listLocalFontFamilies()).rejects.toThrow("denied");
 });
+it("shares an in-flight desktop read and refreshes a cached catalog on request", async () => {
+	const read = vi
+		.fn()
+		.mockResolvedValueOnce([" Arial ", "Arial"])
+		.mockResolvedValueOnce(["微软雅黑"]);
+	vi.stubGlobal("window", { electronAPI: { listLocalFontFamilies: read } });
+	const first = listLocalFontFamilies();
+	expect(listLocalFontFamilies()).toBe(first);
+	await expect(first).resolves.toEqual(["Arial"]);
+	await expect(listLocalFontFamilies()).resolves.toEqual(["Arial"]);
+	expect(read).toHaveBeenCalledTimes(1);
+	await expect(listLocalFontFamilies(true)).resolves.toEqual(["微软雅黑"]);
+	await expect(listLocalFontFamilies()).resolves.toEqual(["微软雅黑"]);
+	expect(read.mock.calls).toEqual([[false], [true]]);
+});
+
+it("allows a retry after a transient desktop enumeration failure", async () => {
+	const read = vi
+		.fn()
+		.mockRejectedValueOnce(new Error("temporarily unavailable"))
+		.mockResolvedValueOnce(["Arial"]);
+	vi.stubGlobal("window", { electronAPI: { listLocalFontFamilies: read } });
+	await expect(listLocalFontFamilies()).rejects.toThrow("temporarily unavailable");
+	await expect(listLocalFontFamilies()).resolves.toEqual(["Arial"]);
+});
 it("quotes a font name containing a comma as a single family", () => {
 	expect(localFontCssFamily('Font, "Custom"')).toBe('"Font, \\"Custom\\""');
 });
