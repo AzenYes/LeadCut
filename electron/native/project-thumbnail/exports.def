@@ -1,0 +1,4 @@
+LIBRARY LeadCutThumbnail
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

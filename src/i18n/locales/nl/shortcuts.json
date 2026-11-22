@@ -1,0 +1,32 @@
+{
+	"actions": {
+		"addZoom": "Zoom toevoegen",
+		"addTrim": "Trim toevoegen",
+		"addSpeed": "Snelheid toevoegen",
+		"addAnnotation": "Annotatie toevoegen",
+		"addKeyframe": "Keyframe toevoegen",
+		"deleteSelected": "Selectie verwijderen",
+		"playPause": "Afspelen / Pauzeren",
+		"cycleForward": "Annotaties vooruit doorlopen",
+		"cycleBackward": "Annotaties achteruit doorlopen",
+		"deleteSelectedAlt": "Selectie verwijderen (alt)",
+		"panTimeline": "Tijdlijn verschuiven",
+		"zoomTimeline": "Tijdlijn zoomen"
+	},
+	"recording": {
+		"title": "Recording (global)",
+		"occupied": "Already used by another application",
+		"needsModifier": "Use Ctrl or Alt (Command or Option on macOS).",
+		"unsupportedKey": "This key cannot be used as a global shortcut.",
+		"duplicate": "This shortcut is already used for {{action}}.",
+		"saveFailed": "Could not save the shortcuts.",
+		"actions": {
+			"toggleRecording": "Start / Stop recording",
+			"togglePause": "Pause / Resume recording",
+			"addMarkerCut": "Mark for deletion",
+			"addMarkerHighlight": "Mark highlight",
+			"toggleAnnotation": "Toggle recording annotations",
+			"toggleKeystrokeCapture": "Pause / Resume keystroke capture"
+		}
+	}
+}

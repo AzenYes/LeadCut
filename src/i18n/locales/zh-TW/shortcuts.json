@@ -1,0 +1,32 @@
+{
+	"actions": {
+		"addZoom": "新增縮放",
+		"addTrim": "新增修剪",
+		"addSpeed": "新增速度",
+		"addAnnotation": "新增註解",
+		"addKeyframe": "新增關鍵影格",
+		"deleteSelected": "刪除所選項目",
+		"playPause": "播放或暫停",
+		"cycleForward": "往前切換註解",
+		"cycleBackward": "往後切換註解",
+		"deleteSelectedAlt": "刪除所選項目（Alt）",
+		"panTimeline": "平移時間軸",
+		"zoomTimeline": "縮放時間軸"
+	},
+	"recording": {
+		"title": "錄製（全域）",
+		"occupied": "已被其他程式占用",
+		"needsModifier": "請加上 Ctrl 或 Alt。macOS 對應 Command 或 Option。",
+		"unsupportedKey": "此按鍵無法用作全域快速鍵。",
+		"duplicate": "此快速鍵已用於「{{action}}」。",
+		"saveFailed": "無法儲存快速鍵。",
+		"actions": {
+			"toggleRecording": "開始 / 停止錄製",
+			"togglePause": "暫停 / 繼續錄製",
+			"addMarkerCut": "標記「這裡要刪」",
+			"addMarkerHighlight": "標記「重點」",
+			"toggleAnnotation": "開啟 / 關閉錄製標註",
+			"toggleKeystrokeCapture": "暫停 / 繼續記錄按鍵"
+		}
+	}
+}

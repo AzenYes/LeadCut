@@ -1,0 +1,32 @@
+{
+	"actions": {
+		"addZoom": "Adicionar zoom",
+		"addTrim": "Adicionar corte",
+		"addSpeed": "Adicionar velocidade",
+		"addAnnotation": "Adicionar anotação",
+		"addKeyframe": "Adicionar quadro-chave",
+		"deleteSelected": "Excluir selecionado",
+		"playPause": "Reproduzir / Pausar",
+		"cycleForward": "Alternar anotações para frente",
+		"cycleBackward": "Alternar anotações para trás",
+		"deleteSelectedAlt": "Excluir selecionado (alt)",
+		"panTimeline": "Mover linha do tempo",
+		"zoomTimeline": "Zoom da linha do tempo"
+	},
+	"recording": {
+		"title": "Recording (global)",
+		"occupied": "Already used by another application",
+		"needsModifier": "Use Ctrl or Alt (Command or Option on macOS).",
+		"unsupportedKey": "This key cannot be used as a global shortcut.",
+		"duplicate": "This shortcut is already used for {{action}}.",
+		"saveFailed": "Could not save the shortcuts.",
+		"actions": {
+			"toggleRecording": "Start / Stop recording",
+			"togglePause": "Pause / Resume recording",
+			"addMarkerCut": "Mark for deletion",
+			"addMarkerHighlight": "Mark highlight",
+			"toggleAnnotation": "Toggle recording annotations",
+			"toggleKeystrokeCapture": "Pause / Resume keystroke capture"
+		}
+	}
+}

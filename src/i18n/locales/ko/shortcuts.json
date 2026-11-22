@@ -1,0 +1,32 @@
+{
+	"actions": {
+		"addZoom": "확대 추가",
+		"addTrim": "트림 추가",
+		"addSpeed": "속도 추가",
+		"addAnnotation": "주석 추가",
+		"addKeyframe": "키프레임 추가",
+		"deleteSelected": "선택 항목 삭제",
+		"playPause": "재생 / 일시 정지",
+		"cycleForward": "주석 다음으로 순환",
+		"cycleBackward": "주석 이전으로 순환",
+		"deleteSelectedAlt": "선택 항목 삭제 (보조)",
+		"panTimeline": "타임라인 이동",
+		"zoomTimeline": "타임라인 확대/축소"
+	},
+	"recording": {
+		"title": "Recording (global)",
+		"occupied": "Already used by another application",
+		"needsModifier": "Use Ctrl or Alt (Command or Option on macOS).",
+		"unsupportedKey": "This key cannot be used as a global shortcut.",
+		"duplicate": "This shortcut is already used for {{action}}.",
+		"saveFailed": "Could not save the shortcuts.",
+		"actions": {
+			"toggleRecording": "Start / Stop recording",
+			"togglePause": "Pause / Resume recording",
+			"addMarkerCut": "Mark for deletion",
+			"addMarkerHighlight": "Mark highlight",
+			"toggleAnnotation": "Toggle recording annotations",
+			"toggleKeystrokeCapture": "Pause / Resume keystroke capture"
+		}
+	}
+}

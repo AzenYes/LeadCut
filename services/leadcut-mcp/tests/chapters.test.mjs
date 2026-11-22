@@ -1,0 +1,30 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {test,before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import {Client} from '@modelcontextprotocol/sdk/client/index.js';
+import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+let dir,client;
+before(async()=>{dir=await fs.mkdtemp(path.join(os.tmpdir(),'leadcut-chapters-'));client=new Client({name:'chapters-test',version:'1'});await client.connect(new StdioClientTransport({command:process.execPath,args:[path.resolve('dist/index.js')]}));});
+after(async()=>{await client?.close();if(dir)await fs.rm(dir,{recursive:true,force:true});});
+async function call(name,args,error=false){const r=await client.callTool({name,arguments:args});assert.equal(!!r.isError,error,JSON.stringify(r));return error?r:JSON.parse(r.content[0].text);}
+test('draft → approval → style → stale; safe revision, backup and preservation',async()=>{
+ const project=path.join(dir,'chapters.leadcut'),timelineModel='leadcut-sequence-v1';
+ const base={version:2,videoPath:'source.mp4',editor:{clipRegions:[{id:'a',startMs:0,endMs:6000,sourceStartMs:0,speed:1}],autoCaptions:[{id:'caption',text:'Keep',startMs:0,endMs:1000}],audioRegions:[{id:'music',audioPath:'music.wav',startMs:0,endMs:6000}],future:{untouched:true}}};
+ const raw=JSON.stringify(base);await fs.writeFile(project,raw);
+ const chapters=[{id:'one',title:'开场',startMs:0,endMs:2000},{id:'two',title:'实操',startMs:2000,endMs:6000}];
+ const dry=await call('set_chapters',{project,timelineModel,chapters});assert.equal(dry.status,'off');assert.equal(await fs.readFile(project,'utf8'),raw);
+ await call('set_chapters',{project,timelineModel,chapters,dryRun:false},true);
+ const draft=await call('set_chapters',{project,timelineModel,chapters,dryRun:false,expectedRevision:dry.revision});assert.equal(draft.chapterProgress.confirmed,false);assert.equal(await fs.readFile(draft.backupPath,'utf8'),raw);
+ await call('update_chapter_style',{project,timelineModel,enabled:true},true);
+ await call('confirm_chapters',{project,timelineModel,confirmedByUser:false},true);
+ const ready=await call('confirm_chapters',{project,timelineModel,confirmedByUser:true,dryRun:false,expectedRevision:draft.revision});assert.equal(ready.status,'ready');
+ const styled=await call('update_chapter_style',{project,timelineModel,style:{backgroundOpacity:0.55},dryRun:false,expectedRevision:ready.revision});assert.equal(styled.chapterProgress.style.backgroundOpacity,0.55);
+ await call('update_chapter_style',{project,timelineModel,style:{gap:20},dryRun:false,expectedRevision:ready.revision},true);
+ const stored=JSON.parse(await fs.readFile(project,'utf8'));for(const key of ['autoCaptions','audioRegions','future'])assert.deepEqual(stored.editor[key],base.editor[key]);
+ assert.equal((await call('list_chapters',{project})).status,'ready');
+ stored.editor.clipRegions[0].speed=2;await fs.writeFile(project,JSON.stringify(stored));assert.equal((await call('list_chapters',{project})).status,'stale');
+ await call('update_chapter_style',{project,timelineModel,enabled:true},true);
+ await call('set_chapters',{project,timelineModel,chapters:[{id:'x',title:'invalid',startMs:1,endMs:6000}]},true);
+});
