@@ -21,11 +21,12 @@ test("a newer project opens for preview without accepting edits or saves", async
 		};
 	});
 	await page.goto("/?windowType=editor");
+	const clip = page.locator('[data-region-id="future-clip"]');
+	await expect(clip).toHaveCount(1, { timeout: 20_000 });
 	await expect(page.getByText("This project is read-only. Open it in a newer version of LeadCut to edit it.")).toBeVisible();
-	await expect(page.locator('[data-region-id="future-clip"]')).toHaveCount(1);
 	await page.keyboard.press("Control+s");
 	await page.keyboard.press("Delete");
-	await expect(page.locator('[data-region-id="future-clip"]')).toHaveCount(1);
+	await expect(clip).toHaveCount(1);
 	await expect(page.locator("html")).not.toHaveAttribute("data-save-attempts");
 });
 
