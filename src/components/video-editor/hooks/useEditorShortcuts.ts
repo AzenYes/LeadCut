@@ -1,16 +1,22 @@
 import { useEffect, useRef } from "react";
-import { type ShortcutAction, type ShortcutsConfig, matchesShortcut, SHORTCUT_ACTIONS } from "@/lib/shortcuts";
+import { type FixedShortcut, type ShortcutAction, type ShortcutsConfig, FIXED_SHORTCUTS, matchesShortcut, SHORTCUT_ACTIONS } from "@/lib/shortcuts";
 import { isEditorNavigationTarget, isEditorShortcutBlocked, isShortcutEditingTarget } from "../editorShortcutScope";
+
+type Options = {
+	repeatable?: ReadonlySet<ShortcutAction>;
+	canHandle?: (action: ShortcutAction) => boolean;
+	fixedActions?: Partial<Record<FixedShortcut["action"], () => boolean>>;
+	onEscape?: () => void;
+};
 
 export function useEditorShortcuts(
 	shortcuts: ShortcutsConfig,
 	isMac: boolean,
 	actions: Record<ShortcutAction, () => void>,
-	repeatable?: ReadonlySet<ShortcutAction>,
-	canHandle?: (action: ShortcutAction) => boolean,
+	options: Options = {},
 ) {
-	const current = useRef({ shortcuts, isMac, actions, repeatable, canHandle });
-	current.current = { shortcuts, isMac, actions, repeatable, canHandle };
+	const current = useRef({ shortcuts, isMac, actions, options });
+	current.current = { shortcuts, isMac, actions, options };
 	useEffect(() => {
 		let heldPlaybackKey: string | null = null;
 		const consume = (event: KeyboardEvent) => {
@@ -31,11 +37,21 @@ export function useEditorShortcuts(
 			if (event.defaultPrevented || event.isComposing || isShortcutEditingTarget(event.target)) return;
 			if (/^(Arrow|Home$|End$)/.test(event.key) && !isEditorNavigationTarget(event.target)) return;
 			const active = current.current;
+			const { canHandle, fixedActions, onEscape, repeatable } = active.options;
+			if (onEscape && matchesShortcut(event, { key: "escape" }, active.isMac)) onEscape();
+			const fixed = fixedActions && FIXED_SHORTCUTS.find(({ bindings }) =>
+				bindings.some(binding => matchesShortcut(event, binding, active.isMac)));
+			if (fixed && fixedActions?.[fixed.action]) {
+				// The transcript owns deletion when the grid itself has focus.
+				if (fixed.action === "deleteSelection" && (event.target as Element | null)?.matches?.("[data-caption-transcript-grid]")) return;
+				if (fixedActions[fixed.action]?.()) consume(event);
+				return;
+			}
 			const action = SHORTCUT_ACTIONS.find(name =>
-				matchesShortcut(event, active.shortcuts[name], active.isMac) && (active.canHandle?.(name) ?? true));
+				matchesShortcut(event, active.shortcuts[name], active.isMac) && (canHandle?.(name) ?? true));
 			if (!action) return;
 			consume(event);
-			if (event.repeat && !active.repeatable?.has(action)) return;
+			if (event.repeat && !repeatable?.has(action)) return;
 			// React Aria activates focused buttons on Space keyup. Consume both
 			// events for the playback binding so one press toggles only once.
 			if (action === "playPause") heldPlaybackKey = key;

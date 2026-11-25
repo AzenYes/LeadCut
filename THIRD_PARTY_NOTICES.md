@@ -54,3 +54,15 @@ The NVIDIA CUDA compositor uses the NVENC 12.0 interface header by NVIDIA
 Corporation (copyright 2010–2022). The MIT License notice is included in the
 [vendored header](electron/native/nvidia-cuda-compositor/third_party/nvEncodeAPI.h).
 [Upstream header](https://github.com/NVIDIA/VideoProcessingFramework/blob/529fb192f22ec305b8b237ed9e6014e171339c81/src/TC/third_party/nvEncodeAPI.h)
+
+## Windows media tools
+
+The compact Windows x64 package includes FFmpeg and FFprobe 6.1.1 with shared
+libraries. The package includes the applicable notices in `resources/media-tools/licenses`.
+The release workflow cross-builds the runtime on Ubuntu 22.04 using pinned upstream
+sources. The build recipe and source checksums are recorded in
+[`scripts/build-windows-media-tools.sh`](scripts/build-windows-media-tools.sh).
+
+The Windows packaging step takes the runtime from `LEADCUT_WINDOWS_MEDIA_TOOLS_DIR`.
+Local builds without this variable use the existing `ffmpeg-static` and `ffprobe-static`
+dependencies.

@@ -1,151 +1,127 @@
-import type { ExportBackendPreference, ExportRenderBackend } from "./types";
+import type { ExportBackendPreference } from "./types";
 
 export type LightningRuntimePlatform = "darwin" | "win32" | "linux" | "unknown";
+export type ExportEncodeRoute = "native-static-layout" | "breeze-stream" | "webcodecs";
+export type NativeStaticExportRoute = "nvidia-cuda-compositor" | "windows-d3d11-compositor" | "ffmpeg-static-layout";
+
+export interface ExportRoutePlan<Route extends string> {
+	primary: Route | null;
+	fallbacks: Route[];
+	reasons: Partial<Record<Route, string[]>>;
+}
+
+export interface EncoderRoutePlan extends ExportRoutePlan<ExportEncodeRoute> {
+	waitForMetadata: boolean;
+	preferBreezeToSoftware: boolean;
+}
+
+interface EncoderRouteOptions {
+	scope: "encoder";
+	backendPreference: ExportBackendPreference;
+	platform: LightningRuntimePlatform;
+	nvidiaCudaEnabled?: boolean;
+	mixedAudioTransport?: boolean;
+	requiresFfmpegAudio?: boolean;
+	staticLayoutAttempted?: boolean;
+	retryWithWebCodecs?: "native-encoder" | "audio-mux";
+}
+
+interface StaticLayoutRouteOptions {
+	scope: "static-layout";
+	cudaSkipReason: string | null;
+	d3d11SkipReason: string | null;
+	gpuOnlyFeatures: string[];
+}
 
 export function normalizeLightningRuntimePlatform(
 	platformHint: string | null | undefined,
 ): LightningRuntimePlatform {
-	if (!platformHint) {
-		return "unknown";
-	}
-
-	if (/win/i.test(platformHint)) {
-		return "win32";
-	}
-
-	if (/linux/i.test(platformHint)) {
-		return "linux";
-	}
-
-	if (/mac|iphone|ipad|ipod/i.test(platformHint)) {
-		return "darwin";
-	}
-
+	if (!platformHint) return "unknown";
+	if (/win/i.test(platformHint)) return "win32";
+	if (/linux/i.test(platformHint)) return "linux";
+	if (/mac|iphone|ipad|ipod/i.test(platformHint)) return "darwin";
 	return "unknown";
 }
 
-export function shouldPreferNativeAutoBackend(_platform: LightningRuntimePlatform): boolean {
-	return _platform === "darwin" || _platform === "win32";
+function selectRoutes<Route extends string>(
+	ordered: readonly { route: Route; reason: string; rejected?: boolean }[],
+): ExportRoutePlan<Route> {
+	const eligible: Route[] = [];
+	const reasons: ExportRoutePlan<Route>["reasons"] = {};
+	for (const { route, reason, rejected } of ordered) {
+		reasons[route] = [reason];
+		if (!rejected) eligible.push(route);
+	}
+	const [primary = null, ...fallbacks] = eligible;
+	return { primary, fallbacks, reasons };
 }
 
-export type LightningExportRoute = "native-static-layout" | "breeze-stream" | "webcodecs";
-
-export interface LightningExportRouteDecision {
-	route: LightningExportRoute;
-	status: "selected" | "fallback" | "rejected";
-	reasons: string[];
-}
-
-export interface LightningExportRoutePlan {
-	selectedRoute: LightningExportRoute;
-	decisions: LightningExportRouteDecision[];
-}
-
-// Disabled while stabilizing v1.3.0: the Windows auto static-layout probe can
-// leave Lightning at "Preparing export..." before the stable streaming fallback.
-const WINDOWS_AUTO_STATIC_LAYOUT_FIRST_ENABLED = false;
-
-export function shouldPreferNativeStaticLayoutBeforeBreeze(
-	platform: LightningRuntimePlatform,
-	backendPreference: ExportBackendPreference,
-): boolean {
-	return (
-		WINDOWS_AUTO_STATIC_LAYOUT_FIRST_ENABLED &&
-		backendPreference === "auto" &&
-		platform === "win32"
-	);
-}
-
-export function planLightningExportRoutes(options: {
-	backendPreference: ExportBackendPreference;
-	platform: LightningRuntimePlatform;
-	nativeStaticLayoutAvailable: boolean;
-	nativeStaticLayoutSkipReasons?: string[];
-}): LightningExportRoutePlan {
-	const decisions: LightningExportRouteDecision[] = [];
-	const nativeStaticLayoutSkipReasons = options.nativeStaticLayoutSkipReasons ?? [];
-	const canUseNativeStaticLayout =
-		options.nativeStaticLayoutAvailable && nativeStaticLayoutSkipReasons.length === 0;
-
-	const addNativeStaticLayoutDecision = (status: LightningExportRouteDecision["status"]) => {
-		decisions.push({
-			route: "native-static-layout",
-			status,
-			reasons: canUseNativeStaticLayout
-				? ["visually-compatible"]
-				: nativeStaticLayoutSkipReasons.length > 0
-					? nativeStaticLayoutSkipReasons
-					: ["native-static-unavailable"],
-		});
-	};
-
-	if (options.backendPreference === "webcodecs") {
-		decisions.push({
-			route: "webcodecs",
-			status: "selected",
-			reasons: ["user-selected-webcodecs"],
-		});
-		return { selectedRoute: "webcodecs", decisions };
+export function planExportRoute(options: EncoderRouteOptions): EncoderRoutePlan;
+export function planExportRoute(options: StaticLayoutRouteOptions): ExportRoutePlan<NativeStaticExportRoute>;
+export function planExportRoute(options: EncoderRouteOptions | StaticLayoutRouteOptions) {
+	if (options.scope === "static-layout") {
+		const { cudaSkipReason, d3d11SkipReason, gpuOnlyFeatures } = options;
+		return selectRoutes<NativeStaticExportRoute>([
+			{
+				route: "nvidia-cuda-compositor",
+				reason: cudaSkipReason ?? "cuda-compositor-available",
+				rejected: cudaSkipReason !== null,
+			},
+			{
+				route: "windows-d3d11-compositor",
+				reason: d3d11SkipReason ?? "d3d11-compositor-available",
+				rejected: d3d11SkipReason !== null,
+			},
+			{
+				route: "ffmpeg-static-layout",
+				reason: gpuOnlyFeatures.length > 0
+					? `unsupported-layout:${gpuOnlyFeatures.join(", ")}`
+					: "ffmpeg-static-layout-available",
+				rejected: gpuOnlyFeatures.length > 0,
+			},
+		]);
 	}
 
-	const preferStaticFirst =
-		options.backendPreference === "breeze" ||
-		shouldPreferNativeStaticLayoutBeforeBreeze(options.platform, options.backendPreference);
-
-	if (preferStaticFirst) {
-		addNativeStaticLayoutDecision(canUseNativeStaticLayout ? "selected" : "rejected");
-		decisions.push({
-			route: "breeze-stream",
-			status: canUseNativeStaticLayout ? "fallback" : "selected",
-			reasons: [
-				options.backendPreference === "breeze"
-					? "user-selected-breeze"
-					: "native-static-layout-not-auto-default",
-			],
-		});
-		decisions.push({
-			route: "webcodecs",
-			status: "fallback",
-			reasons: ["breeze-unavailable-fallback"],
-		});
+	const { backendPreference, platform, nvidiaCudaEnabled, mixedAudioTransport,
+		requiresFfmpegAudio, staticLayoutAttempted, retryWithWebCodecs } = options;
+	const webCodecs = { route: "webcodecs", reason: "default-webcodecs-first" } as const;
+	const breeze = { route: "breeze-stream", reason: "platform-prefers-native-streaming" } as const;
+	const webCodecsOnly = backendPreference === "webcodecs" || retryWithWebCodecs !== undefined;
+	if (webCodecsOnly) {
 		return {
-			selectedRoute: canUseNativeStaticLayout ? "native-static-layout" : "breeze-stream",
-			decisions,
+			...selectRoutes<ExportEncodeRoute>([
+				{ ...webCodecs, reason: retryWithWebCodecs ? `retry-after:${retryWithWebCodecs}` : "explicit-webcodecs" },
+			]),
+			waitForMetadata: false,
+			preferBreezeToSoftware: false,
 		};
 	}
 
-	if (options.backendPreference === "auto" && shouldPreferNativeAutoBackend(options.platform)) {
-		decisions.push({
-			route: "native-static-layout",
-			status: "rejected",
-			reasons: ["platform-does-not-use-native-static-layout"],
-		});
-		decisions.push({
-			route: "breeze-stream",
-			status: "selected",
-			reasons: ["platform-prefers-native-streaming"],
-		});
-		decisions.push({
-			route: "webcodecs",
-			status: "fallback",
-			reasons: ["breeze-unavailable-fallback"],
-		});
-		return { selectedRoute: "breeze-stream", decisions };
-	}
-
-	decisions.push({
-		route: "webcodecs",
-		status: "selected",
-		reasons: ["default-webcodecs-first"],
-	});
-	decisions.push({
-		route: "breeze-stream",
-		status: "fallback",
-		reasons: ["webcodecs-software-or-unavailable-fallback"],
-	});
-	return { selectedRoute: "webcodecs", decisions };
-}
-
-export function getDefaultLightningRenderBackend(): ExportRenderBackend {
-	return "webgl";
+	const tryStaticLayout = backendPreference === "breeze" || nvidiaCudaEnabled === true;
+	const tryBreezeFirst = tryStaticLayout || platform === "win32" || platform === "darwin" ||
+		(platform === "linux" && mixedAudioTransport && requiresFfmpegAudio === true);
+	const waitForMetadata = (tryStaticLayout && !staticLayoutAttempted) ||
+		(mixedAudioTransport === true && requiresFfmpegAudio === undefined);
+	const preferBreezeToSoftware = !tryBreezeFirst && !mixedAudioTransport;
+	const streamChoices = tryBreezeFirst
+		? [
+			{ ...breeze, reason: tryStaticLayout ? "fallback-from-static-layout" :
+				platform === "linux" ? "audio-requires-ffmpeg" : breeze.reason },
+			{ ...webCodecs, reason: "fallback-from-breeze" },
+		]
+		: [webCodecs, { ...breeze, reason: preferBreezeToSoftware
+			? "fallback-from-webcodecs" : "native-audio-mux-not-needed", rejected: !preferBreezeToSoftware }];
+	return {
+		...selectRoutes<ExportEncodeRoute>([
+			{
+				route: "native-static-layout",
+				reason: staticLayoutAttempted ? "static-layout-already-attempted" :
+					nvidiaCudaEnabled ? "cuda-opt-in" : tryStaticLayout ? "explicit-breeze" : "static-layout-not-requested",
+				rejected: !tryStaticLayout || staticLayoutAttempted,
+			},
+			...streamChoices,
+		]),
+		waitForMetadata,
+		preferBreezeToSoftware,
+	};
 }

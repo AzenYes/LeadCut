@@ -34,6 +34,7 @@ vite.config.js
 vite.config.d.ts
 
 # Native capture build artifacts
+/build/nsis/
 electron/native/wgc-capture/build/
 electron/native/cursor-monitor/build/
 electron/native/project-thumbnail/build/
@@ -51,16 +52,3 @@ gpu-export-probe.mp4
 # Browser test output
 test-results/
 playwright-report/
-
-# Local work and generated Windows installer inputs
-/.code/
-/build/nsis/
-/electron/native/bin/win32-*/LeadCutThumbnail.dll
-/electron/native/bin/win32-*/SDL2.dll
-/electron/native/bin/win32-*/ggml*.dll
-/electron/native/bin/win32-*/whisper.dll
-
-# Project-local credentials
-.env
-.env.*
-!.env.example

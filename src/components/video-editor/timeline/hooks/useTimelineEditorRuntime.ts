@@ -27,7 +27,7 @@ interface UseTimelineEditorRuntimeParams {
 	ref: ForwardedRef<TimelineEditorHandle>;
 	videoDuration: number;
 	totalMs: number;
-	currentTimeMs: number;
+	getCurrentTimeMs: () => number;
 	safeMinDurationMs: number;
 	cursorTelemetry: CursorTelemetryPoint[];
 	autoSuggestZoomsTrigger: number;
@@ -70,7 +70,6 @@ interface UseTimelineEditorRuntimeParams {
 	onCaptionAdded?: (span: Span) => void;
 	selectedCaptionId?: string | null;
 	onSelectCaption?: (id: string | null) => void;
-	isMac: boolean;
 	isTimelineFocusedRef: RefObject<boolean | null>;
 }
 
@@ -78,7 +77,7 @@ export function useTimelineEditorRuntime({
 	ref,
 	videoDuration,
 	totalMs,
-	currentTimeMs,
+	getCurrentTimeMs,
 	safeMinDurationMs,
 	cursorTelemetry,
 	autoSuggestZoomsTrigger,
@@ -121,7 +120,6 @@ export function useTimelineEditorRuntime({
 	onCaptionAdded,
 	selectedCaptionId,
 	onSelectCaption,
-	isMac,
 	isTimelineFocusedRef,
 }: UseTimelineEditorRuntimeParams) {
 	const {
@@ -150,7 +148,7 @@ export function useTimelineEditorRuntime({
 		cycleAnnotationsAtCurrentTime,
 	} = useTimelineSelection({
 		totalMs,
-		currentTimeMs,
+		getCurrentTimeMs,
 		zoomRegions,
 		clipRegions,
 		markers,
@@ -217,7 +215,7 @@ export function useTimelineEditorRuntime({
 		handleAddZoom,
 		handleSuggestZooms,
 	} = useTimelineZoomActions({
-		timeline: { videoDuration, totalMs, currentTimeMs },
+		timeline: { videoDuration, totalMs, getCurrentTimeMs },
 		regions: { zoom: zoomRegions, clip: clipRegions },
 		cursorTelemetry,
 		options: { disableSuggestedZooms },
@@ -239,11 +237,11 @@ export function useTimelineEditorRuntime({
 		if (!videoDuration || videoDuration === 0 || totalMs === 0 || !onClipSplit) {
 			return;
 		}
-		onClipSplit(currentTimeMs);
-	}, [videoDuration, totalMs, currentTimeMs, onClipSplit]);
+		onClipSplit(getCurrentTimeMs());
+	}, [videoDuration, totalMs, getCurrentTimeMs, onClipSplit]);
 
 	const { handleAddAudio } = useTimelineAudioActions({
-		timeline: { videoDuration, totalMs, currentTimeMs },
+		timeline: { videoDuration, totalMs, getCurrentTimeMs },
 		regions: { audio: audioRegions },
 		onAudioAdded,
 	});
@@ -260,15 +258,14 @@ export function useTimelineEditorRuntime({
 			}
 
 			const latestStartPos = Math.max(0, totalMs - defaultDuration);
-			const startPos = Math.max(0, Math.min(currentTimeMs, latestStartPos));
+			const startPos = Math.max(0, Math.min(getCurrentTimeMs(), latestStartPos));
 			const endPos = Math.min(startPos + defaultDuration, totalMs);
 			onAnnotationAdded({ start: startPos, end: endPos }, trackIndex);
 		},
-		[videoDuration, totalMs, currentTimeMs, defaultRegionDurationMs, onAnnotationAdded],
+		[videoDuration, totalMs, getCurrentTimeMs, defaultRegionDurationMs, onAnnotationAdded],
 	);
 
-	const deleteSelected = useTimelineKeyboardShortcuts({
-		isMac,
+	const { deleteSelected, selectAllZooms, cycleAnnotations } = useTimelineKeyboardShortcuts({
 		isTimelineFocusedRef,
 		hasAnyZoomBlocks,
 		activateSelectAllZooms,
@@ -295,7 +292,9 @@ export function useTimelineEditorRuntime({
 			addZoom: handleAddZoom,
 			addKeyframe,
 			deleteSelected,
-			addCaption: () => addCaptionAtMs(currentTimeMs),
+			selectAllZooms,
+			cycleAnnotations,
+			addCaption: () => addCaptionAtMs(getCurrentTimeMs()),
 			suggestZooms: handleSuggestZooms,
 			splitClip: handleSplitClip,
 			addAnnotation: handleAddAnnotation,
@@ -306,10 +305,12 @@ export function useTimelineEditorRuntime({
 			handleAddAnnotation,
 			handleAddAudio,
 			addCaptionAtMs,
-			currentTimeMs,
+			getCurrentTimeMs,
 			handleAddZoom,
 			addKeyframe,
 			deleteSelected,
+			selectAllZooms,
+			cycleAnnotations,
 			handleSuggestZooms,
 			handleSplitClip,
 			keyframes,

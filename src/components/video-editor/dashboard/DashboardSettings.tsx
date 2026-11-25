@@ -7,7 +7,7 @@ import { supportsHudCaptureProtection } from "@/lib/hudCaptureProtection";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
-import { useScopedT } from "@/contexts/I18nContext";
+import { useI18n, useScopedT } from "@/contexts/I18nContext";
 import { moveProjectFolderReferences } from "./useProjectFolders";
 export const DashboardSettingsContext = createContext<ReactNode>(null);
 export function DashboardSettings({ onImportFile, legacyCount, refreshProjects }: {
@@ -17,6 +17,7 @@ export function DashboardSettings({ onImportFile, legacyCount, refreshProjects }
 }) {
 	const uiText = useUiText();
 	const t = useScopedT("settings");
+	const { t: translate } = useI18n();
 	const upstreamUrl = t("about.upstreamLink");
 	const settingsContent = useContext(DashboardSettingsContext);
 	const [directory, setDirectory] = useState("");
@@ -25,6 +26,7 @@ export function DashboardSettings({ onImportFile, legacyCount, refreshProjects }
 	const [captureSupported, setCaptureSupported] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [confirmConversion, setConfirmConversion] = useState(false);
+	const [configuredAgent, setConfiguredAgent] = useState<"codex" | "claude" | null>(null);
 	const run = async (action: () => Promise<void>) => {
 		setBusy(true);
 		try {
@@ -55,6 +57,15 @@ export function DashboardSettings({ onImportFile, legacyCount, refreshProjects }
 			toast.success(summary);
 		}
 	});
+	const connectAgent = (agent: "codex" | "claude") => run(async () => {
+		const result = await window.electronAPI.configureLeadCutAgent(agent);
+		if (!result.success) {
+			toast.error(uiText("leadcutAgentSetupFailed"));
+			return;
+		}
+		setConfiguredAgent(agent);
+		toast.success(uiText("leadcutAgentSetupComplete"));
+	});
 	useEffect(() => {
 		let active = true;
 		void Promise.all([
@@ -75,11 +86,22 @@ export function DashboardSettings({ onImportFile, legacyCount, refreshProjects }
 	}, []);
 	return (
 		<section aria-label={uiText("dashboardSettings")} className="dashboard-settings max-w-2xl py-10">
-			<h1 className="mb-8 text-lg font-semibold">{uiText("settings")}</h1>
+			<h1 className="text-lg font-semibold">{translate("common.interface.applicationSettings")}</h1>
+			<p className="mt-1 mb-8 text-sm text-muted-foreground">{translate("common.interface.settingsScopeApplication")}</p>
 			<SettingsSections categories={["general", "motion", "recording", "files", "advanced"]}>
 				<SettingsCategory category={["general", "motion", "advanced"]}>
 					{settingsContent}
 				</SettingsCategory>
+				{Boolean(window.electronAPI.configureLeadCutAgent) && (
+					<SettingsCategory category="advanced">
+						<SettingsRow title={uiText("leadcutAgentSetup")} description={configuredAgent ? uiText("leadcutAgentSetupComplete") : undefined}>
+							<div className="flex gap-2">
+								<Button variant="secondary" size="sm" disabled={busy} onClick={() => void connectAgent("codex")}>Codex</Button>
+								<Button variant="secondary" size="sm" disabled={busy} onClick={() => void connectAgent("claude")}>Claude Code</Button>
+							</div>
+						</SettingsRow>
+					</SettingsCategory>
+				)}
 				<SettingsCategory category="files">
 					<SettingsRow title={uiText("openVideoOrProject")}>
 						<Button

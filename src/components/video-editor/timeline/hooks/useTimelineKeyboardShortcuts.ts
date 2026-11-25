@@ -1,10 +1,7 @@
-import { type RefObject, useCallback, useEffect } from "react";
-import { matchesShortcut } from "@/lib/shortcuts";
-import { isEditorShortcutBlocked, isShortcutEditingTarget } from "../../editorShortcutScope";
+import { type RefObject, useCallback } from "react";
 import { resolveDeleteSelectionTarget } from "./utils/timelineSelectionUtils";
 
 interface UseTimelineKeyboardShortcutsParams {
-	isMac: boolean;
 	isTimelineFocusedRef: RefObject<boolean | null>;
 	hasAnyZoomBlocks: boolean;
 	activateSelectAllZooms: () => void;
@@ -26,7 +23,6 @@ interface UseTimelineKeyboardShortcutsParams {
 }
 
 export function useTimelineKeyboardShortcuts({
-	isMac,
 	isTimelineFocusedRef,
 	hasAnyZoomBlocks,
 	activateSelectAllZooms,
@@ -72,52 +68,13 @@ export function useTimelineKeyboardShortcuts({
 		selectedKeyframeId, selectedZoomId, selectedClipId, selectedAnnotationId, selectedAudioId, selectedCaptionId,
 		deleteSelectedKeyframe, deleteSelectedZoom, deleteSelectedClip, deleteSelectedAnnotation, deleteSelectedAudio, deleteSelectedCaption,
 	]);
-	useEffect(() => {
-		const handleKeyDown = (e: KeyboardEvent) => {
-			if (e.defaultPrevented || e.isComposing || isEditorShortcutBlocked(e.target) || isShortcutEditingTarget(e.target)) return;
-
-			// Selection survives inspector focus; deletion follows the selected block.
-			if (
-				(e.key === "Delete" || e.key === "Backspace") &&
-					!e.ctrlKey &&
-					!e.metaKey &&
-					!e.altKey &&
-					!e.shiftKey
-			) {
-				if (deleteSelected()) e.preventDefault();
-				return;
-			}
-
-			if (!isTimelineFocusedRef.current) {
-				return;
-			}
-
-			if (matchesShortcut(e, { key: "a", ctrl: true }, isMac)) {
-				if (!hasAnyZoomBlocks) {
-					return;
-				}
-				e.preventDefault();
-				activateSelectAllZooms();
-				return;
-			}
-
-			if (e.key === "Tab" && annotationCount > 0) {
-				if (cycleAnnotationsAtCurrentTime(e.shiftKey)) {
-					e.preventDefault();
-				}
-			}
-		};
-
-		window.addEventListener("keydown", handleKeyDown);
-		return () => window.removeEventListener("keydown", handleKeyDown);
-	}, [
-		activateSelectAllZooms,
-		annotationCount,
-		cycleAnnotationsAtCurrentTime,
-		deleteSelected,
-		hasAnyZoomBlocks,
-		isMac,
-		isTimelineFocusedRef,
-	]);
-	return deleteSelected;
+	const selectAllZooms = useCallback(() => {
+		if (!isTimelineFocusedRef.current || !hasAnyZoomBlocks) return false;
+		activateSelectAllZooms();
+		return true;
+	}, [activateSelectAllZooms, hasAnyZoomBlocks, isTimelineFocusedRef]);
+	const cycleAnnotations = useCallback((backward: boolean) =>
+		Boolean(isTimelineFocusedRef.current && annotationCount > 0 && cycleAnnotationsAtCurrentTime(backward)),
+	[annotationCount, cycleAnnotationsAtCurrentTime, isTimelineFocusedRef]);
+	return { deleteSelected, selectAllZooms, cycleAnnotations };
 }

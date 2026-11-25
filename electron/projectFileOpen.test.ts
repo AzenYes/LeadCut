@@ -24,6 +24,18 @@ describe("shell project paths", () => {
 });
 
 describe("external project delivery", () => {
+	it("takes the first cold project for hydration and preserves later shell requests", () => {
+		const deliver = vi.fn();
+		const queue = createProjectOpenQueue(deliver);
+		queue.enqueue(["first.leadcut", "second.leadcut", "third.leadcut"]);
+		expect(queue.takeForHydration()).toBe("first.leadcut");
+		queue.ready(42);
+		expect(queue.takeForHydration()).toBeUndefined();
+		expect(deliver).toHaveBeenLastCalledWith(42, { id: 1, path: "second.leadcut" });
+		queue.complete(42, 1);
+		expect(deliver).toHaveBeenLastCalledWith(42, { id: 2, path: "third.leadcut" });
+	});
+
 	it("holds a cold launch until hydration and sends warm requests in order", () => {
 		const deliver = vi.fn();
 		const queue = createProjectOpenQueue(deliver);

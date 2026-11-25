@@ -1,9 +1,8 @@
-import { EDITOR_LAYOUT_STORAGE_KEY } from "@/lib/storageKeys";
+import { CAPTION_PANEL_WIDTH_STORAGE_KEY, EDITOR_LAYOUT_STORAGE_KEY } from "@/lib/storageKeys";
 import { useEffect, useState } from "react";
 import { loadAppSetting, saveAppSetting } from "@/lib/appSettings";
 
 const DEFAULT = { width: 320, collapsed: false, labels: false };
-const CAPTION_PANEL_WIDTH_KEY = "leadcut.editor.captionPanelWidth";
 export function useInspectorLayout(captionPanel = false) {
 	const [preferences, setPreferences] = useState(() => {
 		const stored = loadAppSetting<Partial<typeof DEFAULT>>(EDITOR_LAYOUT_STORAGE_KEY);
@@ -14,7 +13,7 @@ export function useInspectorLayout(captionPanel = false) {
 		};
 	});
 	const [captionWidth, setCaptionWidth] = useState(() => {
-		const saved = loadAppSetting<number>(CAPTION_PANEL_WIDTH_KEY);
+		const saved = loadAppSetting<number>(CAPTION_PANEL_WIDTH_STORAGE_KEY);
 		return typeof saved === "number" && Number.isFinite(saved) ? Math.max(340, Math.min(900, saved)) : 440;
 	});
 	const [windowWidth, setWindowWidth] = useState(() => window.innerWidth);
@@ -46,11 +45,11 @@ export function useInspectorLayout(captionPanel = false) {
 	return { preferences: { ...preferences, width: clamp(captionPanel ? captionWidth : preferences.width) }, compact, open: compact ? compactOpen : !preferences.collapsed,
 		minWidth, maxWidth, setWidth,
 		commitWidth: () => {
-			if (captionPanel) saveAppSetting(CAPTION_PANEL_WIDTH_KEY, captionWidth);
+			if (captionPanel) saveAppSetting(CAPTION_PANEL_WIDTH_STORAGE_KEY, captionWidth);
 			else saveAppSetting(EDITOR_LAYOUT_STORAGE_KEY, preferences);
 		},
 		updateWidth: (width: number) => {
-			if (captionPanel) { setWidth(width); saveAppSetting(CAPTION_PANEL_WIDTH_KEY, clamp(width)); }
+			if (captionPanel) { setWidth(width); saveAppSetting(CAPTION_PANEL_WIDTH_STORAGE_KEY, clamp(width)); }
 			else update({ width: clamp(width) });
 		},
 		update,

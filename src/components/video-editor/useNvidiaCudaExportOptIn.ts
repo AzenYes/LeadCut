@@ -32,13 +32,19 @@ export function saveNvidiaCudaExportOptIn(enabled: boolean) {
 	return saveAppSetting(NVIDIA_CUDA_EXPORT_OPT_IN_SETTING_KEY, enabled);
 }
 
-export function useNvidiaCudaExportOptIn({ onEnabled }: { onEnabled?: () => void } = {}) {
-	const [nvidiaCudaExportAvailable, setNvidiaCudaExportAvailable] = useState(false);
+export function useNvidiaCudaExportOptIn({
+	exportMenuOpen,
+	onEnabled,
+}: { exportMenuOpen: boolean; onEnabled?: () => void }) {
+	const [nvidiaCudaAvailability, setNvidiaCudaAvailability] = useState<boolean | null>(null);
 	const [experimentalNvidiaCudaExport, setExperimentalNvidiaCudaExportState] = useState(
 		loadInitialNvidiaCudaExportOptIn,
 	);
+	const nvidiaCudaExportAvailable = nvidiaCudaAvailability === true;
+	const shouldCheckCapabilities = exportMenuOpen || experimentalNvidiaCudaExport;
 
 	useEffect(() => {
+		if (!shouldCheckCapabilities || nvidiaCudaAvailability !== null) return;
 		let cancelled = false;
 
 		void (async () => {
@@ -49,7 +55,7 @@ export function useNvidiaCudaExportOptIn({ onEnabled }: { onEnabled?: () => void
 				}
 
 				const available = isNvidiaCudaExportAvailable(result);
-				setNvidiaCudaExportAvailable(available);
+				setNvidiaCudaAvailability(available);
 				if (!available) {
 					setExperimentalNvidiaCudaExportState(false);
 				}
@@ -58,7 +64,7 @@ export function useNvidiaCudaExportOptIn({ onEnabled }: { onEnabled?: () => void
 					return;
 				}
 				console.warn("[export] Failed to load native export capabilities", error);
-				setNvidiaCudaExportAvailable(false);
+				setNvidiaCudaAvailability(false);
 				setExperimentalNvidiaCudaExportState(false);
 			}
 		})();
@@ -66,7 +72,7 @@ export function useNvidiaCudaExportOptIn({ onEnabled }: { onEnabled?: () => void
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [nvidiaCudaAvailability, shouldCheckCapabilities]);
 
 	const setExperimentalNvidiaCudaExport = useCallback(
 		(enabled: boolean) => {

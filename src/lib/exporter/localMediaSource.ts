@@ -96,10 +96,11 @@ export async function resolveMediaResourceUrl(resource: string): Promise<string>
 		: toFileUrl(localFilePath);
 }
 
-async function createReadableMediaResourceFile(resource: string): Promise<File> {
+async function createReadableMediaResourceFile(resource: string, signal?: AbortSignal): Promise<File> {
 	const filename = resource.split(/[\\/]/).pop()?.split("?")[0] || "media";
 	const resourceUrl = await resolveMediaResourceUrl(resource);
-	const response = await fetch(resourceUrl);
+	signal?.throwIfAborted();
+	const response = signal ? await fetch(resourceUrl, { signal }) : await fetch(resourceUrl);
 	if (!response.ok) {
 		throw new Error(`Failed to load media resource: ${response.status} ${response.statusText}`);
 	}
@@ -108,7 +109,7 @@ async function createReadableMediaResourceFile(resource: string): Promise<File> 
 	return new File([blob], filename, { type: blob.type || inferMimeType(filename) });
 }
 
-export async function createFallbackDemuxerSource(resource: string): Promise<string | File> {
+export async function createFallbackDemuxerSource(resource: string, signal?: AbortSignal): Promise<string | File> {
 	// Local media already has a random-access transport: WebDemuxer issues bounded
 	// byte-range requests against this URL. Converting it to a File would copy the
 	// complete recording through Electron IPC and make memory use scale with file size.
@@ -116,7 +117,7 @@ export async function createFallbackDemuxerSource(resource: string): Promise<str
 		return resolveMediaResourceUrl(resource);
 	}
 
-	return createReadableMediaResourceFile(resource);
+	return createReadableMediaResourceFile(resource, signal);
 }
 
 export async function resolveMediaElementSource(resource: string): Promise<{

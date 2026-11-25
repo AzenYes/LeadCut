@@ -4,13 +4,11 @@ import {
 	type SourceAudioTrackSettings,
 } from "@/components/video-editor/audio/audioTypes";
 import { useSourceAudioTrackSettings } from "./useSourceAudioTrackSettings";
-import { getSourceTrackIdFromPath } from "@/lib/exporter/audioRoutingEngine";
+import type { SourceTrackId } from "@/lib/exporter/audioRoutingEngine";
 import { isSourceAudioDeleted } from "./sourceAudioEdits";
 
 interface UseClipAudioSettingsControllerParams {
-	currentSourceTimeMs?: number;
 	selectedClipId: string | null;
-	activeClipId: string | null;
 	sourceAudioTrackSettingsByClip: Record<string, SourceAudioTrackSettings>;
 	setSourceAudioTrackSettingsByClip: React.Dispatch<
 		React.SetStateAction<Record<string, SourceAudioTrackSettings>>
@@ -22,9 +20,7 @@ interface UseClipAudioSettingsControllerParams {
 }
 
 export function useClipAudioSettingsController({
-	currentSourceTimeMs = 0,
 	selectedClipId,
-	activeClipId,
 	sourceAudioTrackSettingsByClip,
 	setSourceAudioTrackSettingsByClip,
 	defaultSourceAudioTrackSettings,
@@ -32,7 +28,6 @@ export function useClipAudioSettingsController({
 }: UseClipAudioSettingsControllerParams) {
 	const {
 		sourceAudioTrackMeta,
-		activeSourceAudioTrackSettings,
 		selectedClipSourceAudioTrackSettings,
 		getSourceAudioTrackSettingsForClip,
 		onSourceAudioTracksMetaChange,
@@ -41,18 +36,11 @@ export function useClipAudioSettingsController({
 		onSourceAudioRangeDelete,
 	} = useSourceAudioTrackSettings({
 		selectedClipId,
-		activeClipId,
 		sourceAudioTrackSettingsByClip,
 		setSourceAudioTrackSettingsByClip,
 		defaultSourceAudioTrackSettings,
 		setDefaultSourceAudioTrackSettings,
 	});
-
-	const previewSourceAudioTrackSettings = useMemo(
-		() =>
-			activeClipId ? activeSourceAudioTrackSettings : selectedClipSourceAudioTrackSettings,
-		[activeClipId, activeSourceAudioTrackSettings, selectedClipSourceAudioTrackSettings],
-	);
 
 	const embeddedTrackId = useMemo<"mixed" | "system">(() => {
 		const hasMixedTrack = sourceAudioTrackMeta.some((track) => track.id === "mixed");
@@ -61,20 +49,11 @@ export function useClipAudioSettingsController({
 		return hasSystemTrack ? "system" : "mixed";
 	}, [sourceAudioTrackMeta]);
 
-	const embeddedSourcePreviewGain = useMemo(() => {
-		const settings = previewSourceAudioTrackSettings[embeddedTrackId] ?? {
-			volume: 1,
-			normalize: false,
-		};
-		const normalizeGain = settings.normalize ? SOURCE_AUDIO_NORMALIZE_GAIN : 1;
-		if (isSourceAudioDeleted(settings, currentSourceTimeMs)) return 0;
-		return Math.max(0, Math.min(1, settings.volume * normalizeGain));
-	}, [embeddedTrackId, previewSourceAudioTrackSettings, currentSourceTimeMs]);
-
 	const getSourceTrackPreviewGain = useCallback(
-		(audioPath: string) => {
-			const trackId = getSourceTrackIdFromPath(audioPath);
-			const settings = previewSourceAudioTrackSettings[trackId] ?? {
+		(trackId: SourceTrackId, activeClipId: string | null, currentSourceTimeMs: number) => {
+			const settings = (activeClipId
+				? getSourceAudioTrackSettingsForClip(activeClipId)
+				: selectedClipSourceAudioTrackSettings)[trackId] ?? {
 				volume: 1,
 				normalize: false,
 			};
@@ -82,19 +61,18 @@ export function useClipAudioSettingsController({
 			if (isSourceAudioDeleted(settings, currentSourceTimeMs)) return 0;
 			return Math.max(0, Math.min(1, settings.volume * normalizeGain));
 		},
-		[previewSourceAudioTrackSettings, currentSourceTimeMs],
+		[getSourceAudioTrackSettingsForClip, selectedClipSourceAudioTrackSettings],
 	);
 
 	return {
 		onSourceAudioRangeDelete,
 		sourceAudioTrackMeta,
-		activeSourceAudioTrackSettings,
 		selectedClipSourceAudioTrackSettings,
 		getSourceAudioTrackSettingsForClip,
 		onSourceAudioTracksMetaChange,
 		onSelectedClipSourceAudioTrackVolumeChange,
 		onSelectedClipSourceAudioTrackNormalizeChange,
-		embeddedSourcePreviewGain,
+		embeddedTrackId,
 		getSourceTrackPreviewGain,
 	};
 }

@@ -20,7 +20,6 @@ import {
 type Input = {
 	timeline: ReturnType<typeof useTimelineState>;
 	duration: number;
-	currentTime: number;
 	nextClipIdRef: MutableRefObject<number>;
 	initializedRef: MutableRefObject<boolean>;
 	autoFullTrackIdRef: MutableRefObject<string | null>;
@@ -30,7 +29,6 @@ type Input = {
 export function useTimelineProjection({
 	timeline,
 	duration,
-	currentTime,
 	nextClipIdRef,
 	initializedRef,
 	autoFullTrackIdRef,
@@ -107,7 +105,6 @@ export function useTimelineProjection({
 		() => projectCaptionCues(autoCaptions, clipRegions),
 		[autoCaptions, clipRegions],
 	);
-	const timelinePlayheadTime = currentTime;
 	const timelineDuration = useMemo(
 		() =>
 			Math.max(getTimelineDurationMs(clipRegions, initializedRef.current ? 0 : duration * 1000), ...timeline.videoRegions.map((region) => region.endMs), ...timeline.audioRegions.map((region) => region.endMs)) / 1000,
@@ -140,7 +137,6 @@ export function useTimelineProjection({
 		mapSourceTimeToTimelineTime: toTimelineTime,
 		effectiveZoomRegions,
 		effectiveCaptionRegions,
-		timelinePlayheadTime,
 		timelineDuration,
 		effectiveSpeedRegions,
 	};

@@ -412,7 +412,13 @@ export function normalizeEditorPreferences(
 	};
 }
 
-export function loadEditorPreferences(): EditorPreferences {
+let cachedEditorPreferences: EditorPreferences | undefined;
+
+function getAsyncEditorPreferencesWriter() {
+	return typeof window === "undefined" ? undefined : window.electronAPI?.patchEditorPreferences;
+}
+
+function readEditorPreferences(): EditorPreferences {
 	const persisted = loadAppSetting<unknown>(EDITOR_PREFERENCES_STORAGE_KEY);
 	if (persisted !== null) {
 		return normalizeEditorPreferences(persisted);
@@ -430,16 +436,41 @@ export function loadEditorPreferences(): EditorPreferences {
 	}
 }
 
-export function saveEditorPreferences(preferences: Partial<EditorPreferences>): void {
+export function loadEditorPreferences(): EditorPreferences {
+	if (!getAsyncEditorPreferencesWriter()) return readEditorPreferences();
+	cachedEditorPreferences ??= readEditorPreferences();
+	return cachedEditorPreferences;
+}
+
+export async function saveEditorPreferences(
+	preferences: Partial<EditorPreferences>,
+	{ flush = false }: { flush?: boolean } = {},
+): Promise<boolean> {
 	try {
 		const current = loadEditorPreferences();
 		const merged = normalizeEditorPreferences({ ...current, ...preferences }, current);
 		const persisted = stripPersistedDevMotionBlurSettings(merged);
-		if (JSON.stringify(persisted) === JSON.stringify(stripPersistedDevMotionBlurSettings(current))) return;
-		saveAppSetting(EDITOR_PREFERENCES_STORAGE_KEY, persisted);
-		saveLocalStorageJson(EDITOR_PREFERENCES_STORAGE_KEY, persisted);
+		const previous = stripPersistedDevMotionBlurSettings(current);
+		if (JSON.stringify(persisted) === JSON.stringify(previous)) return true;
+		const asyncWriter = getAsyncEditorPreferencesWriter();
+		if (asyncWriter) {
+			cachedEditorPreferences = merged;
+			const changed = Object.fromEntries(Object.entries(persisted).filter(([key, value]) =>
+				JSON.stringify(value) !== JSON.stringify(previous[key as keyof typeof previous]),
+			));
+			saveLocalStorageJson(EDITOR_PREFERENCES_STORAGE_KEY, persisted);
+			const saved = await asyncWriter(changed, flush).catch(() => false);
+			if (!saved && cachedEditorPreferences === merged) {
+				cachedEditorPreferences = current;
+				saveLocalStorageJson(EDITOR_PREFERENCES_STORAGE_KEY, previous);
+			}
+			return saved;
+		}
+		const appSaved = saveAppSetting(EDITOR_PREFERENCES_STORAGE_KEY, persisted);
+		const localSaved = saveLocalStorageJson(EDITOR_PREFERENCES_STORAGE_KEY, persisted);
+		return appSaved || localSaved;
 	} catch {
-		// Ignore storage failures so editor controls still work.
+		return false;
 	}
 }
 

@@ -145,7 +145,8 @@ function getTargetConfigs() {
 				archTag,
 				buildRoot: path.join(cacheRoot, `build-${archTag}`),
 				outputDir: path.join(nativeRoot, "bin", archTag),
-				configureArgs: ["-DCMAKE_BUILD_TYPE=Release"],
+				// Keep the packaged CLI usable without libgomp or the build machine's CPU instruction set.
+				configureArgs: ["-DCMAKE_BUILD_TYPE=Release", "-DGGML_OPENMP=OFF", "-DGGML_NATIVE=OFF"],
 			},
 		];
 	}
@@ -362,6 +363,7 @@ async function shouldSkipBuild(target) {
 		return (
 			manifest.version === whisperVersion &&
 			manifest.arch === target.arch &&
+			(target.platform !== "linux" || manifest.linuxCpuBuildVersion === 1) &&
 			(target.platform !== "win32" || manifest.windowsUtf8ManifestSha256 === await getFileSha256(windowsUtf8ManifestPath)) &&
 			existsSync(binaryPath)
 		);
@@ -455,6 +457,7 @@ async function stageRuntimeArtifacts(target, candidateDir, runtimeEntries) {
 				platform: target.platform,
 				arch: target.arch,
 				binary: target.platform === "win32" ? "whisper-cli.exe" : "whisper-cli",
+				...(target.platform === "linux" ? { linuxCpuBuildVersion: 1 } : {}),
 				...(target.platform === "win32" ? { windowsUtf8ManifestSha256: await getFileSha256(windowsUtf8ManifestPath) } : {}),
 			},
 			null,

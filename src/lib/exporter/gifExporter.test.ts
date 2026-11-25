@@ -1,55 +1,74 @@
 import * as fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	buildGifFrameRendererConfig,
 	calculateOutputDimensions,
+	GifExporter,
+	getGifFrameDelayMs,
 	getGifRepeat,
 } from "./gifExporter";
-import { GIF_SIZE_PRESETS, GifSizePreset } from "./types";
+import { GIF_SIZE_PRESETS, type GifFrameRate, type GifSizePreset } from "./types";
 
-/**
- * Property 2: Loop Encoding Correctness
- *
- * *For any* GIF export configuration, when loop is enabled the output GIF SHALL
- * have a loop count of 0 (infinite), and when loop is disabled the output GIF
- * SHALL have a loop count of 1 (play once).
- *
- * **Validates: Requirements 3.2, 3.3**
- *
- * Feature: gif-export, Property 2: Loop Encoding Correctness
- */
+const { createVideoExporter, exportVideo, cancelVideo } = vi.hoisted(() => {
+	const exportVideo = vi.fn(async () => ({
+		success: true, tempFilePath: "/temp/intermediate.mp4", metrics: { frameCount: 2 },
+	}));
+	const cancelVideo = vi.fn();
+	const createVideoExporter = vi.fn(function () {
+		return { export: exportVideo, cancel: cancelVideo };
+	});
+	return { createVideoExporter, exportVideo, cancelVideo };
+});
+
+vi.mock("./modernVideoExporter", () => ({ ModernVideoExporter: createVideoExporter }));
+
+describe("desktop GIF export", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.clearAllMocks();
+	});
+
+	it.each([false, true])("uses the shared MP4 stage for a short clip (cancelled: %s)", async cancelled => {
+		const convertExportToGif = vi.fn(async () => ({ success: true, tempPath: "/temp/output.gif" }));
+		const discardExportedTemp = vi.fn(async () => {});
+		vi.stubGlobal("window", { electronAPI: { convertExportToGif, discardExportedTemp } });
+		const onProgress = vi.fn(() => {
+			if (cancelled) exporter.cancel();
+		});
+		const exporter = new GifExporter({
+			videoUrl: "file:///clip.mp4", width: 161, height: 91, frameRate: 15, loop: false, sizePreset: "original",
+			wallpaper: "#000000", zoomRegions: [], showShadow: false, shadowIntensity: 0,
+			backgroundBlur: 0, borderRadius: 0, padding: 0, cropRegion: { x: 0, y: 0, width: 1, height: 1 },
+			onProgress,
+		});
+
+		const result = await exporter.export();
+
+		expect(createVideoExporter).toHaveBeenCalledWith(expect.objectContaining({
+			width: 162, height: 92, omitAudio: true, preferredRenderBackend: "webgl",
+		}));
+		expect(exportVideo).toHaveBeenCalledOnce();
+		expect(onProgress).toHaveBeenCalledWith(expect.objectContaining({ totalFrames: 2, phase: "finalizing" }));
+		expect(discardExportedTemp).toHaveBeenCalledExactlyOnceWith("/temp/intermediate.mp4");
+		if (cancelled) {
+			expect(result).toEqual({ success: false, error: "Export cancelled" });
+			expect(cancelVideo).toHaveBeenCalledOnce();
+			expect(convertExportToGif).not.toHaveBeenCalled();
+		} else {
+			expect(result).toMatchObject({ success: true, tempFilePath: "/temp/output.gif" });
+			expect(convertExportToGif).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+				videoPath: "/temp/intermediate.mp4", width: 161, height: 91, fps: 15, frameCount: 2, loop: false,
+			}));
+		}
+	});
+});
+
 describe("GIF Exporter", () => {
-	describe("Property 2: Loop Encoding Correctness", () => {
-		/**
-		 * Test the loop configuration mapping logic.
-		 * In gif.js: repeat=0 means infinite loop, repeat=1 means play once (no loop)
-		 */
-		it("should map loop=true to repeat=0 (infinite) and loop=false to repeat=1 (once)", () => {
-			fc.assert(
-				fc.property(fc.boolean(), (loopEnabled: boolean) => {
-					const repeat = getGifRepeat(loopEnabled);
+	it("enables infinite looping when requested", () => {
+		expect(getGifRepeat(true)).toBe(0);
+	});
 
-					if (loopEnabled) {
-						// When loop is enabled, repeat should be 0 (infinite loop)
-						expect(repeat).toBe(0);
-					} else {
-						// When loop is disabled, repeat should be 1 (play once)
-						expect(repeat).toBe(1);
-					}
-				}),
-				{ numRuns: 100 },
-			);
-		});
-
-		it("should always produce valid repeat values (0 or 1)", () => {
-			fc.assert(
-				fc.property(fc.boolean(), (loopEnabled: boolean) => {
-					const repeat = getGifRepeat(loopEnabled);
-					expect([0, 1]).toContain(repeat);
-				}),
-				{ numRuns: 100 },
-			);
-		});
+	it("omits the repeat extension for single playback", () => {
+		expect(getGifRepeat(false)).toBe(-1);
 	});
 
 	/**
@@ -253,41 +272,6 @@ describe("Property 3: Size Preset Resolution Mapping", () => {
 	});
 });
 
-describe("GIF renderer config", () => {
-	it("forwards cursor click-effect settings into the frame renderer config", () => {
-		const config = buildGifFrameRendererConfig(
-			{
-				videoUrl: "file:///recording.mp4",
-				width: 1920,
-				height: 1080,
-				frameRate: 30,
-				loop: true,
-				sizePreset: "original",
-				wallpaper: "#101010",
-				zoomRegions: [],
-				showShadow: false,
-				shadowIntensity: 0,
-				backgroundBlur: 0,
-				cropRegion: { x: 0, y: 0, width: 1, height: 1 },
-				cursorClickEffect: "echo",
-				cursorClickEffectColor: "#22C55E",
-				cursorClickEffectScale: 1.4,
-				cursorClickEffectOpacity: 0.65,
-				cursorClickEffectDurationMs: 720,
-			} as never,
-			{ width: 1920, height: 1080 },
-		);
-
-		expect(config).toMatchObject({
-			cursorClickEffect: "echo",
-			cursorClickEffectColor: "#22C55E",
-			cursorClickEffectScale: 1.4,
-			cursorClickEffectOpacity: 0.65,
-			cursorClickEffectDurationMs: 720,
-		});
-	});
-});
-
 /**
  * Property 6: Frame Count Consistency
  *
@@ -364,62 +348,29 @@ describe("Property 6: Frame Count Consistency", () => {
 	});
 });
 
-/**
- * Property 5: Valid GIF Output (Configuration Validation)
- *
- * *For any* successful GIF export, the output blob SHALL be a valid GIF file.
- * This test validates the GIF configuration parameters are correctly set up.
- *
- * **Validates: Requirements 5.3**
- *
- * Feature: gif-export, Property 5: Valid GIF Output
- *
- * Note: Full GIF encoding validation requires browser environment with video.
- * This test validates configuration correctness.
- */
-describe("Property 5: Valid GIF Output (Configuration)", () => {
-	it("should generate valid GIF configuration for all frame rates", () => {
+describe("GIF frame timing", () => {
+	it("keeps elapsed time within half a GIF clock tick at each frame", () => {
 		fc.assert(
 			fc.property(
-				fc.constantFrom(10, 15, 20, 25, 30),
-				fc.integer({ min: 100, max: 1920 }),
-				fc.integer({ min: 100, max: 1080 }),
-				fc.boolean(),
-				(frameRate: number, width: number, height: number, loop: boolean) => {
-					// Validate frame delay calculation (gif.js uses milliseconds)
-					const frameDelay = Math.round(1000 / frameRate);
-
-					// Frame delay should be positive and reasonable
-					expect(frameDelay).toBeGreaterThan(0);
-					expect(frameDelay).toBeLessThanOrEqual(100); // 10fps = 100ms delay
-
-					// Loop configuration
-					const repeat = loop ? 0 : 1;
-					expect([0, 1]).toContain(repeat);
-
-					// Dimensions should be positive
-					expect(width).toBeGreaterThan(0);
-					expect(height).toBeGreaterThan(0);
+				fc.constantFrom<GifFrameRate>(15, 20, 25, 30),
+				fc.integer({ min: 1, max: 1800 }),
+				(frameRate, frameCount) => {
+					let elapsed = 0;
+					for (let frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+						const delayMs = getGifFrameDelayMs(frameIndex, frameRate);
+						if (delayMs <= 0 || delayMs % 10 !== 0) return false;
+						elapsed += delayMs;
+					}
+					return Math.abs(elapsed - (frameCount * 1000) / frameRate) <= 5;
 				},
 			),
 			{ numRuns: 100 },
 		);
 	});
 
-	it("should calculate correct frame delays for each frame rate", () => {
-		const expectedDelays: Record<number, number> = {
-			10: 100, // 1000ms / 10fps = 100ms
-			15: 67, // 1000ms / 15fps ≈ 67ms
-			20: 50, // 1000ms / 20fps = 50ms
-			25: 40, // 1000ms / 25fps = 40ms
-			30: 33, // 1000ms / 30fps ≈ 33ms
-		};
-
-		for (const [fps, expectedDelay] of Object.entries(expectedDelays)) {
-			const frameRate = Number(fps);
-			const actualDelay = Math.round(1000 / frameRate);
-			expect(actualDelay).toBe(expectedDelay);
-		}
+	it("alternates centisecond delays at 15 and 30 fps", () => {
+		expect([0, 1, 2].map((index) => getGifFrameDelayMs(index, 15))).toEqual([70, 60, 70]);
+		expect([0, 1, 2].map((index) => getGifFrameDelayMs(index, 30))).toEqual([30, 40, 30]);
 	});
 });
 

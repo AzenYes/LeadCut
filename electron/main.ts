@@ -1,3 +1,4 @@
+import { configureTrustedIpcDocuments, handleTrustedIpc, onTrustedIpc } from "./trustedIpc";
 import { readAppEnv } from "./envCompat";
 import { APP_LOG_DIRECTORY, appLog, flushAppLogSync, installMainConsoleLogging } from "./logger";
 import { createMainExceptionHandlers } from "./mainExceptionHandlers";
@@ -14,9 +15,10 @@ import { addRecordingMarkerAndNotify } from "./ipc/recording/events";
 import { toggleKeystrokeCapture } from "./ipc/cursor/keystrokes";
 import { configureLiveAnnotationRecording, getLiveAnnotationState, registerLiveAnnotationIpc, toggleLiveAnnotation } from "./liveAnnotation";
 import { discardInterruptedRecording, getInterruptedRecording, recoverInterruptedRecording } from "./ipc/recording/interruptedRecording";
+import { findBrowserRecordingPartial, recoverBrowserRecordingPartial } from "./ipc/recording/browserStream";
 import { checkProjectWatcherNow, startProjectWatcher, stopProjectWatcher } from "./ipc/project/projectWatcher";
 import { acquireEditorLock, releaseEditorLock, releaseEditorLocksOnExit } from "./ipc/project/editorLock";
-import { currentProjectPath, currentProjectRevision, onCurrentProjectPathChanged, selectedSource } from "./ipc/state";
+import { currentProjectPath, currentProjectRevision, onCurrentProjectPathChanged, projectHandedToAgent, selectedSource, setProjectHandedToAgent } from "./ipc/state";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -27,7 +29,6 @@ import {
 	dialog,
 	globalShortcut,
 	webContents as electronWebContents,
-	ipcMain,
 	Menu,
 	nativeImage,
 	session,
@@ -38,7 +39,6 @@ import {
 import { RECORDINGS_DIR } from "./appPaths";
 import { APP_ID, APP_NAME } from "./appIdentity";
 import { repairInstalledProjectAssociation } from "./fileAssociation";
-import { showCursor } from "./cursorHider";
 import { getGpuSwitches } from "./gpuSwitches";
 import {
 	cleanupRendererExports,
@@ -206,6 +206,8 @@ function getTrustedCaptureDocumentBaseUrls(): string[] {
 	return trustedUrls;
 }
 
+configureTrustedIpcDocuments(getTrustedCaptureDocumentBaseUrls);
+
 function isHudWebContents(webContents: Electron.WebContents | null): boolean {
 	if (!webContents || webContents.isDestroyed()) {
 		return false;
@@ -229,6 +231,7 @@ let isAppQuitting = false;
 let isCreatingMainWindow = false;
 let isCreatingEditorWindow = false;
 let projectOpenStartupReady = false;
+let canHydrateStartupProject = false;
 function assignHudAsMainWindow(window: BrowserWindow) {
 	mainWindow = window;
 	window.once("closed", () => {
@@ -255,10 +258,10 @@ app.on("open-file", (event, filePath) => {
 	requestExternalProjects(projectPathsFromCommandLine([process.execPath, filePath], process.cwd()));
 });
 
-ipcMain.on("external-project-open-ready", (event) => {
+onTrustedIpc("external-project-open-ready", (event) => {
 	if (getExistingEditorWindow()?.webContents === event.sender) projectOpenQueue.ready(event.sender.id);
 });
-ipcMain.on("external-project-open-done", (event, requestId: unknown) => {
+onTrustedIpc("external-project-open-done", (event, requestId: unknown) => {
 	if (getExistingEditorWindow()?.webContents === event.sender)
 		projectOpenQueue.complete(event.sender.id, requestId);
 });
@@ -383,7 +386,7 @@ function showHudOverlayFromTray() {
 	return true;
 }
 
-ipcMain.on("set-has-unsaved-changes", (_event, hasChanges: boolean) => {
+onTrustedIpc("set-has-unsaved-changes", (_event, hasChanges: boolean) => {
 	editorHasUnsavedChanges = hasChanges;
 });
 
@@ -484,7 +487,9 @@ function focusOrCreateMainWindow() {
 }
 
 function isEditorWindow(window: BrowserWindow) {
-	return window.webContents.getURL().includes("windowType=editor");
+	return !window.isDestroyed() &&
+		!window.webContents.isDestroyed() &&
+		window.webContents.getURL().includes("windowType=editor");
 }
 
 function sendEditorMenuAction(
@@ -715,42 +720,42 @@ function getUpdateDialogWindow() {
 	return getHudOverlayWindow();
 }
 
-ipcMain.handle("install-downloaded-update", () => {
+handleTrustedIpc("install-downloaded-update", () => {
 	installDownloadedUpdateNow(sendUpdateToastToWindows);
 	return { success: true };
 });
 
-ipcMain.handle("download-available-update", (_event, installAfterDownload?: boolean) => {
+handleTrustedIpc("download-available-update", (_event, installAfterDownload?: boolean) => {
 	return downloadAvailableUpdate(sendUpdateToastToWindows, {
 		installAfterDownload: Boolean(installAfterDownload),
 	});
 });
 
-ipcMain.handle("defer-downloaded-update", (_event, delayMs?: number) => {
+handleTrustedIpc("defer-downloaded-update", (_event, delayMs?: number) => {
 	return deferUpdateReminder(getUpdateDialogWindow, sendUpdateToastToWindows, delayMs);
 });
 
-ipcMain.handle("dismiss-update-toast", () => {
+handleTrustedIpc("dismiss-update-toast", () => {
 	return dismissUpdateToast(getUpdateDialogWindow, sendUpdateToastToWindows);
 });
 
-ipcMain.handle("skip-update-version", () => {
+handleTrustedIpc("skip-update-version", () => {
 	return skipAvailableUpdateVersion(sendUpdateToastToWindows);
 });
 
-ipcMain.handle("get-current-update-toast-payload", () => {
+handleTrustedIpc("get-current-update-toast-payload", () => {
 	return getCurrentUpdateToastPayload();
 });
 
-ipcMain.handle("get-update-status-summary", () => {
+handleTrustedIpc("get-update-status-summary", () => {
 	return getUpdateStatusSummary();
 });
 
-ipcMain.handle("get-experimental-updates-enabled", () => {
+handleTrustedIpc("get-experimental-updates-enabled", () => {
 	return getExperimentalUpdatesEnabled();
 });
 
-ipcMain.handle("set-experimental-updates-enabled", async (_event, enabled: unknown) => {
+handleTrustedIpc("set-experimental-updates-enabled", async (_event, enabled: unknown) => {
 	if (typeof enabled !== "boolean") {
 		return { success: false, enabled: getExperimentalUpdatesEnabled() };
 	}
@@ -769,7 +774,7 @@ ipcMain.handle("set-experimental-updates-enabled", async (_event, enabled: unkno
 	}
 });
 
-ipcMain.handle("preview-update-toast", async () => {
+handleTrustedIpc("preview-update-toast", async () => {
 	if (process.platform !== "darwin") {
 		await previewNativeUpdateDialog(getUpdateDialogWindow);
 		return { success: true };
@@ -778,7 +783,7 @@ ipcMain.handle("preview-update-toast", async () => {
 	return { success: previewUpdateToast(sendUpdateToastToWindows) };
 });
 
-ipcMain.handle("check-for-app-updates", async () => {
+handleTrustedIpc("check-for-app-updates", async () => {
 	await checkForAppUpdates(getUpdateDialogWindow, { manual: true });
 	return { success: true, logPath: getUpdaterLogPath() };
 });
@@ -796,7 +801,7 @@ function sendRecordingShortcut(action: RecordingShortcutAction) {
 	}
 }
 
-ipcMain.on("recording-paused-changed", (event, paused: unknown) => {
+onTrustedIpc("recording-paused-changed", (event, paused: unknown) => {
 	if (!trayRecording || typeof paused !== "boolean" || !isHudWebContents(event.sender)) return;
 	if (trayRecordingPaused === paused) return;
 	trayRecordingPaused = paused;
@@ -907,14 +912,18 @@ function createEditorWindowWrapper() {
 		editorHasUnsavedChanges = false;
 		await cleanupRendererExports();
 		return !isAppQuitting;
-	});
+	}, process.platform === "win32" && app.isPackaged && canHydrateStartupProject);
 	const editorContentsId = editorWindow.webContents.id;
 	editorWindow.webContents.on("did-start-loading", () => projectOpenQueue.detach(editorContentsId));
-	editorWindow.once("closed", () => projectOpenQueue.detach(editorContentsId));
+	editorWindow.once("closed", () => {
+		projectOpenQueue.detach(editorContentsId);
+		if (!mainWindow || !isEditorWindow(mainWindow) || mainWindow === editorWindow) {
+			void cleanupRendererExports().catch(error => console.warn("Could not clean up editor exports", error));
+		}
+	});
 	mainWindow = editorWindow;
 	editorHasUnsavedChanges = false;
 	if (!IS_AUTOMATED_EXPORT) {
-		void getSystemFontFamilies(LOCAL_FONT_CATALOG_PATH).catch(() => undefined);
 		let ownedProjectPath: string | null = null;
 		const watchProject = (file: string | null) => {
 			const previous = ownedProjectPath;
@@ -937,6 +946,7 @@ function createEditorWindowWrapper() {
 		editorWindow.once("closed", () => {
 			unsubscribe();
 			stopProjectWatcher();
+			if (ownedProjectPath && projectHandedToAgent === ownedProjectPath) setProjectHandedToAgent(null);
 			if (ownedProjectPath) void releaseEditorLock(ownedProjectPath).catch(error => console.warn("Could not release LeadCut editor lock", error));
 		});
 	}
@@ -963,8 +973,7 @@ function createEditorWindowWrapper() {
 				if (event.sender === editorWindow.webContents && requestId === closeSaveRequestId)
 					done(success === true);
 			};
-			ipcMain.on("save-before-close-done", saved);
-			return () => ipcMain.removeListener("save-before-close-done", saved);
+			return onTrustedIpc("save-before-close-done", saved);
 		},
 		offerDiscard: async () => {
 			const result = await dialog.showMessageBox(editorWindow, {
@@ -980,6 +989,8 @@ function createEditorWindowWrapper() {
 		close: closeAfterSave,
 		cancel: () => {
 			isAppQuitting = false;
+			quitCleanupFinished = false;
+			quitCleanupRunning = false;
 		},
 	});
 	editorWindow.once("closed", closeSave.dispose);
@@ -1008,16 +1019,28 @@ function createSourceSelectorWindowWrapper() {
 
 // On macOS, applications and their menu bar stay active until the user quits
 // explicitly with Cmd + Q.
-app.on("before-quit", () => {
+let quitCleanupFinished = false;
+let quitCleanupRunning = false;
+app.on("before-quit", (event) => {
 	isAppQuitting = true;
+	if (quitCleanupFinished) return;
+	event.preventDefault();
+	if (quitCleanupRunning) return;
+	quitCleanupRunning = true;
 	configureLiveAnnotationRecording(false);
 	try { flushAppSettingsSync(); } catch { /* The settings store records the error. */ }
 	void clearRecordingTrashUndo().catch((error) =>
 		console.warn("Could not clear recording undo cache", error),
 	);
 	killWindowsCaptureProcess();
-	showCursor();
-	void cleanupRendererExports();
+	const deadline = setTimeout(finish, 3000);
+	function finish() {
+		if (quitCleanupFinished) return;
+		quitCleanupFinished = true;
+		clearTimeout(deadline);
+		app.quit();
+	}
+	void cleanupRendererExports().catch(error => console.warn("Could not clean up exports before quitting", error)).finally(finish);
 });
 
 app.on("will-quit", () => {
@@ -1049,27 +1072,33 @@ app.on("second-instance", (_event, commandLine, workingDirectory) => {
 // Register all IPC handlers when app is ready
 async function promptInterruptedRecording() {
 	const interrupted = await getInterruptedRecording();
-	if (!interrupted) return false;
+	const browserPartial = interrupted ? null : await findBrowserRecordingPartial();
+	const recordingPath = interrupted?.videoPath ?? browserPartial;
+	if (!recordingPath) return false;
 	const { response } = await dialog.showMessageBox({
 		type: "warning",
 		title: uiText("interruptedRecordingTitle"),
 		message: uiText("interruptedRecordingMessage"),
-		detail: interrupted.videoPath,
+		detail: recordingPath,
 		buttons: [uiText("interruptedRecordingRecover"), uiText("interruptedRecordingDiscard"), uiText("interruptedRecordingLater")],
 		defaultId: 0,
 		cancelId: 2,
 		noLink: true,
 	});
 	if (response !== 0 && response !== 1) return false;
-	const result = response === 0
-		? await recoverInterruptedRecording(interrupted.startedAt)
-		: await discardInterruptedRecording(interrupted.startedAt);
+	const result = interrupted
+		? response === 0
+			? await recoverInterruptedRecording(interrupted.startedAt)
+			: await discardInterruptedRecording(interrupted.startedAt)
+		: response === 0
+			? await recoverBrowserRecordingPartial(recordingPath)
+			: await shell.trashItem(recordingPath).then(() => ({ success: true }), () => ({ success: false }));
 	if (!result.success) {
 		await dialog.showMessageBox({
 			type: "error",
 			title: uiText("interruptedRecordingTitle"),
 			message: uiText("interruptedRecordingUnableToFinish"),
-			detail: "path" in result ? result.path ?? interrupted.videoPath : interrupted.videoPath,
+			detail: "path" in result && typeof result.path === "string" ? result.path : recordingPath,
 		});
 	}
 	return response === 0 && result.success;
@@ -1176,7 +1205,7 @@ app.whenReady().then(async () => {
 		}
 	}
 
-	ipcMain.on("hud-overlay-close", () => {
+	onTrustedIpc("hud-overlay-close", () => {
 		const hud = getHudOverlayWindow();
 		if (hud) {
 			console.log("[main] Closing HUD window via hud-overlay-close");
@@ -1205,7 +1234,7 @@ app.whenReady().then(async () => {
 	await Promise.all([
 		ensureRecordingsDir(),
 		!VITE_DEV_SERVER_URL
-			? ensurePackagedRendererServer(RENDERER_DIST).catch((error) => {
+			? ensurePackagedRendererServer(RENDERER_DIST, path.join(process.resourcesPath, "assets")).catch((error) => {
 					console.warn(
 						"[renderer-server] Failed to start packaged renderer server:",
 						error,
@@ -1218,7 +1247,7 @@ app.whenReady().then(async () => {
 	]);
 
 	registerLiveAnnotationIpc();
-	ipcMain.handle("list-local-font-families", (event, refresh: unknown) => {
+	handleTrustedIpc("list-local-font-families", (event, refresh: unknown) => {
 		const frame = event.senderFrame;
 		if (!shouldGrantLocalFontsPermission({
 			permission: "local-fonts",
@@ -1249,6 +1278,11 @@ app.whenReady().then(async () => {
 			if (!recording) {
 				restoreWindowSafely(mainWindow);
 			}
+		},
+		(senderId) => {
+			if (!canHydrateStartupProject || getExistingEditorWindow()?.webContents.id !== senderId) return;
+			canHydrateStartupProject = false;
+			return projectOpenQueue.takeForHydration();
 		},
 	);
 	if (!IS_AUTOMATED_EXPORT) {
@@ -1290,7 +1324,8 @@ app.whenReady().then(async () => {
 			return false;
 		});
 	projectOpenStartupReady = true;
-	if (projectOpenQueue.hasPending || recoveredRecording) createEditorWindowWrapper();
+	canHydrateStartupProject = projectOpenQueue.hasPending;
+	if (canHydrateStartupProject || recoveredRecording) createEditorWindowWrapper();
 	else createWindow();
 	if (process.platform === "win32" && app.isPackaged) {
 		void repairInstalledProjectAssociation(process.execPath).catch(error =>

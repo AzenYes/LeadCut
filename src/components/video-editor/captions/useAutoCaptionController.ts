@@ -74,6 +74,10 @@ export function useAutoCaptionController({
 	const captionImportInFlightRef = useRef(false);
 	const [isImportingCaptions, setIsImportingCaptions] = useState(false);
 	const [isWorkingWithTranscript, setIsWorkingWithTranscript] = useState(false);
+	const [captionGenerationProgress, setCaptionGenerationProgress] = useState(0);
+	useEffect(() => window.electronAPI.onAutoCaptionProgress?.(progress => {
+		if (captionGenerationInFlightRef.current) setCaptionGenerationProgress(progress);
+	}), []);
 	const activeSourceRef = useRef({ videoSourcePath, videoPath, projectPath });
 	const scopeRevisionRef = useRef(0);
 	if (activeSourceRef.current.projectPath !== projectPath ||
@@ -216,6 +220,10 @@ export function useAutoCaptionController({
 		setWhisperModelDownloadStatus("downloading");
 		setWhisperModelDownloadProgress(0);
 		const result = await window.electronAPI.downloadWhisperSmallModel();
+		if (result.canceled) {
+			setWhisperModelDownloadStatus("idle");
+			return;
+		}
 		if (!result.success) {
 			setWhisperModelDownloadStatus("error");
 			toast.error(result.error || uiText("failedToDownloadWhisperSmallModel"));
@@ -264,6 +272,7 @@ export function useAutoCaptionController({
 		const revisionBeforeGeneration = scopeRevisionRef.current;
 		const projectBeforeGeneration = activeSourceRef.current.projectPath;
 		captionGenerationInFlightRef.current = true;
+		setCaptionGenerationProgress(0);
 		setIsGeneratingCaptions(true);
 		try {
 			if (!whisperModelPath) {
@@ -303,6 +312,7 @@ export function useAutoCaptionController({
 				whisperModelPath,
 				language: autoCaptionSettings.language,
 			});
+			if (result.canceled) return;
 			if (scopeRevisionRef.current !== revisionBeforeGeneration || activeSourceRef.current.projectPath !== projectBeforeGeneration || resolveAutoCaptionSourcePath(activeSourceRef.current) !== sourcePath) {
 				toast.info(uiText("recordingChangedGeneratedCaptionsWereNotApplied"));
 				return;
@@ -354,6 +364,9 @@ export function useAutoCaptionController({
 	return {
 		isImportingCaptions,
 		isWorkingWithTranscript,
+		captionGenerationProgress,
+		handleCancelAutoCaptions: window.electronAPI.cancelAutoCaptions,
+		handleCancelWhisperModelDownload: window.electronAPI.cancelWhisperModelDownload,
 		hasTranscript: Boolean(transcript?.segments.length),
 		handleImportSrtCaptions,
 		handleImportTranscript,

@@ -48,6 +48,16 @@ it("does not recreate a project that was deleted externally", async () => {
 	await expect(fs.readdir(directory)).resolves.toEqual([]);
 });
 
+it("does not overwrite a newer format even when its revision matches", async () => {
+	const future = '{"version":3,"minReaderVersion":3,"editor":{"futureFeature":true}}';
+	await fs.writeFile(projectPath, future);
+	await expect(guardedSaveProject({
+		projectPath, content: edited, expectedRevision: computeProjectRevision(future),
+	})).rejects.toThrow("requires a newer version");
+	await expect(fs.readFile(projectPath, "utf8")).resolves.toBe(future);
+	expect(await fs.readdir(directory)).toEqual(["example.recordly"]);
+});
+
 it("writes a new project without an expected revision", async () => {
 	await expect(guardedSaveProject({ projectPath, content: edited, expectedRevision: null })).resolves.toEqual({
 		success: true, revision: computeProjectRevision(edited),

@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeProjectFileAtomically } from "./atomicProjectWrite.js";
 import {
 	getProjectFileExtension,
 	getProjectsDir,
@@ -37,17 +37,6 @@ function isPlainProject(candidate: unknown): candidate is LeadcutProject {
 		typeof project.editor === "object" &&
 		project.editor !== null
 	);
-}
-
-/** Ported from electron/ipc/project/atomicSave.ts, which has no Electron dependency of its own. */
-async function writeProjectFileAtomically(projectPath: string, contents: string): Promise<void> {
-	const targetPath = path.resolve(projectPath);
-	const parentDir = path.dirname(targetPath);
-	const temporaryPath = path.join(parentDir, `.leadcut-mcp-${process.pid}-${randomUUID()}.tmp`);
-
-	await fs.mkdir(parentDir, { recursive: true });
-	await fs.writeFile(temporaryPath, contents, "utf-8");
-	await fs.rename(temporaryPath, targetPath);
 }
 
 export async function resolveProjectPath(nameOrPath: string): Promise<string> {
@@ -101,7 +90,10 @@ export async function listProjects(): Promise<ProjectListEntry[]> {
 }
 
 export async function openProject(projectPath: string): Promise<LeadcutProject> {
-	const raw = await fs.readFile(projectPath, "utf-8");
+	return parseProject(await fs.readFile(projectPath, "utf-8"), projectPath);
+}
+
+export function parseProject(raw: string, projectPath: string): LeadcutProject {
 	const parsed: unknown = JSON.parse(raw.replace(/^\uFEFF/, ""));
 	if (!isPlainProject(parsed)) {
 		throw new Error(`${projectPath} is not a valid LeadCut project file`);
@@ -116,6 +108,10 @@ export function resolveProjectMediaPath(projectPath: string, mediaPath: string):
 	return path.resolve(path.dirname(projectPath), mediaPath);
 }
 
-export async function saveProject(projectPath: string, project: LeadcutProject): Promise<void> {
-	await writeProjectFileAtomically(projectPath, JSON.stringify(project, null, 2));
+export async function saveProject(
+	projectPath: string, project: LeadcutProject, verify?: () => Promise<void>,
+	beforeCommit?: (contents: string) => Promise<void>,
+): Promise<void> {
+	const contents = JSON.stringify(project, null, 2);
+	await writeProjectFileAtomically(projectPath, contents, verify, beforeCommit && (() => beforeCommit(contents)));
 }

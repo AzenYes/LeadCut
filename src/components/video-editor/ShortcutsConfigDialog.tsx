@@ -357,7 +357,7 @@ export function ShortcutsConfigDialog() {
 						</p>
 						{FIXED_SHORTCUTS.map(shortcut => (
 							<div
-								key={shortcut.label}
+								key={shortcut.action}
 								className="flex items-center justify-between gap-4 border-b border-separator py-3 last:border-0"
 							>
 								<span className="text-[13px] text-foreground">{shortcut.label}</span>

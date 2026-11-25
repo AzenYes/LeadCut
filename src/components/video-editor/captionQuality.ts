@@ -13,8 +13,6 @@ export const DEFAULT_CAPTION_QUALITY_RULES: CaptionQualityRules = {
 	maxDurationMs: 7000,
 };
 
-export const CAPTION_QUALITY_SETTINGS_KEY = "leadcut.captions.qualityRules.v1";
-
 export function normalizeCaptionQualityRules(value: unknown): CaptionQualityRules {
 	const defaults = DEFAULT_CAPTION_QUALITY_RULES;
 	if (!value || typeof value !== "object") return defaults;

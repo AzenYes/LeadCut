@@ -1,11 +1,13 @@
 import { chapterProgressStatus } from "../chapterProgress";
-import { useMemo, type ComponentProps, type Dispatch, type RefObject, type SetStateAction } from "react";
+import { useCallback, useLayoutEffect, useMemo, useSyncExternalStore, type ComponentProps, type Dispatch, type RefObject, type SetStateAction } from "react";
 import type { AspectRatio } from "@/utils/aspectRatioUtils";
 import type { useVideoEditorAudio } from "../audio/useVideoEditorAudio";
+import { createExportPreviewRenderer, type ExportPreviewStore } from "../export/pausedExportPreview";
 import type { useAppearanceState } from "../state/useAppearanceState";
 import type { useTimelineState } from "../state/useTimelineState";
-import type { CursorTelemetryPoint, ZoomRegion } from "../types";
+import { setPaddingSide, type CursorTelemetryPoint, type ZoomRegion } from "../types";
 import VideoPlayback, { type VideoPlaybackRef } from "../VideoPlayback";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 
 type PlaybackProps = ComponentProps<typeof VideoPlayback>;
 type Handlers = Pick<
@@ -25,12 +27,13 @@ type Props = {
 	previewVersion: number;
 	aspectRatio: AspectRatio;
 	playbackRef: RefObject<VideoPlaybackRef | null>;
-	currentTime: number;
+	playbackClock: PlaybackClock;
 	isPlaying: boolean;
 	previewPlaybackRate?: number;
 	timelineDuration?: number;
 	previewVolume: number;
 	suspendRendering: boolean;
+	exportPreview: ExportPreviewStore;
 	readOnly: boolean;
 	appearance: ReturnType<typeof useAppearanceState>;
 	timeline: ReturnType<typeof useTimelineState>;
@@ -40,7 +43,6 @@ type Props = {
 	effectiveShowCursor: boolean;
 	setDuration: Dispatch<SetStateAction<number>>;
 	setIsPreviewReady: (ready: boolean) => void;
-	setCurrentTime: Dispatch<SetStateAction<number>>;
 	setIsPlaying: Dispatch<SetStateAction<boolean>>;
 	setError: (message: string | null) => void;
 	handlers: Handlers;
@@ -51,12 +53,13 @@ export function EditorVideoPreview({
 	previewVersion,
 	aspectRatio,
 	playbackRef,
-	currentTime,
+	playbackClock,
 	isPlaying,
 	previewPlaybackRate = 1,
 	timelineDuration,
 	previewVolume,
 	suspendRendering,
+	exportPreview,
 	readOnly,
 	appearance,
 	timeline,
@@ -66,15 +69,43 @@ export function EditorVideoPreview({
 	effectiveShowCursor,
 	setDuration,
 	setIsPreviewReady,
-	setCurrentTime,
 	setIsPlaying,
 	setError,
 	handlers,
 }: Props) {
+	const still = useSyncExternalStore(exportPreview.subscribe, exportPreview.get);
+	const exportPreviewRenderer = useMemo(() => createExportPreviewRenderer(exportPreview), [exportPreview]);
+	useLayoutEffect(() => exportPreviewRenderer.attach(), [exportPreviewRenderer]);
+	const handlePreviewReady = useCallback((ready: boolean) => {
+		setIsPreviewReady(ready);
+		const restored = exportPreview.get();
+		if (!ready || !restored || restored.suspended) return;
+		const video = playbackRef.current?.video;
+		exportPreview.set(null);
+		if (restored.resumePlayback && video) {
+			// The transport is attached by the preview's remaining effects.
+			queueMicrotask(() => {
+				const playback = playbackRef.current;
+				if (playback?.video === video && !exportPreview.get()) {
+					void playback.play().catch(() => undefined);
+				}
+			});
+		}
+	}, [exportPreview, playbackRef, setIsPreviewReady]);
+	const currentTime = useSyncExternalStore(playbackClock.subscribe, playbackClock.getTime);
 	const { autoCaptions } = timeline;
+	const paddingDraft = useSyncExternalStore(appearance.paddingDraft.subscribe, appearance.paddingDraft.get);
+	const padding = useMemo(() => paddingDraft ? setPaddingSide(appearance.padding, paddingDraft.side, paddingDraft.value)
+		: appearance.padding, [appearance.padding, paddingDraft]);
 	const visibleCaptions = useMemo(() => autoCaptions.filter(cue => cue.text.trim().length > 0), [autoCaptions]);
-	return (
-		<VideoPlayback
+	const { activeClipId, currentSourceTimeMs, isCurrentClipMuted } = audio.getSourcePlayback(currentTime);
+	const volume = audio.shouldMutePreviewVideo || isCurrentClipMuted ? 0
+		: Math.max(0, Math.min(1, previewVolume * audio.getSourceTrackPreviewGain(audio.embeddedTrackId, activeClipId, currentSourceTimeMs)));
+	return (<>
+		{still && <img data-export-still-preview alt="" src={still.imageUrl}
+			className="pointer-events-none absolute inset-0 z-30 h-full w-full" />}
+		{!still?.suspended && <VideoPlayback
+			exportPreviewRenderer={exportPreviewRenderer}
 			clipRegions={timeline.clipRegions}
 			videoRegions={timeline.videoRegions}
 			videoTracks={timeline.videoTracks}
@@ -84,8 +115,8 @@ export function EditorVideoPreview({
 			ref={playbackRef}
 			videoPath={videoPath || ""}
 			onDurationChange={setDuration}
-			onPreviewReadyChange={setIsPreviewReady}
-			onTimeUpdate={setCurrentTime}
+			onPreviewReadyChange={handlePreviewReady}
+			onTimeUpdate={playbackClock.setTime}
 			currentTime={currentTime}
 			onPlayStateChange={setIsPlaying}
 			onError={setError}
@@ -107,7 +138,7 @@ export function EditorVideoPreview({
 			zoomOutEasing={appearance.zoomOutEasing}
 			connectedZoomEasing={appearance.connectedZoomEasing}
 			borderRadius={appearance.borderRadius}
-			padding={appearance.padding}
+			padding={padding}
 			cropRegion={appearance.cropRegion}
 			webcam={appearance.webcam}
 			webcamVideoPath={
@@ -121,6 +152,7 @@ export function EditorVideoPreview({
 			}))}
 			autoCaptions={visibleCaptions}
 			autoCaptionSettings={timeline.autoCaptionSettings}
+			captionFontSizeDraft={timeline.captionFontSizeDraft}
 			selectedAnnotationId={timeline.selectedAnnotationId}
 			cursorTelemetry={effectiveCursorTelemetry}
 			showCursor={effectiveShowCursor}
@@ -146,13 +178,9 @@ export function EditorVideoPreview({
 			cursorClickBounce={appearance.cursorClickBounce}
 			cursorClickBounceDuration={appearance.cursorClickBounceDuration}
 			cursorSway={appearance.cursorSway}
-			volume={
-				audio.shouldMutePreviewVideo || audio.isCurrentClipMuted
-					? 0
-					: Math.max(0, Math.min(1, previewVolume * audio.embeddedSourcePreviewGain))
-			}
+			volume={volume}
 			suspendRendering={suspendRendering}
 			{...handlers}
-		/>
-	);
+		/>}
+	</>);
 }

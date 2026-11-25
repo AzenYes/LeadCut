@@ -10,7 +10,7 @@ interface UseEditorPlaybackControlsParams {
 	videoPlaybackRef: RefObject<VideoPlaybackRef | null>;
 	timelineRef: RefObject<TimelineEditorHandle | null>;
 	playSourceAudioPreview: () => void;
-	timelinePlayheadTime: number;
+	getCurrentTime: () => number;
 	timelineDuration: number;
 	reviewRate: ReviewRate;
 	previewPlaybackRate: number;
@@ -29,7 +29,7 @@ export function useEditorPlaybackControls({
 	videoPlaybackRef,
 	timelineRef,
 	playSourceAudioPreview,
-	timelinePlayheadTime,
+	getCurrentTime,
 	timelineDuration,
 	reviewRate,
 	previewPlaybackRate,
@@ -43,8 +43,6 @@ export function useEditorPlaybackControls({
 	const [reverseRate, setReverseRate] = useState(0);
 	const reverse = useRef<{ rate: number; frame: number; owner: Window } | null>(null);
 	const boundedPlayback = useRef<{ frame: number; owner: Window } | null>(null);
-	const latestTime = useRef(timelinePlayheadTime);
-	latestTime.current = timelinePlayheadTime;
 	const stopReverse = useCallback(() => {
 		if (!reverse.current) return false;
 		reverse.current.owner.cancelAnimationFrame(reverse.current.frame);
@@ -117,7 +115,7 @@ export function useEditorPlaybackControls({
 		}
 		const playback = getActivePlayback();
 		const video = playback?.video;
-		let time = latestTime.current;
+		let time = getCurrentTime();
 		if (!playback || !video || time <= 0) { pauseOnly(); return; }
 		pauseOnly();
 		const owner = video.ownerDocument?.defaultView ?? window;
@@ -132,14 +130,13 @@ export function useEditorPlaybackControls({
 			if (!video.seeking) {
 				time = Math.max(0, time - (now - previous) / 1000 * run.rate);
 				previous = now;
-				latestTime.current = time;
 				playback.seekTimeline(time);
 				if (time === 0) { stopReverse(); return; }
 			}
 			run.frame = owner.requestAnimationFrame(tick);
 		};
 		run.frame = owner.requestAnimationFrame(tick);
-	}, [getActivePlayback, pauseOnly, stopReverse]);
+	}, [getActivePlayback, getCurrentTime, pauseOnly, stopReverse]);
 
 	const handleSeek = useCallback(
 		(time: number, options: { pause?: boolean } = {}) => {
@@ -151,7 +148,6 @@ export function useEditorPlaybackControls({
 			if (options.pause) pauseOnly();
 			else stopReverse();
 			const target = Math.min(timelineDuration, Math.max(0, time));
-			latestTime.current = target;
 			playback.seekTimeline(target);
 		},
 		[getActivePlayback, pauseOnly, stopBoundedPlayback, stopReverse, timelineDuration],
@@ -186,31 +182,33 @@ export function useEditorPlaybackControls({
 		run.frame = owner.requestAnimationFrame(tick);
 	}, [getActivePlayback, handleTimelineSeek, playFromTime, stopBoundedPlayback, timelineDuration]);
 	const stepFrames = useCallback((frames: number) => {
-		handleTimelineSeek(stepFrameTime(latestTime.current, frames, frameRate, timelineDuration));
-	}, [frameRate, handleTimelineSeek, timelineDuration]);
-	const seekBy = useCallback((seconds: number) => handleTimelineSeek(latestTime.current + seconds), [handleTimelineSeek]);
+		handleTimelineSeek(stepFrameTime(getCurrentTime(), frames, frameRate, timelineDuration));
+	}, [frameRate, getCurrentTime, handleTimelineSeek, timelineDuration]);
+	const seekBy = useCallback((seconds: number) => handleTimelineSeek(getCurrentTime() + seconds), [getCurrentTime, handleTimelineSeek]);
 	const seekToCut = useCallback((direction: "previous" | "next") => {
-		const cut = findAdjacentCut(clipRegions, latestTime.current * 1000, direction);
+		const cut = findAdjacentCut(clipRegions, getCurrentTime() * 1000, direction);
 		if (cut !== null) handleTimelineSeek(cut / 1000);
-	}, [clipRegions, handleTimelineSeek]);
+	}, [clipRegions, getCurrentTime, handleTimelineSeek]);
 	const seekToStart = useCallback(() => handleTimelineSeek(0), [handleTimelineSeek]);
 	const seekToEnd = useCallback(() => handleTimelineSeek(timelineDuration), [handleTimelineSeek, timelineDuration]);
 
 	const handlePreviewSkipBack = useCallback(() => {
+		const timelinePlayheadTime = getCurrentTime();
 		const currentMs = timelinePlayheadTime * 1000;
 		const keyframes = timelineRef.current?.keyframes ?? [];
 		const previous = [...keyframes]
 			.reverse()
 			.find((keyframe) => keyframe.time < currentMs - 50);
 		handleSeek(previous ? previous.time / 1000 : Math.max(0, timelinePlayheadTime - 5));
-	}, [handleSeek, timelinePlayheadTime, timelineRef]);
+	}, [getCurrentTime, handleSeek, timelineRef]);
 
 	const handlePreviewSkipForward = useCallback(() => {
+		const timelinePlayheadTime = getCurrentTime();
 		const currentMs = timelinePlayheadTime * 1000;
 		const keyframes = timelineRef.current?.keyframes ?? [];
 		const next = keyframes.find((keyframe) => keyframe.time > currentMs + 50);
 		handleSeek(next ? next.time / 1000 : Math.min(timelineDuration, timelinePlayheadTime + 5));
-	}, [handleSeek, timelineDuration, timelinePlayheadTime, timelineRef]);
+	}, [getCurrentTime, handleSeek, timelineDuration, timelineRef]);
 
 	return {
 		previewPlaybackRate,

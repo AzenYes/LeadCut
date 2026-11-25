@@ -599,6 +599,13 @@ export interface Padding {
 	linked?: boolean;
 }
 
+export type PaddingSide = keyof Omit<Padding, "linked">;
+
+export function setPaddingSide(padding: Padding, side: PaddingSide, value: number): Padding {
+	return padding.linked === false ? { ...padding, [side]: value }
+		: { top: value, bottom: value, left: value, right: value, linked: true };
+}
+
 export const DEFAULT_PADDING: Padding = {
 	top: 20,
 	bottom: 20,
@@ -671,6 +678,9 @@ export interface AutoCaptionSettings {
 	shadowOffsetX: number;
 	shadowOffsetY: number;
 }
+
+export const CAPTION_FONT_SIZE_MIN = 16;
+export const CAPTION_FONT_SIZE_MAX = 72;
 
 export const DEFAULT_AUTO_CAPTION_SETTINGS: AutoCaptionSettings = {
 	enabled: false,

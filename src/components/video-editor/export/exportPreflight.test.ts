@@ -43,7 +43,7 @@ describe("collectExportPreflightIssues", () => {
 			{ kind: "diskSpace", location: "target", freeBytes: 99, neededBytes: 100 },
 		]);
 		expect(collect({ targetFreeBytes: null, tempFreeBytes: 5 })).toEqual([
-			{ kind: "diskSpace", location: "temp", freeBytes: 5, neededBytes: 100 },
+			{ kind: "diskSpace", location: "temp", freeBytes: 5, neededBytes: 200 },
 		]);
 	});
 });

@@ -108,8 +108,21 @@ test("captions render in preview and remain synchronized at 1x, 2x and 4x", asyn
 	}
 	// Exercise moving playback as well as paused seeks.
 	await seek(page, clip, 0);
+	// At 4× the caption can enter and leave between Playwright's locator polls.
+	await page.evaluate(() => {
+		const video = document.querySelector<HTMLVideoElement>('video[aria-hidden="true"]');
+		const observer = new MutationObserver(() => {
+			if (!video || video.paused || !document.querySelector('[role="button"][aria-label="Edit current caption"]')) return;
+			document.body.dataset.captionPlaybackObservedMs = String(video.currentTime * 1000);
+			observer.disconnect();
+		});
+		observer.observe(document.body, { childList: true, subtree: true });
+	});
 	await page.getByRole("button", { name: "Play", exact: true }).click();
-	await expect(visibleCaption).toBeVisible();
+	await expect(page.locator("body")).toHaveAttribute("data-caption-playback-observed-ms", /^\d/);
+	const observedAt = Number(await page.locator("body").getAttribute("data-caption-playback-observed-ms"));
+	expect(observedAt).toBeGreaterThanOrEqual(sourceStart - 100);
+	expect(observedAt).toBeLessThanOrEqual(sourceEnd + 100);
 	await expect
 		.poll(() =>
 			page

@@ -94,7 +94,14 @@
 			"availableGenericTitle": "有可用更新。"
 		},
 		"preparing": "Preparing recording",
-		"preparingSubtitle": "Opening the editor in a moment"
+		"startingCapture": "正在啟動擷取",
+		"recoveringCapture": "正在復原錄製",
+		"stoppingCapture": "正在停止擷取",
+		"savingCapture": "正在儲存錄製",
+		"openingEditor": "正在開啟編輯器",
+		"discardingCapture": "正在捨棄錄製",
+		"savedAt": "錄製檔案已儲存在 {{path}}",
+		"revealSavedRecording": "在資料夾中顯示錄製"
 	},
 	"sourceSelector": {
 		"loadingSources": "正在載入來源...",

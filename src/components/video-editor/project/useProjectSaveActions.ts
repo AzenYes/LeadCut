@@ -5,13 +5,14 @@ import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useSta
 import { toast } from "@/components/ui/toast";
 import { createProjectData, type EditorProjectData } from "../projectPersistence";
 import type { useProjectState } from "../state/useProjectState";
-import { cloneStructured, getErrorMessage } from "../videoEditorUtils";
+import { getErrorMessage } from "../videoEditorUtils";
+import { requiresNewerProjectReader } from "../../../../services/leadcut-mcp/src/projectFormat";
 
 const PROJECT_AUTOSAVE_DELAY_MS = 500;
+const PROJECT_AUTOSAVE_MAX_WAIT_MS = 10_000;
 
 type SaveProjectOptions = {
 	silent?: boolean;
-	remountPreviewAfterSave?: boolean;
 	refreshLibraryAfterSave?: boolean;
 	captureThumbnail?: boolean;
 };
@@ -29,7 +30,6 @@ type UseProjectSaveActionsInput = {
 	resolveProjectSaveDialog: (saved: boolean) => void;
 	captureProjectThumbnail: () => Promise<string | null>;
 	refreshProjectLibrary: () => Promise<void>;
-	remountPreview: () => void;
 };
 
 export function useProjectSaveActions({
@@ -44,7 +44,6 @@ export function useProjectSaveActions({
 	resolveProjectSaveDialog,
 	captureProjectThumbnail,
 	refreshProjectLibrary,
-	remountPreview,
 }: UseProjectSaveActionsInput) {
 	const uiText = useUiText();
 	const {
@@ -65,8 +64,10 @@ export function useProjectSaveActions({
 	const savingNameRef = useRef(false);
 	const activePathRef = useRef(currentProjectPath);
 	const activeSourceRef = useRef(currentSourcePath);
+	const autosaveStartedAtRef = useRef<number | null>(null);
 	useLayoutEffect(() => {
 		if (activePathRef.current !== currentProjectPath) {
+			autosaveStartedAtRef.current = null;
 			saveGenerationRef.current += 1;
 			setSaveFeedback({ saving: false, error: null, savedAt: null });
 		}
@@ -74,6 +75,7 @@ export function useProjectSaveActions({
 	}, [currentProjectPath]);
 	useLayoutEffect(() => {
 		if (activeSourceRef.current !== currentSourcePath) {
+			autosaveStartedAtRef.current = null;
 			saveGenerationRef.current += 1;
 			setSaveFeedback({ saving: false, error: null, savedAt: null });
 		}
@@ -84,7 +86,16 @@ export function useProjectSaveActions({
 	const saveGenerationRef = useRef(0);
 	const savesSuspendedRef = useRef(false);
 	const previewReadOnlyRef = useRef(false);
-	const [previewReadOnly, setPreviewReadOnly] = useState(false);
+	const agentReadOnlyPathRef = useRef<string | null>(null);
+	const [agentReadOnlyPath, setAgentReadOnlyPath] = useState<string | null>(null);
+	const agentReadOnly = agentReadOnlyPath !== null && agentReadOnlyPath === currentProjectPath;
+	const [versionPreviewReadOnly, setPreviewReadOnly] = useState(false);
+	const newerProjectReadOnly = Boolean(lastSavedSnapshot && requiresNewerProjectReader(lastSavedSnapshot));
+	const newerProjectReadOnlyRef = useRef(newerProjectReadOnly);
+	useLayoutEffect(() => {
+		newerProjectReadOnlyRef.current = newerProjectReadOnly;
+	}, [newerProjectReadOnly]);
+	const previewReadOnly = versionPreviewReadOnly || newerProjectReadOnly || agentReadOnly;
 	const conflictedProjectRef = useRef<{ path: string; revision: string | null } | null>(null);
 	const [saveResumeRevision, setSaveResumeRevision] = useState(0);
 	const clearPendingAutosave = useCallback(() => {
@@ -93,7 +104,14 @@ export function useProjectSaveActions({
 			autosaveTimeoutRef.current = null;
 		}
 	}, []);
-	const isPreviewReadOnly = useCallback(() => previewReadOnlyRef.current, []);
+	const isPreviewReadOnly = useCallback(() => previewReadOnlyRef.current || newerProjectReadOnlyRef.current ||
+		(agentReadOnlyPathRef.current !== null && agentReadOnlyPathRef.current === activePathRef.current), []);
+	const setAgentReadOnly = useCallback((path: string | null) => {
+		agentReadOnlyPathRef.current = path;
+		setAgentReadOnlyPath(path);
+		clearPendingAutosave();
+	}, [clearPendingAutosave]);
+	const isVersionPreview = useCallback(() => previewReadOnlyRef.current, []);
 	const setVersionPreviewReadOnly = useCallback((readOnly: boolean) => {
 		previewReadOnlyRef.current = readOnly;
 		setPreviewReadOnly(readOnly);
@@ -159,6 +177,7 @@ export function useProjectSaveActions({
 	const saveProject = useCallback(
 		async (forceSaveAs: boolean, options?: SaveProjectOptions) => {
 			clearPendingAutosave();
+			autosaveStartedAtRef.current = null;
 			const generation = saveGenerationRef.current;
 			if (savesSuspendedRef.current || isPreviewReadOnly() || (!forceSaveAs && isOverwriteBlocked(activePathRef.current))) return false;
 			return queueSave(async () => {
@@ -171,7 +190,6 @@ export function useProjectSaveActions({
 
 				const captureThumbnail = options?.captureThumbnail ?? true;
 				const refreshLibrary = options?.refreshLibraryAfterSave ?? true;
-				const remount = options?.remountPreviewAfterSave ?? true;
 				try {
 					let projectData =
 						currentProjectSnapshot?.videoPath === currentSourcePath
@@ -238,7 +256,7 @@ export function useProjectSaveActions({
 						conflictedProjectRef.current = null;
 					}
 					setLastSavedSnapshot(
-						cloneStructured({ ...projectData, projectId: result.projectId ?? projectData.projectId }),
+						{ ...projectData, projectId: result.projectId ?? projectData.projectId },
 					);
 					if (refreshLibrary) await refreshProjectLibrary();
 
@@ -249,8 +267,6 @@ export function useProjectSaveActions({
 						setSaveFeedback((previous) => ({ ...previous, error: getErrorMessage(error) }));
 					toast.error(uiText("couldNotSaveProjectValue", { value0: getErrorMessage(error) }));
 					return false;
-				} finally {
-					if (remount) remountPreview();
 				}
 			});
 		},
@@ -270,7 +286,6 @@ export function useProjectSaveActions({
 			projectDisplayName,
 			captureProjectThumbnail,
 			refreshProjectLibrary,
-			remountPreview,
 		],
 	);
 
@@ -285,17 +300,20 @@ export function useProjectSaveActions({
 	useEffect(() => {
 		if (previewReadOnly || savesSuspendedRef.current || isOverwriteBlocked(currentProjectPath) || project.projectBrowserOpen || project.loading || !currentSourcePath || !hasUnsavedChanges) {
 			clearPendingAutosave();
+			autosaveStartedAtRef.current = null;
 			return;
 		}
+		const now = performance.now();
+		autosaveStartedAtRef.current ??= now;
+		const remaining = PROJECT_AUTOSAVE_MAX_WAIT_MS - (now - autosaveStartedAtRef.current);
 		autosaveTimeoutRef.current = window.setTimeout(() => {
 			autosaveTimeoutRef.current = null;
 			void saveProject(false, {
 				silent: true,
-				remountPreviewAfterSave: false,
 				refreshLibraryAfterSave: false,
 				captureThumbnail: false,
 			});
-		}, PROJECT_AUTOSAVE_DELAY_MS);
+		}, Math.max(0, Math.min(PROJECT_AUTOSAVE_DELAY_MS, remaining)));
 		return clearPendingAutosave;
 	}, [clearPendingAutosave, hasUnsavedChanges, saveProject, project.loading, project.projectBrowserOpen, currentProjectPath, currentSourcePath, saveResumeRevision, isOverwriteBlocked, previewReadOnly]);
 	useEffect(() => clearPendingAutosave, [clearPendingAutosave]);
@@ -383,13 +401,14 @@ export function useProjectSaveActions({
 						conflictedProjectRef.current = null;
 					}
 					setLastSavedSnapshot(
-						cloneStructured({ ...projectData, projectId: result.projectId ?? projectData.projectId }),
+						{ ...projectData, projectId: result.projectId ?? projectData.projectId },
 					);
 					await refreshProjectLibrary();
 
 					return true;
-				} finally {
-					remountPreview();
+				} catch (error) {
+					logError("project-save", error);
+					throw error;
 				}
 			});
 		},
@@ -408,7 +427,6 @@ export function useProjectSaveActions({
 			setLastSavedSnapshot,
 			captureProjectThumbnail,
 			refreshProjectLibrary,
-			remountPreview,
 		],
 	);
 
@@ -490,7 +508,11 @@ export function useProjectSaveActions({
 	return {
 		saveFeedback,
 		previewReadOnly,
+		agentReadOnly,
+		setAgentReadOnly,
+		newerProjectReadOnly,
 		isPreviewReadOnly,
+		isVersionPreview,
 		setVersionPreviewReadOnly,
 		blockCurrentProjectOverwrite,
 		withSavesSuspended,

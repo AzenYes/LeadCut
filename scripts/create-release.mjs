@@ -6,8 +6,8 @@ function printUsage() {
   node scripts/create-release.mjs --tag <tag> [--title <title>] [--notes <text> | --notes-file <path>] [--prerelease] [--draft]
 
 Examples:
-  node scripts/create-release.mjs --tag v1.2.0-beta.2 --title "v1.2.0 beta-2" --prerelease --notes-file ./release-notes.md
-  node scripts/create-release.mjs --tag v1.2.0 --notes "Stable release summary"
+  node scripts/create-release.mjs --tag v0.2.0-beta.1 --title "v0.2.0 beta.1" --prerelease --notes-file ./release-notes.md
+  node scripts/create-release.mjs --tag v0.2.0 --notes "Stable release summary"
 `);
 }
 

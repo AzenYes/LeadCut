@@ -25,6 +25,8 @@ import {
 	DEFAULT_ANNOTATION_POSITION,
 	DEFAULT_ANNOTATION_SIZE,
 	DEFAULT_ANNOTATION_STYLE,
+	CAPTION_FONT_SIZE_MIN,
+	CAPTION_FONT_SIZE_MAX,
 	DEFAULT_AUTO_CAPTION_SETTINGS,
 	DEFAULT_CONNECTED_ZOOM_DURATION_MS,
 	DEFAULT_CONNECTED_ZOOM_EASING,
@@ -71,7 +73,9 @@ import {
 } from "./types";
 import { convertLegacyWebcamRadiusToRoundness, normalizeWebcamCropRegion } from "./webcamOverlay";
 
-export const PROJECT_VERSION = 2;
+export { PROJECT_FORMAT_VERSION as PROJECT_VERSION } from "../../../services/leadcut-mcp/src/projectFormat";
+import { PROJECT_FORMAT_VERSION, requiresNewerProjectReader } from "../../../services/leadcut-mcp/src/projectFormat";
+import appPackage from "../../../package.json" with { type: "json" };
 export const MACOS_DEFAULT_BORDER_RADIUS_PERCENT = 8;
 const LEGACY_BORDER_RADIUS_REFERENCE_PX = 1080;
 
@@ -152,6 +156,8 @@ export interface ProjectEditorState {
 
 export interface EditorProjectData {
 	version: number;
+	writerVersion?: string;
+	minReaderVersion?: number;
 	projectId?: string;
 	videoPath: string;
 	editor: Partial<ProjectEditorState>;
@@ -732,7 +738,7 @@ export function normalizeProjectEditor(editor: Partial<ProjectEditorState>): Pro
 				? rawAutoCaptionSettings.fontFamily.trim()
 				: getDefaultCaptionFontFamily(),
 		fontSize: isFiniteNumber(rawAutoCaptionSettings.fontSize)
-			? clamp(rawAutoCaptionSettings.fontSize, 16, 72)
+			? clamp(rawAutoCaptionSettings.fontSize, CAPTION_FONT_SIZE_MIN, CAPTION_FONT_SIZE_MAX)
 			: DEFAULT_AUTO_CAPTION_SETTINGS.fontSize,
 		bottomOffset: isFiniteNumber(rawAutoCaptionSettings.bottomOffset)
 			? clamp(rawAutoCaptionSettings.bottomOffset, 0, 95)
@@ -1132,7 +1138,12 @@ export function createProjectData(
 	}
 	return {
 		...extra,
-		version: PROJECT_VERSION,
+		version: requiresNewerProjectReader(previousData) ? (_version ?? PROJECT_FORMAT_VERSION) : PROJECT_FORMAT_VERSION,
+		writerVersion: appPackage.version,
+		minReaderVersion: Math.max(
+			PROJECT_FORMAT_VERSION,
+			typeof extra.minReaderVersion === "number" ? extra.minReaderVersion : 0,
+		),
 		...(typeof projectId === "string" && projectId.trim().length > 0 ? { projectId } : {}),
 		videoPath,
 		editor: stripProjectUserPreferences({ ...extraEditor, ...editor }),

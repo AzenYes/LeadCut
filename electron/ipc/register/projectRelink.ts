@@ -1,6 +1,7 @@
+import { handleTrustedIpc } from "../../trustedIpc";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { BrowserWindow, dialog, ipcMain, type OpenDialogOptions, type WebContents } from "electron";
+import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from "electron";
 import type { MediaRelinkMapping, ProjectMediaKind } from "../../../src/components/video-editor/projectRelink";
 import { uiText } from "../../uiI18n";
 import { COMPANION_AUDIO_LAYOUTS } from "../constants";
@@ -34,7 +35,7 @@ export function registerProjectRelinkHandlers() {
 		}
 		return access;
 	};
-	ipcMain.handle("pick-relink-media", async ({ sender }, kind: ProjectMediaKind) => {
+	handleTrustedIpc("pick-relink-media", async ({ sender }, kind: ProjectMediaKind) => {
 		try {
 			if (!["video", "webcam", "audio", "broll"].includes(kind)) return { success: false };
 			const file = await choose(sender, {
@@ -52,7 +53,7 @@ export function registerProjectRelinkHandlers() {
 			return { success: false, message: error instanceof Error ? error.message : String(error) };
 		}
 	});
-	ipcMain.handle("pick-relink-media-folder", async ({ sender }) => {
+	handleTrustedIpc("pick-relink-media-folder", async ({ sender }) => {
 		try {
 			const folder = await choose(sender, { title: uiText("relinkFindInFolder"), properties: ["openDirectory"] });
 			if (!folder) return { success: false, canceled: true };
@@ -62,7 +63,7 @@ export function registerProjectRelinkHandlers() {
 			return { success: false, message: error instanceof Error ? error.message : String(error) };
 		}
 	});
-	ipcMain.handle("match-media-in-folder", async ({ sender }, folder: string, basenames: string[]) => {
+	handleTrustedIpc("match-media-in-folder", async ({ sender }, folder: string, basenames: string[]) => {
 		try {
 			const access = getGrants(sender);
 			if (!access.folders.has(folder) || !Array.isArray(basenames)) return { success: false };
@@ -78,7 +79,7 @@ export function registerProjectRelinkHandlers() {
 			return { success: false, message: error instanceof Error ? error.message : String(error) };
 		}
 	});
-	ipcMain.handle("relink-project-media", async ({ sender }, projectPath: string, revision: string, mapping: MediaRelinkMapping) => {
+	handleTrustedIpc("relink-project-media", async ({ sender }, projectPath: string, revision: string, mapping: MediaRelinkMapping) => {
 		try {
 			if (typeof projectPath !== "string" || !projectPath || typeof revision !== "string" ||
 				!revision || !mapping || typeof mapping !== "object" || Array.isArray(mapping)) return { success: false };

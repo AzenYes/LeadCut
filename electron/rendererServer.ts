@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
+import { listenForBrowserOnLoopback } from "./loopbackHttp";
 
 const MIME_TYPES: Record<string, string> = {
 	".css": "text/css; charset=utf-8",
@@ -19,6 +21,8 @@ const MIME_TYPES: Record<string, string> = {
 	".webp": "image/webp",
 	".woff": "font/woff",
 	".woff2": "font/woff2",
+	".mp4": "video/mp4",
+	".webm": "video/webm",
 };
 
 let packagedRendererBaseUrl: string | null = null;
@@ -64,12 +68,16 @@ function resolveRequestedFilePath(rootDir: string, requestPathname: string): str
 
 async function servePackagedRendererRequest(
 	rootDir: string,
+	assetDirectory: string | undefined,
 	request: IncomingMessage,
 	response: ServerResponse,
 ): Promise<void> {
 	try {
 		const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
-		const resolvedFilePath = resolveRequestedFilePath(rootDir, requestUrl.pathname);
+		const isExtraAsset = requestUrl.pathname.startsWith("/bundled-assets/");
+		const resolvedFilePath = isExtraAsset
+			? assetDirectory && resolveRequestedFilePath(assetDirectory, requestUrl.pathname.slice("/bundled-assets".length))
+			: resolveRequestedFilePath(rootDir, requestUrl.pathname);
 
 		if (!resolvedFilePath) {
 			response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
@@ -79,10 +87,29 @@ async function servePackagedRendererRequest(
 
 		const filePath = resolvedFilePath;
 		const fileContents = await fs.readFile(filePath);
+		const scriptHashes = path.extname(filePath) === ".html"
+			? [...fileContents.toString("utf8").matchAll(/<script\s*>([\s\S]*?)<\/script>/gi)].map(([, script]) =>
+				`'sha256-${createHash("sha256").update(script.replace(/\r\n?/g, "\n")).digest("base64")}'`)
+			: [];
+		const contentSecurityPolicy = [
+			"default-src 'self'",
+			// The bundled export renderer generates shader bindings at runtime.
+			`script-src 'self' 'unsafe-eval' ${scriptHashes.join(" ")}`,
+			"style-src 'self' 'unsafe-inline'",
+			"img-src 'self' data: blob: http://127.0.0.1:* https:",
+			"media-src 'self' data: blob: http://127.0.0.1:* https:",
+			"connect-src 'self' blob: data: http://127.0.0.1:* https:",
+			"font-src 'self' data: blob:",
+			"worker-src 'self' blob:",
+			"object-src 'none'",
+			requestUrl.pathname === "/export-frame.html" ? "frame-ancestors 'self'" : "frame-ancestors 'none'",
+			"base-uri 'none'",
+		].join("; ");
 
 		response.writeHead(200, {
 			"Cache-Control": getCacheControl(filePath),
 			"Content-Type": getContentType(filePath),
+			"Content-Security-Policy": contentSecurityPolicy,
 		});
 
 		if (request.method === "HEAD") {
@@ -107,7 +134,7 @@ export function getPackagedRendererBaseUrl(): string | null {
 	return packagedRendererBaseUrl;
 }
 
-export async function ensurePackagedRendererServer(rootDir: string): Promise<string> {
+export async function ensurePackagedRendererServer(rootDir: string, assetDirectory?: string): Promise<string> {
 	if (packagedRendererBaseUrl) {
 		return packagedRendererBaseUrl;
 	}
@@ -116,26 +143,12 @@ export async function ensurePackagedRendererServer(rootDir: string): Promise<str
 		return packagedRendererServerStartPromise;
 	}
 
-	packagedRendererServerStartPromise = new Promise((resolve, reject) => {
-		const server = createServer((request, response) => {
-			void servePackagedRendererRequest(rootDir, request, response);
-		});
-
-		server.once("error", (error) => {
-			reject(error);
-		});
-
-		server.listen(0, "127.0.0.1", () => {
-			const address = server.address();
-			if (!address || typeof address === "string") {
-				server.close();
-				reject(new Error("Renderer server did not expose a TCP address"));
-				return;
-			}
-
-			packagedRendererBaseUrl = `http://127.0.0.1:${address.port}`;
-			resolve(packagedRendererBaseUrl);
-		});
+	const server = createServer((request, response) => {
+		void servePackagedRendererRequest(rootDir, assetDirectory, request, response);
+	});
+	packagedRendererServerStartPromise = listenForBrowserOnLoopback(server).then(origin => {
+		packagedRendererBaseUrl = origin;
+		return origin;
 	});
 
 	try {

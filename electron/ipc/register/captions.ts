@@ -1,11 +1,14 @@
+import { handleTrustedIpc } from "../../trustedIpc";
 import { localizeNativeUiMessage, uiText } from "../../uiI18n";
+import fs from "node:fs/promises";
 import path from "node:path";
-import { dialog, ipcMain } from "electron";
+import { dialog } from "electron";
 import { generateAutoCaptionsFromVideo } from "../captions/generate";
 import { importSrtFile, SrtImportError } from "../captions/srtImport";
 import { importTranscriptFile, rebuildCaptionsFromTranscript, TranscriptImportError } from "../captions/transcriptImport";
 import {
 	deleteWhisperSmallModel,
+	cancelWhisperModelDownload,
 	downloadWhisperSmallModel,
 	getWhisperSmallModelStatus,
 	sendWhisperModelDownloadProgress,
@@ -22,7 +25,12 @@ type OpenVideoFilePickerOptions = {
 };
 
 export function registerCaptionHandlers() {
-	ipcMain.handle("import-transcript-file", async () => {
+	let selectedWhisperExecutable: string | undefined;
+	const activeGeneration = new Map<number, AbortController>();
+	handleTrustedIpc("cancel-auto-captions", event => {
+		activeGeneration.get(event.sender.id)?.abort();
+	});
+	handleTrustedIpc("import-transcript-file", async () => {
 		try {
 			const selected = await dialog.showOpenDialog({
 				title: uiText("transcriptImport"),
@@ -36,14 +44,14 @@ export function registerCaptionHandlers() {
 			return { success: false, errorCode: error instanceof TranscriptImportError ? error.code : "readFailed" };
 		}
 	});
-	ipcMain.handle("rebuild-captions-from-transcript", async (_, transcript: unknown) => {
+	handleTrustedIpc("rebuild-captions-from-transcript", async (_, transcript: unknown) => {
 		try {
 			return { success: true, cues: rebuildCaptionsFromTranscript(transcript) };
 		} catch (error) {
 			return { success: false, errorCode: error instanceof TranscriptImportError ? error.code : "readFailed" };
 		}
 	});
-	ipcMain.handle("import-srt-captions", async (_, options?: { title?: string }) => {
+	handleTrustedIpc("import-srt-captions", async (_, options?: { title?: string }) => {
 		try {
 			const selected = await dialog.showOpenDialog({
 				title: typeof options?.title === "string" ? options.title.slice(0, 160) : uiText("importSRTSubtitles"),
@@ -58,7 +66,7 @@ export function registerCaptionHandlers() {
 			return { success: false, errorCode: error instanceof SrtImportError ? error.code : "readFailed" };
 		}
 	});
-	ipcMain.handle("open-video-file-picker", async (_, options?: OpenVideoFilePickerOptions) => {
+	handleTrustedIpc("open-video-file-picker", async (_, options?: OpenVideoFilePickerOptions) => {
 		try {
 			const includeProjects = Boolean(options?.includeProjects);
 			const recordingsDir = await getRecordingsDir();
@@ -116,7 +124,7 @@ export function registerCaptionHandlers() {
 		}
 	});
 
-	ipcMain.handle("open-audio-file-picker", async () => {
+	handleTrustedIpc("open-audio-file-picker", async () => {
 		try {
 			const result = await dialog.showOpenDialog({
 				title: uiText("selectAudioFile"),
@@ -149,14 +157,14 @@ export function registerCaptionHandlers() {
 		}
 	});
 
-	ipcMain.handle("open-whisper-executable-picker", async () => {
+	handleTrustedIpc("open-whisper-executable-picker", async () => {
 		try {
 			const result = await dialog.showOpenDialog({
 				title: uiText("selectWhisperExecutable"),
 				filters: [
 					{
 						name: uiText("executables"),
-						extensions: process.platform === "win32" ? ["exe", "cmd", "bat"] : ["*"],
+						extensions: process.platform === "win32" ? ["exe"] : ["*"],
 					},
 					{ name: uiText("allFiles"), extensions: ["*"] },
 				],
@@ -167,15 +175,15 @@ export function registerCaptionHandlers() {
 				return { success: false, canceled: true };
 			}
 
-			approveUserPath(result.filePaths[0]);
-			return { success: true, path: result.filePaths[0] };
+			selectedWhisperExecutable = await fs.realpath(result.filePaths[0]);
+			return { success: true, path: selectedWhisperExecutable };
 		} catch (error) {
 			console.error("Failed to open Whisper executable picker:", error);
 			return { success: false, error: String(error) };
 		}
 	});
 
-	ipcMain.handle("open-whisper-model-picker", async () => {
+	handleTrustedIpc("open-whisper-model-picker", async () => {
 		try {
 			const result = await dialog.showOpenDialog({
 				title: uiText("selectWhisperModel"),
@@ -198,7 +206,7 @@ export function registerCaptionHandlers() {
 		}
 	});
 
-	ipcMain.handle("get-whisper-small-model-status", async () => {
+	handleTrustedIpc("get-whisper-small-model-status", async () => {
 		try {
 			return await getWhisperSmallModelStatus();
 		} catch (error) {
@@ -206,7 +214,8 @@ export function registerCaptionHandlers() {
 		}
 	});
 
-	ipcMain.handle("download-whisper-small-model", async (event) => {
+	handleTrustedIpc("cancel-whisper-model-download", cancelWhisperModelDownload);
+	handleTrustedIpc("download-whisper-small-model", async (event) => {
 		try {
 			const existing = await getWhisperSmallModelStatus();
 			if (existing.exists) {
@@ -221,12 +230,13 @@ export function registerCaptionHandlers() {
 			const modelPath = await downloadWhisperSmallModel(event.sender);
 			return { success: true, path: modelPath };
 		} catch (error) {
+			if (error instanceof Error && error.name === "AbortError") return { success: false, canceled: true };
 			console.error("Failed to download Whisper small model:", error);
 			return { success: false, error: String(error) };
 		}
 	});
 
-	ipcMain.handle("delete-whisper-small-model", async (event) => {
+	handleTrustedIpc("delete-whisper-small-model", async (event) => {
 		try {
 			await deleteWhisperSmallModel();
 			sendWhisperModelDownloadProgress(event.sender, {
@@ -258,19 +268,38 @@ export function registerCaptionHandlers() {
 		}
 	});
 
-	ipcMain.handle(
+	handleTrustedIpc(
 		"generate-auto-captions",
 		async (
-			_,
+			event,
 			options: {
 				videoPath: string;
-				whisperExecutablePath: string;
+				whisperExecutablePath?: string;
 				whisperModelPath: string;
 				language?: string;
 			},
 		) => {
+			const sender = event.sender;
+			const senderId = sender.id;
+			if (activeGeneration.has(senderId)) return { success: false, message: uiText("failedToGenerateAutoCaptions") };
+			const controller = new AbortController();
+			activeGeneration.set(senderId, controller);
+			const cancel = () => controller.abort();
+			sender.once("destroyed", cancel);
 			try {
-				const result = await generateAutoCaptionsFromVideo(options);
+				const result = await generateAutoCaptionsFromVideo({
+					videoPath: options.videoPath,
+					whisperModelPath: options.whisperModelPath,
+					language: options.language,
+					signal: controller.signal,
+					onProgress: progress => {
+						if (!sender.isDestroyed()) sender.send("auto-caption-progress", Math.round(progress * 100));
+					},
+					whisperExecutablePath: options.whisperExecutablePath &&
+						path.resolve(options.whisperExecutablePath) === selectedWhisperExecutable
+						? selectedWhisperExecutable
+						: undefined,
+				});
 				return {
 					success: true,
 					cues: result.cues,
@@ -281,6 +310,7 @@ export function registerCaptionHandlers() {
 							: uiText("generatedValueCaptionCuesFromTheValue", { value0: result.cues.length, value1: localizeNativeUiMessage(result.audioSourceLabel) }),
 				};
 			} catch (error) {
+				if (controller.signal.aborted) return { success: false, canceled: true };
 				console.error("Failed to generate auto captions:", error);
 				return {
 					success: false,
@@ -288,6 +318,9 @@ export function registerCaptionHandlers() {
 					message:
 						error instanceof Error ? error.message : uiText("failedToGenerateAutoCaptions"),
 				};
+			} finally {
+				activeGeneration.delete(senderId);
+				if (!sender.isDestroyed()) sender.removeListener("destroyed", cancel);
 			}
 		},
 	);

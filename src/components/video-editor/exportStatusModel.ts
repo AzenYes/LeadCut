@@ -19,6 +19,10 @@ export type ExportStatusModel = {
 	nativeSkipLabel: string | null;
 };
 
+export function isModernMp4Export(format: ExportFormat, pipeline: ExportPipelineModel) {
+	return format === "mp4" && pipeline === "modern";
+}
+
 export function resolveExportStatusModel({
 	isExporting,
 	exportProgress,
@@ -60,8 +64,7 @@ export function resolveExportStatusModel({
 		exportFormat === "mp4" &&
 		exportPipelineModel === "modern" &&
 		(isExporting || exportProgress !== null);
-	const shouldSuspendPreviewRendering =
-		isExporting && exportFormat === "mp4" && exportPipelineModel === "modern";
+	const shouldSuspendPreviewRendering = isExporting && isModernMp4Export(exportFormat, exportPipelineModel);
 	const isLegacyExportInProgress =
 		exportFormat === "mp4" &&
 		exportPipelineModel === "legacy" &&
@@ -111,15 +114,17 @@ function resolveRuntimeLabel(exportProgress: ExportProgress | null): string | nu
 	const renderBackend = exportProgress?.renderBackend;
 	const encodeBackend = exportProgress?.encodeBackend;
 	const encoderName = exportProgress?.encoderName;
+	const route = exportProgress?.exportRoute;
 
-	if (!renderBackend && !encodeBackend && !encoderName) {
+	if (!renderBackend && !encodeBackend && !encoderName && !route) {
 		return null;
 	}
 
 	const rendererLabel =
 		renderBackend === "webgpu" ? "WebGPU" : renderBackend === "webgl" ? "WebGL" : null;
-	const encoderLabel =
-		encodeBackend === "ffmpeg" ? "Breeze" : encodeBackend === "webcodecs" ? "WebCodecs" : null;
+	const encoderLabel = route === "webcodecs" || (!route && encodeBackend === "webcodecs")
+		? "WebCodecs"
+		: route || encodeBackend === "ffmpeg" ? "Breeze" : null;
 	const pathLabel =
 		rendererLabel && encoderLabel
 			? `${rendererLabel} + ${encoderLabel}`

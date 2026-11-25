@@ -21,6 +21,8 @@ export async function runSmokeExport({
 	quality = "1080p",
 	fps = 30,
 	legacyEnvironment = false,
+	backend = "webcodecs",
+	renderBackend = "webgl",
 }) {
 	const reportPath = `${outputPath}.report.json`;
 	const smokeSettings = {
@@ -28,8 +30,8 @@ export async function runSmokeExport({
 		LEADCUT_SMOKE_EXPORT_PROJECT: projectPath,
 		LEADCUT_SMOKE_EXPORT_OUTPUT: outputPath,
 		LEADCUT_SMOKE_EXPORT_PIPELINE: "modern",
-		LEADCUT_SMOKE_EXPORT_BACKEND: "webcodecs",
-		LEADCUT_SMOKE_EXPORT_RENDER_BACKEND: "webgl",
+		LEADCUT_SMOKE_EXPORT_BACKEND: backend,
+		LEADCUT_SMOKE_EXPORT_RENDER_BACKEND: renderBackend,
 		LEADCUT_SMOKE_EXPORT_QUALITY: quality,
 		LEADCUT_SMOKE_EXPORT_FPS: String(fps),
 	};

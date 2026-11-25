@@ -29,17 +29,22 @@ export function usePreferredCaptureDevice(
 				let inputs = await enumerate();
 				if (active && current === request && !locked && !requestedLabels.current &&
 					inputs.length && inputs.every(device => !device.label.trim())) {
-					requestedLabels.current = true;
-					try {
-						if (kind === "videoinput") {
-							release = (await acquireWebcamStream()).release;
-						} else {
-							const stream = await media.getUserMedia({ audio: true });
-							release = () => stream.getTracks().forEach(track => track.stop());
+					const inEditor = kind === "videoinput"
+						? (await window.electronAPI?.getEditorMode?.().catch(() => true)) ?? true
+						: false;
+					if (!inEditor && active && current === request && !requestedLabels.current) {
+						requestedLabels.current = true;
+						try {
+							if (kind === "videoinput") {
+								release = (await acquireWebcamStream()).release;
+							} else {
+								const stream = await media.getUserMedia({ audio: true });
+								release = () => stream.getTracks().forEach(track => track.stop());
+							}
+							inputs = await enumerate();
+						} catch {
+							// IDs can still be usable without device labels.
 						}
-						inputs = await enumerate();
-					} catch {
-						// IDs can still be usable without device labels.
 					}
 				}
 				if (active && current === request) setDevices(inputs.filter(device => device.deviceId));

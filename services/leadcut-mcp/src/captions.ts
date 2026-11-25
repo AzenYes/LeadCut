@@ -38,6 +38,13 @@ const settings = z.object({
 	shadowOffsetY: z.number().min(-30).max(30).optional(),
 }).strict();
 const args={project:z.string().min(1),timelineModel:z.literal(TIMELINE_MODEL),dryRun:z.boolean().default(true),expectedRevision:z.string().optional()};
+const captionPatch = z.object({
+ captionId:z.string().min(1),
+ text:captionText.optional(),
+ startMs:time.optional(),
+ endMs:time.optional(),
+ words:z.array(word).optional(),
+});
 function validate(cues:EditableCaption[]){
  const ids=new Set();const bases=new Set();
  for(const c of cues){
@@ -48,6 +55,27 @@ function validate(cues:EditableCaption[]){
  if(bases.size>1)throw new Error('Cannot mix source and timeline captions; replace the track or convert first.');
  return cues.sort((a,b)=>a.startMs-b.startMs||a.endMs-b.endMs);
 }
+function applyCaptionPatches(cues: EditableCaption[], updates: z.infer<typeof captionPatch>[]) {
+ const changes = new Map<string, Omit<z.infer<typeof captionPatch>, "captionId">>();
+ const ids = new Set(cues.map(cue => cue.id));
+ for (const {captionId, ...fields} of updates) {
+  if (!ids.has(captionId)) throw new Error('Caption ID not found.');
+  if (changes.has(captionId)) throw new Error('Supply one change per caption ID.');
+  const patch = Object.fromEntries(Object.entries(fields).filter(([,value]) => value !== undefined));
+  if (!Object.keys(patch).length) throw new Error('Supply a caption change.');
+  changes.set(captionId, patch);
+ }
+ const diff: {captionId:string;before:EditableCaption;after:EditableCaption}[] = [];
+ const next = cues.map(before => {
+  const patch = changes.get(before.id);
+  if (!patch) return before;
+  const after = {...before,...patch};
+  if ((patch.text !== undefined || patch.startMs !== undefined || patch.endMs !== undefined) && patch.words === undefined) delete after.words;
+  if (JSON.stringify(before) !== JSON.stringify(after)) diff.push({captionId: before.id,before,after});
+  return after;
+ });
+ return {cues:validate(next),diff};
+}
 export function registerCaptionTools(server:McpServer){
  server.tool('list_captions','Read native captions, their clock, editable style and revision.',{project:z.string()},async({project})=>{
   const file=await resolveProjectPath(project),raw=await fs.readFile(file,'utf8'),p=JSON.parse(raw);return reply({project:file,revision:hash(raw),cues:p.editor.autoCaptions??[],settings:p.editor.autoCaptionSettings??{}});
@@ -56,12 +84,16 @@ export function registerCaptionTools(server:McpServer){
   sequence(p);const next: EditableCaption[] = cues.map(c=>({...c,id:c.id??randomUUID(),...(timeBasis==='timeline'?{timeBasis}: {})}));
   return {project:{...p,editor:{...p.editor,autoCaptions:validate([...(mode==='append'?(p.editor.autoCaptions as EditableCaption[]??[]):[]),...next]),autoCaptionSettings:{...(p.editor.autoCaptionSettings as object??{}),enabled:true,...style}}}};
  }));
- server.tool('update_caption','Edit one caption in its existing clock; text-only edits clear stale word timestamps.',{...args,captionId:z.string(),text:captionText.optional(),startMs:time.optional(),endMs:time.optional(),words:z.array(word).optional()},async({project,dryRun,expectedRevision,captionId,text,startMs,endMs,words})=>mutate(project,dryRun,expectedRevision,p=>{
-  sequence(p);const cues=(p.editor.autoCaptions??[]) as EditableCaption[];if(!cues.some(c=>c.id===captionId))throw new Error('Caption ID not found.');
-  const patch=Object.fromEntries(Object.entries({text,startMs,endMs,words}).filter(([,v])=>v!==undefined));if(!Object.keys(patch).length)throw new Error('Supply a caption change.');
-  const next=cues.map(c=>{if(c.id!==captionId)return c;const n={...c,...patch};if((text!==undefined||startMs!==undefined||endMs!==undefined)&&words===undefined)delete n.words;return n;});
-  return {project:{...p,editor:{...p.editor,autoCaptions:validate(next)}}};
- }));
+ const editCaptions = (project:string,dryRun:boolean,expectedRevision:string|undefined,updates:z.infer<typeof captionPatch>[]) =>
+  mutate(project,dryRun,expectedRevision,p=>{
+   sequence(p);
+   const {cues,diff} = applyCaptionPatches((p.editor.autoCaptions??[]) as EditableCaption[], updates);
+   return {project:{...p,editor:{...p.editor,autoCaptions:cues}},diff};
+  });
+ server.tool('update_caption','Edit one caption in its existing clock; text-only edits clear stale word timestamps.',{...args,...captionPatch.shape},
+  async({project,dryRun,expectedRevision,...update})=>editCaptions(project,dryRun,expectedRevision,[update]));
+ server.tool('update_captions','Edit multiple captions in one transaction and report before/after changes.',{...args,updates:z.array(captionPatch).min(1).max(200)},
+  async({project,dryRun,expectedRevision,updates})=>editCaptions(project,dryRun,expectedRevision,updates));
  server.tool('delete_captions','Delete only named caption IDs.',{...args,captionIds:z.array(z.string()).min(1)},async({project,dryRun,expectedRevision,captionIds})=>mutate(project,dryRun,expectedRevision,p=>{
   sequence(p);const cues=(p.editor.autoCaptions??[]) as EditableCaption[];if(captionIds.some(id=>!cues.some(c=>c.id===id)))throw new Error('Caption ID not found.');return {project:{...p,editor:{...p.editor,autoCaptions:cues.filter(c=>!captionIds.includes(c.id))}}};
  }));

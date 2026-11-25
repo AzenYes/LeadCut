@@ -8,6 +8,7 @@ const roots = [
 ];
 
 const allowed = new Map<string, string>([
+	["electron-builder.json5", "Packages the upstream CUDA helper under its existing binary name"],
 	["index.html", "Reads a legacy theme before renderer migration"],
 	["package.json", "Upstream project URL"],
 	["build/installer.nsh", "Cleans file associations written by an earlier LeadCut version"],

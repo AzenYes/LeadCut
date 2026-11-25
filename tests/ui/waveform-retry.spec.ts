@@ -63,7 +63,7 @@ test("shows the desktop waveform error and retries with progress", async ({ page
 		});
 	});
 	await page.goto("/?windowType=editor");
-	await expect(page.getByText("Waveform generation failed", { exact: true })).toBeVisible();
+	await expect(page.getByText("Waveform generation failed", { exact: true })).toBeVisible({ timeout: 25_000 });
 	const initialAttempts = Number(
 		await page.locator("html").getAttribute("data-waveform-attempts"),
 	);

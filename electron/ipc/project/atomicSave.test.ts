@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getProjectBackupPath, withRenamedProjectBackup, writeProjectFileAtomically } from "./atomicSave";
 
@@ -108,6 +108,27 @@ describe("writeProjectFileAtomically", () => {
 			'{"revision":2}',
 		);
 		await expectNoTemporaryArtifacts();
+	});
+
+	it("retries a temporarily locked destination and removes staging files", async () => {
+		await fs.writeFile(projectPath, '{"version":2}');
+		const rename = fs.rename.bind(fs);
+		let failures = 0;
+		const spy = vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+			if (target === projectPath && failures < 2) {
+				failures++;
+				throw Object.assign(new Error("Temporarily locked"), { code: "EPERM" });
+			}
+			await rename(source, target);
+		});
+		try {
+			await writeProjectFileAtomically(projectPath, '{"version":2,"name":"saved"}');
+			expect(failures).toBe(2);
+			await expect(fs.readFile(projectPath, "utf8")).resolves.toContain("saved");
+			await expectNoTemporaryArtifacts();
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it.skipIf(process.platform === "win32")(

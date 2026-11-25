@@ -15,6 +15,7 @@ import type { TimelineEditorHandle } from "../timeline/TimelineEditor";
 import type { EditorEffectSection } from "../types";
 import type { VideoPlaybackRef } from "../VideoPlayback";
 import { REVIEW_RATES, type ReviewRate } from "../videoPlayback/playbackStepping";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 import { getErrorMessage, summarizeErrorMessage } from "../videoEditorUtils";
 import { useAnnotationRegionCommands } from "./useAnnotationRegionCommands";
 import { useAudioRegionCommands } from "./useAudioRegionCommands";
@@ -43,7 +44,7 @@ type Input = {
 	currentSourcePath: string | null;
 	duration: number;
 	frameRate: number;
-	currentTime: number;
+	playbackClock: PlaybackClock;
 	isPlaying: boolean;
 	previewVolume: number;
 	loading: boolean;
@@ -77,8 +78,8 @@ export function useTimelineEditingController(input: Input) {
 	const [shuttleMultiplier, setShuttleMultiplier] = useState(1);
 	const previewPlaybackRate = reviewRate * shuttleMultiplier;
 	const uiText = useUiText();
-	const { timeline } = input;
-	const videoCommands = useVideoTrackCommands({ timeline, appearance: input.appearance, sourceDuration: input.duration, currentTime: input.currentTime });
+	const { timeline, playbackClock } = input;
+	const videoCommands = useVideoTrackCommands({ timeline, appearance: input.appearance, sourceDuration: input.duration, getCurrentTime: playbackClock.getTime });
 	const handleSourceFallbackLoadError = useCallback((error: unknown) => {
 		toast.warning(
 			uiText("couldNotLoadCompanionAudioSourceValue", { value0: summarizeErrorMessage(getErrorMessage(error)) }),
@@ -97,7 +98,6 @@ export function useTimelineEditingController(input: Input) {
 	const projection = useTimelineProjection({
 		timeline,
 		duration: input.duration,
-		currentTime: input.currentTime,
 		nextClipIdRef: input.nextClipIdRef,
 		initializedRef: input.clipInitializedRef,
 		autoFullTrackIdRef: input.autoFullTrackClipIdRef,
@@ -112,8 +112,8 @@ export function useTimelineEditingController(input: Input) {
 		setSourceAudioTrackSettingsByClip: timeline.setSourceAudioTrackSettingsByClip,
 		defaultSourceAudioTrackSettings: timeline.defaultSourceAudioTrackSettings,
 		setDefaultSourceAudioTrackSettings: timeline.setDefaultSourceAudioTrackSettings,
-		timelineTime: projection.timelinePlayheadTime,
-		currentTime: projection.mapTimelineTimeToSourceTime(input.currentTime * 1000) / 1000,
+		playbackClock,
+		mapTimelineTimeToSourceTime: projection.mapTimelineTimeToSourceTime,
 		duration: input.duration,
 		isPlaying: input.isPlaying,
 		previewPlaybackRate,
@@ -126,7 +126,7 @@ export function useTimelineEditingController(input: Input) {
 		videoPlaybackRef: input.videoPlaybackRef,
 		timelineRef: input.timelineRef,
 		playSourceAudioPreview: audio.playSourceAudioPreview,
-		timelinePlayheadTime: projection.timelinePlayheadTime,
+		getCurrentTime: playbackClock.getTime,
 		timelineDuration: projection.timelineDuration,
 		previewPlaybackRate,
 		reviewRate,
@@ -244,12 +244,12 @@ export function useTimelineEditingController(input: Input) {
 		nextAnnotationZIndexRef: input.nextAnnotationZIndexRef,
 	});
 
-	const sequenceTools = useSequenceTools({ timeline, clipCommands, videoCommands, currentTime: input.currentTime });
+	const sequenceTools = useSequenceTools({ timeline, clipCommands, videoCommands, getCurrentTime: playbackClock.getTime });
 	const changeReview = useChangeReview({
 		timeline,
 		sourceDurationMs: input.duration * 1000,
 		webcam: input.appearance.webcam,
-		playheadSeconds: projection.timelinePlayheadTime,
+		playbackClock,
 		durationSeconds: projection.timelineDuration,
 		isPlaying: input.isPlaying,
 		applySequence: clipCommands.applySequence,
@@ -263,14 +263,14 @@ export function useTimelineEditingController(input: Input) {
 		const next = REVIEW_RATES[REVIEW_RATES.indexOf(reviewRate) + direction];
 		if (next !== undefined) playback.setReviewRate(next);
 	};
+	const deleteSelection = () => sequenceTools.deleteGroupedSelection() ||
+		(input.timelineRef.current?.deleteSelected() ?? false);
 	useEditorShortcuts(input.shortcuts, input.isMac, {
 		addZoom: () => input.timelineRef.current?.addZoom(),
 		splitClip: sequenceTools.split,
 		addAnnotation: () => input.timelineRef.current?.addAnnotation(),
 		addKeyframe: () => input.timelineRef.current?.addKeyframe(),
-		deleteSelected: () => {
-			if (!sequenceTools.deleteGroupedSelection()) input.timelineRef.current?.deleteSelected();
-		},
+		deleteSelected: deleteSelection,
 		playPause: playback.togglePlayPause,
 		rippleDelete: sequenceTools.rippleDelete,
 		selectForward: () => sequenceTools.setForwardSelectionActive(active => !active),
@@ -295,10 +295,20 @@ export function useTimelineEditingController(input: Input) {
 		auditionChange: () => changeReview.audition(),
 		acceptChange: () => changeReview.accept(),
 		restoreChange: () => changeReview.restore(),
-	}, REPEATING_SHORTCUT_ACTIONS, action => (
-		action !== "acceptChange" && action !== "restoreChange" && action !== "auditionChange" ||
-		(input.activeEffectSection === "review" && changeReview.entries.length > 0)
-	));
+	}, {
+		repeatable: REPEATING_SHORTCUT_ACTIONS,
+		canHandle: action => (
+			action !== "acceptChange" && action !== "restoreChange" && action !== "auditionChange" ||
+			(input.activeEffectSection === "review" && changeReview.entries.length > 0)
+		),
+		onEscape: sequenceTools.clearForwardSelection,
+		fixedActions: {
+			deleteSelection,
+			selectAllZooms: () => input.timelineRef.current?.selectAllZooms() ?? false,
+			nextAnnotation: () => input.timelineRef.current?.cycleAnnotations(false) ?? false,
+			previousAnnotation: () => input.timelineRef.current?.cycleAnnotations(true) ?? false,
+		},
+	});
 
 	return {
 		sequenceTools,

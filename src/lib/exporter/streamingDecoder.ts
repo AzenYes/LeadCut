@@ -41,22 +41,35 @@ type OnFrameCallback = (
 	cursorTimestampMs: number,
 ) => Promise<void>;
 
+export function getMinimumMediaTimelineDurationMs(
+	...tracks: (readonly { endMs: number }[] | undefined)[]
+): number {
+	let endMs = 0;
+	for (const track of tracks) {
+		for (const region of track ?? []) endMs = Math.max(endMs, region.endMs);
+	}
+	return endMs;
+}
+
 /**
- * Decodes video frames via web-demuxer + VideoDecoder in a single forward pass.
- * Way faster than seeking an HTMLVideoElement per frame.
- *
- * Frames in trimmed regions are decoded (needed for P/B-frame state) but discarded.
- * Kept frames are resampled to the target frame rate in a streaming pass.
+ * Decodes video with web-demuxer and VideoDecoder, from a preceding keyframe
+ * when the timeline starts late or skips a long stretch of source footage.
+ * Kept frames are resampled to the target frame rate in streaming passes.
  */
 export class StreamingVideoDecoder {
 	private demuxer: WebDemuxer | null = null;
 	private decoder: VideoDecoder | null = null;
-	private cancelled = false;
+	private readonly decodeAbort = new AbortController();
 	private metadata: DecodedVideoInfo | null = null;
+	private videoDecoderConfig: VideoDecoderConfig | undefined;
 	private pendingFrames: VideoFrame[] = [];
 	private readonly maxDecodeQueue: number;
 	private readonly maxPendingFrames: number;
 	private readonly minimumTimelineDurationMs: number;
+
+	private get cancelled() {
+		return this.decodeAbort.signal.aborted;
+	}
 
 	constructor(options?: {
 		minimumTimelineDurationMs?: number;
@@ -78,6 +91,7 @@ export class StreamingVideoDecoder {
 		videoUrl: string,
 		options: StreamingVideoDecoderLoadOptions = {},
 	): Promise<DecodedVideoInfo> {
+		this.videoDecoderConfig = undefined;
 		if (this.decoder) {
 			try {
 				if (this.decoder.state === "configured") {
@@ -131,7 +145,12 @@ export class StreamingVideoDecoder {
 			}
 		}
 
-		const videoStream = mediaInfo.streams.find((s) => s.codec_type_string === "video");
+		const videoStreams = mediaInfo.streams.filter((stream) => stream.codec_type_string === "video");
+		const [videoStream] = videoStreams;
+		// With multiple video tracks, let WebDemuxer choose the preferred stream.
+		if (videoStreams.length === 1 && videoStream.codec_string && videoStream.width && videoStream.height) {
+			this.videoDecoderConfig = this.getDemuxer()?.genDecoderConfig("video", videoStream);
+		}
 		const audioStream = mediaInfo.streams.find((s) => s.codec_type_string === "audio");
 		const mediaStartTime =
 			typeof mediaInfo.start_time === "number" && Number.isFinite(mediaInfo.start_time)
@@ -189,10 +208,12 @@ export class StreamingVideoDecoder {
 		const owner = this;
 		const context = {
 			demuxer: this.demuxer,
+			videoDecoderConfig: this.videoDecoderConfig,
 			metadata: this.metadata,
 			pendingFrames: this.pendingFrames,
 			maxDecodeQueue: this.maxDecodeQueue,
 			maxPendingFrames: this.maxPendingFrames,
+			signal: this.decodeAbort.signal,
 			get cancelled() {
 				return owner.cancelled;
 			},
@@ -260,7 +281,7 @@ export class StreamingVideoDecoder {
 	}
 
 	cancel(): void {
-		this.cancelled = true;
+		this.decodeAbort.abort();
 	}
 
 	getDemuxer() {
@@ -268,7 +289,7 @@ export class StreamingVideoDecoder {
 	}
 
 	destroy(): void {
-		this.cancelled = true;
+		this.cancel();
 
 		if (this.decoder) {
 			try {

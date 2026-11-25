@@ -1,10 +1,11 @@
-import { useState, type KeyboardEvent, type PointerEvent } from "react";
+import { useState, useSyncExternalStore, type KeyboardEvent, type PointerEvent } from "react";
 import { useI18n } from "@/contexts/I18nContext";
 import { formatTimelineTimecode } from "../timeline/core/time";
 import { scrubberTimeAtPosition } from "./previewScrubberTime";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 
 type Props = {
-	currentTime: number;
+	playbackClock: PlaybackClock;
 	duration: number;
 	onSeek: (time: number) => void;
 	cuts: number[];
@@ -12,8 +13,9 @@ type Props = {
 	chapters: { id: string; startMs: number }[];
 };
 
-export function PreviewScrubber({ currentTime, duration, onSeek, cuts, markers, chapters }: Props) {
+export function PreviewScrubber({ playbackClock, duration, onSeek, cuts, markers, chapters }: Props) {
 	const { t } = useI18n();
+	const currentTime = useSyncExternalStore(playbackClock.subscribe, playbackClock.getTime);
 	const [hoverTime, setHoverTime] = useState<number | null>(null);
 	const percent = (seconds: number) => duration > 0 ? `${Math.max(0, Math.min(1, seconds / duration)) * 100}%` : "0%";
 	const position = (event: PointerEvent<HTMLDivElement>) => {

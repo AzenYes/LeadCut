@@ -29,7 +29,8 @@ export interface CaptionLineLayout {
 }
 
 interface CaptionPageLayout {
-	lines: CaptionLineLayout[];
+	startLine: number;
+	endLine: number;
 	startMs: number;
 	endMs: number;
 }
@@ -123,7 +124,11 @@ function splitCaptionWords(cue: CaptionCue) {
 	}));
 }
 
-function getActiveCaptionCue(cues: CaptionCue[], timeMs: number) {
+function getActiveCaptionCue(cues: CaptionCue[], timeMs: number, endIndex: number[] | null) {
+	if (endIndex) {
+		const cue = cues[findFirstIntervalEnd(endIndex, timeMs, true)];
+		return cue && cue.startMs <= timeMs && timeMs <= cue.endMs ? cue : null;
+	}
 	for (const cue of cues) {
 		if (timeMs >= cue.startMs && timeMs <= cue.endMs) {
 			return cue;
@@ -262,172 +267,130 @@ function getCaptionAnimationState(
 	}
 }
 
-function buildCaptionPages(options: {
-	lines: CaptionLineLayout[];
-	words: CaptionWordLayout[];
-	maxRows: number;
-	hasWordTimings: boolean;
-	cue: CaptionCue;
-}) {
-	const pages: CaptionPageLayout[] = [];
-	const totalPages = Math.max(1, Math.ceil(options.lines.length / options.maxRows));
-	let lineIndex = 0;
-	let remainingLines = options.lines.length;
+type CaptionTimingWord = ReturnType<typeof flattenCaptionWords>[number];
 
-	for (let pageIndex = 0; pageIndex < totalPages; pageIndex += 1) {
-		const remainingPages = totalPages - pageIndex;
-		const pageSize = Math.min(
-			options.maxRows,
-			Math.max(1, Math.ceil(remainingLines / remainingPages)),
-		);
-		const pageLines = options.lines.slice(lineIndex, lineIndex + pageSize);
-		if (pageLines.length === 0) {
-			continue;
-		}
+type CaptionMeasurementIndex = {
+	texts: string[];
+	plain: Uint32Array;
+	spaced: Uint32Array;
+};
 
-		lineIndex += pageLines.length;
-		remainingLines -= pageLines.length;
-
-		if (options.hasWordTimings) {
-			const firstWord = options.words[pageLines[0].startWordIndex];
-			const lastWord = options.words[pageLines[pageLines.length - 1].endWordIndex];
-			pages.push({
-				lines: pageLines,
-				startMs: firstWord?.startMs ?? options.cue.startMs,
-				endMs: lastWord?.endMs ?? options.cue.endMs,
-			});
-			continue;
-		}
-
-		pages.push({
-			lines: pageLines,
-			startMs: 0,
-			endMs: 0,
-		});
-	}
-
-	if (!options.hasWordTimings) {
-		const totalWords = Math.max(1, options.words.length);
-		const cueDuration = Math.max(1, options.cue.endMs - options.cue.startMs);
-		let elapsedMs = options.cue.startMs;
-
-		pages.forEach((page, pageIndex) => {
-			const pageWordCount = page.lines.reduce((count, line) => count + line.words.length, 0);
-			const proportionalDuration = Math.round((cueDuration * pageWordCount) / totalWords);
-			const nextElapsed =
-				pageIndex === pages.length - 1
-					? options.cue.endMs
-					: Math.min(options.cue.endMs, elapsedMs + Math.max(1, proportionalDuration));
-
-			page.startMs = elapsedMs;
-			page.endMs = Math.max(elapsedMs + 1, nextElapsed);
-			elapsedMs = page.endMs;
-		});
-	}
-
-	for (let index = 0; index < pages.length - 1; index += 1) {
-		pages[index].endMs = Math.max(pages[index].startMs + 1, pages[index + 1].startMs);
-	}
-
-	if (pages.length > 0) {
-		pages[pages.length - 1].endMs = Math.max(
-			pages[pages.length - 1].startMs + 1,
-			options.cue.endMs,
-		);
-	}
-
-	return pages;
+function prepareCaptionPagination(lineCount: number, maxRows: number) {
+	const pageCount = Math.ceil(lineCount / maxRows);
+	// Evenly distribute rows, putting the larger pages first.
+	return { pageCount, rowsPerPage: Math.floor(lineCount / pageCount), largerPages: lineCount % pageCount };
 }
 
-function buildCaptionLines(options: {
-	words: CaptionWordLayout[];
+function getCaptionPageAtIndex(
+	lineStarts: number[], words: CaptionTimingWord[],
+	pagination: ReturnType<typeof prepareCaptionPagination>, pageIndex: number,
+): CaptionPageLayout {
+	const { rowsPerPage, largerPages } = pagination;
+	const startLine = pageIndex * rowsPerPage + Math.min(pageIndex, largerPages);
+	const endLine = startLine + rowsPerPage + Number(pageIndex < largerPages);
+	const startMs = words[lineStarts[startLine]].startMs;
+	const endWord = lineStarts[endLine];
+	const endMs = Math.max(startMs + 1, words[endWord]?.startMs ?? words[words.length - 1].endMs);
+	return { startLine, endLine, startMs, endMs };
+}
+
+function captionLinePenalty(lineWidth: number, maxWidth: number, isLastLine: boolean) {
+	const slack = Math.max(0, maxWidth - lineWidth);
+	const fullness = maxWidth <= 0 ? 1 : lineWidth / maxWidth;
+	return isLastLine
+		? slack * slack * 0.18
+		: slack * slack + (fullness < 0.72 ? (0.72 - fullness) * 26000 : 0);
+}
+
+function buildCaptionLineBreaks(options: {
+	segmentStarts: number[];
+	measurement: CaptionMeasurementIndex;
 	maxWidthPx: number;
 	measureText: (text: string) => number;
+	measuredWidths?: Float64Array;
 }) {
-	const wordCount = options.words.length;
-	const segmentWidths = options.words.map((word, index) => {
-		if (index === 0) {
-			return options.measureText(word.text);
-		}
-
-		return options.measureText(`${word.leadingSpace ? " " : ""}${word.text}`);
-	});
-	const plainWordWidths = options.words.map((word) => options.measureText(word.text));
-	const bestCost = new Array<number>(wordCount + 1).fill(Number.POSITIVE_INFINITY);
-	const nextBreak = new Array<number>(wordCount).fill(wordCount);
+	const { segmentStarts, measurement: { texts, plain, spaced }, maxWidthPx, measureText, measuredWidths } = options;
+	const wordCount = plain.length;
+	const widths = measuredWidths?.length === texts.length
+		? measuredWidths : Float64Array.from(texts, text => measureText(text));
+	const bestCost = new Float64Array(wordCount + 1).fill(Number.POSITIVE_INFINITY);
+	const nextBreak = new Uint32Array(wordCount).fill(wordCount);
 
 	bestCost[wordCount] = 0;
 
-	for (let startIndex = wordCount - 1; startIndex >= 0; startIndex -= 1) {
-		let lineWidth = plainWordWidths[startIndex];
+	for (let segmentIndex = segmentStarts.length - 2; segmentIndex >= 0; segmentIndex--) {
+		const start = segmentStarts[segmentIndex];
+		const end = segmentStarts[segmentIndex + 1];
+		let wholeWidth = widths[plain[start]];
+		let fitsOnOneLine = wholeWidth >= 0 && wholeWidth <= maxWidthPx;
+		for (let index = start + 1; fitsOnOneLine && index < end; index++) {
+			const wordWidth = widths[plain[index]];
+			const spacedWidth = widths[spaced[index]];
+			wholeWidth += spacedWidth;
+			fitsOnOneLine = wordWidth >= 0 && wordWidth <= spacedWidth && wholeWidth <= maxWidthPx;
+		}
+		const slack = maxWidthPx - wholeWidth;
+		// A split can only make each line narrower. The additional line has a positive
+		// cost when the whole phrase fits. Leave near ties to the original cost order.
+		const roundoff = Number.EPSILON * (bestCost[end] + maxWidthPx * maxWidthPx + 26_000) * (end - start + 2);
+		if (fitsOnOneLine && slack * slack * 0.18 > roundoff) {
+			bestCost[start] = captionLinePenalty(wholeWidth, maxWidthPx, end === wordCount) + bestCost[end];
+			nextBreak[start] = end;
+			continue;
+		}
 
-		for (let endIndex = startIndex; endIndex < wordCount; endIndex += 1) {
-			if (endIndex > startIndex) {
-				if (options.words[endIndex].forcedBreakBefore) {
-					break;
+		for (let startIndex = end - 1; startIndex >= start; startIndex--) {
+			let lineWidth = widths[plain[startIndex]];
+			for (let endIndex = startIndex; endIndex < end; endIndex++) {
+				if (endIndex > startIndex) {
+					lineWidth += widths[spaced[endIndex]];
+					if (lineWidth > maxWidthPx) break;
 				}
+				const candidateCost = captionLinePenalty(lineWidth, maxWidthPx, endIndex === wordCount - 1) +
+					bestCost[endIndex + 1];
 
-				lineWidth += segmentWidths[endIndex];
-			}
-
-			if (lineWidth > options.maxWidthPx && endIndex > startIndex) {
-				break;
-			}
-
-			const slack = Math.max(0, options.maxWidthPx - lineWidth);
-			const fullness = options.maxWidthPx <= 0 ? 1 : lineWidth / options.maxWidthPx;
-			const isLastLine = endIndex === wordCount - 1;
-			const linePenalty = isLastLine
-				? slack * slack * 0.18
-				: slack * slack + (fullness < 0.72 ? (0.72 - fullness) * 26000 : 0);
-			const candidateCost = linePenalty + bestCost[endIndex + 1];
-
-			if (candidateCost < bestCost[startIndex]) {
-				bestCost[startIndex] = candidateCost;
-				nextBreak[startIndex] = endIndex + 1;
+				if (candidateCost < bestCost[startIndex]) {
+					bestCost[startIndex] = candidateCost;
+					nextBreak[startIndex] = endIndex + 1;
+				}
 			}
 		}
 	}
 
-	const lines: CaptionLineLayout[] = [];
+	const lineStarts = [0];
+	const lineWidths: number[] = [];
 	let startIndex = 0;
-
 	while (startIndex < wordCount) {
-		const endIndexExclusive = Math.max(startIndex + 1, nextBreak[startIndex]);
-		const lineWords = options.words.slice(startIndex, endIndexExclusive).map((word, index) => ({
-			...word,
-			leadingSpace: index === 0 ? false : word.leadingSpace,
-		}));
-		const width = lineWords.reduce(
-			(total, word, index) =>
-				total +
-				options.measureText(
-					`${index === 0 ? "" : word.leadingSpace ? " " : ""}${word.text}`,
-				),
-			0,
-		);
-
-		lines.push({
-			words: lineWords,
-			width,
-			startWordIndex: lineWords[0].index,
-			endWordIndex: lineWords[lineWords.length - 1].index,
-		});
-
-		startIndex = endIndexExclusive;
+		const endIndex = Math.max(startIndex + 1, nextBreak[startIndex]);
+		let width = widths[plain[startIndex]];
+		for (let index = startIndex + 1; index < endIndex; index++) width += widths[spaced[index]];
+		lineWidths.push(width);
+		startIndex = endIndex;
+		lineStarts.push(startIndex);
 	}
 
-	return lines;
+	return { lineStarts, lineWidths };
 }
 
-function getVisibleCaptionPageIndex(pages: CaptionPageLayout[], timeMs: number) {
-	for (let index = 0; index < pages.length; index += 1) {
-		if (timeMs >= pages[index].startMs && timeMs <= pages[index].endMs) {
-			return index;
-		}
+function getIntervalEndIndex(intervals: { startMs: number; endMs: number }[]) {
+	const ends: number[] = [];
+	for (let index = 0; index < intervals.length; index++) {
+		const interval = intervals[index];
+		if (index > 0 && interval.startMs < intervals[index - 1].startMs) return null;
+		ends.push(Math.max(interval.endMs, ends[index - 1] ?? Number.NEGATIVE_INFINITY));
 	}
+	return ends;
+}
 
-	return -1;
+function findFirstIntervalEnd(ends: number[], timeMs: number, includeEnd: boolean) {
+	let low = 0;
+	let high = ends.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (ends[middle] < timeMs || (!includeEnd && ends[middle] === timeMs)) low = middle + 1;
+		else high = middle;
+	}
+	return low;
 }
 
 function getVisibleCaptionText(lines: CaptionLineLayout[]) {
@@ -444,111 +407,183 @@ function getVisibleCaptionText(lines: CaptionLineLayout[]) {
 
 type CaptionLayoutOptions = {
 	cues: CaptionCue[];
-	settings: AutoCaptionSettings;
+	settings: Pick<AutoCaptionSettings, "maxRows">;
 	maxWidthPx: number;
 	measureText: (text: string) => number;
+	measuredWidths?: Float64Array;
 };
 
-export function prepareCaptionLayout(options: CaptionLayoutOptions) {
-	const sourceWords = flattenCaptionWords(options.cues);
-	if (sourceWords.length === 0) return null;
-	const maxRows = clamp(Math.round(options.settings.maxRows || 1), 1, 4);
+export function canWindowCaptionLayout(cues: CaptionCue[]) {
+	return cues.every((cue, index) => cue.endMs > cue.startMs &&
+		(index === 0 || cue.startMs >= cues[index - 1].endMs) &&
+		Boolean(cue.text.trim()) &&
+		(cue.words?.every((word, wordIndex, words) => word.startMs >= cue.startMs &&
+			word.endMs <= cue.endMs && word.endMs > word.startMs &&
+			(wordIndex === 0 || word.startMs >= words[wordIndex - 1].endMs)) ?? true));
+}
 
-	const words: CaptionWordLayout[] = sourceWords.map((word, index) => {
-		return {
-			cueId: word.cueId,
-			cueWordIndex: word.cueWordIndex,
-			text: word.text,
-			index,
-			forcedBreakBefore: word.forcedBreakBefore,
-			leadingSpace: word.leadingSpace,
-			startMs: word.startMs,
-			endMs: word.endMs,
-			hasRealTiming: word.hasRealTiming,
-			state: "upcoming",
-		};
-	});
+export function findPreviewCaptionCueIndex(cues: CaptionCue[], timeMs: number) {
+	let low = 0;
+	let high = cues.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (cues[middle].startMs <= timeMs) low = middle + 1;
+		else high = middle;
+	}
+	return Math.max(0, low - 1);
+}
 
-	const lines = buildCaptionLines({
-		words,
-		maxWidthPx: options.maxWidthPx,
-		measureText: options.measureText,
-	});
+export function getPreviewCaptionCues(cues: CaptionCue[], index: number) {
+	// A single-row page cannot cross a cue break. Include adjacent cues for shared
+	// endpoints and for the short gaps that keep the previous phrase on screen.
+	return index < 0 ? cues : cues.slice(Math.max(0, index - 1), index + 2);
+}
 
-	const pages = buildCaptionPages({
-		lines,
-		words,
-		maxRows,
-		hasWordTimings: true,
-		cue: {
-			id: sourceWords[0].cueId,
-			startMs: sourceWords[0].startMs,
-			endMs: sourceWords[sourceWords.length - 1].endMs,
-			text: "",
-		},
-	});
+export function prepareCaptionTiming(cues: CaptionCue[]) {
+	const sourceWords = flattenCaptionWords(cues);
+	const segmentStarts = [0];
+	const texts: string[] = [];
+	const textIndices = new Map<string, number>();
+	const plain = new Uint32Array(sourceWords.length);
+	const spaced = new Uint32Array(sourceWords.length);
+	const getTextIndex = (text: string) => {
+		const known = textIndices.get(text);
+		if (known !== undefined) return known;
+		const index = texts.length;
+		texts.push(text);
+		textIndices.set(text, index);
+		return index;
+	};
+	for (let index = 0; index < sourceWords.length; index++) {
+		const word = sourceWords[index];
+		if (index > 0 && word.forcedBreakBefore) segmentStarts.push(index);
+		plain[index] = getTextIndex(word.text);
+		spaced[index] = word.leadingSpace ? getTextIndex(` ${word.text}`) : plain[index];
+	}
+	segmentStarts.push(sourceWords.length);
+	const cuesById = new Map<string, CaptionCue>();
+	for (const cue of cues) {
+		if (!cuesById.has(cue.id)) cuesById.set(cue.id, cue);
+	}
+	const cueEndIndex = cues.every(cue => Number.isFinite(cue.startMs) && Number.isFinite(cue.endMs))
+		? getIntervalEndIndex(cues)
+		: null;
+	const wordEndIndex = getIntervalEndIndex(sourceWords);
 	return {
 		sourceWords,
-		words,
-		lines,
-		pages,
-		maxRows,
-		coverage: getCaptionCoverage(options.cues),
+		segmentStarts,
+		measurement: { texts, plain, spaced },
+		cueIndex: { cues, cuesById, cueEndIndex },
+		wordEndIndex,
+		orderedPageTimes: wordEndIndex !== null && sourceWords.every(word =>
+			Number.isFinite(word.startMs) && Number.isFinite(word.endMs)),
+		coverage: getCaptionCoverage(cues),
 	};
 }
 
-export function buildActiveCaptionLayout(options: CaptionLayoutOptions & { timeMs: number }) {
+export function prepareCaptionLayout(
+	options: CaptionLayoutOptions,
+	timing = prepareCaptionTiming(options.cues),
+) {
+	const { sourceWords, segmentStarts, measurement, cueIndex, wordEndIndex, orderedPageTimes, coverage } = timing;
+	if (sourceWords.length === 0) return null;
+	const maxRows = clamp(Math.round(options.settings.maxRows || 1), 1, 4);
+
+	const lineBreaks = buildCaptionLineBreaks({
+		segmentStarts,
+		measurement,
+		maxWidthPx: options.maxWidthPx,
+		measureText: options.measureText,
+		measuredWidths: options.measuredWidths,
+	});
+	const pagination = prepareCaptionPagination(lineBreaks.lineStarts.length - 1, maxRows);
+	let unorderedPages: { pages: CaptionPageLayout[]; endIndex: number[] | null } | null = null;
+	if (!orderedPageTimes) {
+		const pages = Array.from({ length: pagination.pageCount }, (_, index) =>
+			getCaptionPageAtIndex(lineBreaks.lineStarts, sourceWords, pagination, index));
+		unorderedPages = { pages, endIndex: getIntervalEndIndex(pages) };
+	}
+	return { sourceWords, lineBreaks, pagination, unorderedPages, cueIndex, wordEndIndex, coverage };
+}
+
+export function buildActiveCaptionLayout(options: CaptionLayoutOptions & { timeMs: number; settings: AutoCaptionSettings }) {
 	return getActiveCaptionLayout(prepareCaptionLayout(options), options);
 }
 
 export function getActiveCaptionLayout(
 	layout: ReturnType<typeof prepareCaptionLayout>,
-	options: Pick<CaptionLayoutOptions, "cues" | "settings"> & { timeMs: number },
+	options: Pick<CaptionLayoutOptions, "cues"> & { settings: Pick<AutoCaptionSettings, "animationStyle">; timeMs: number },
 ) {
 	if (!layout || !isWithinCaptionCoverage(layout.coverage, options.timeMs)) return null;
-	const { sourceWords, words, lines, pages, maxRows } = layout;
-	let activeWordIndex = sourceWords.findIndex(
-		(word) => options.timeMs >= word.startMs && options.timeMs < word.endMs,
-	);
-	if (activeWordIndex < 0) {
-		const next = sourceWords.findIndex((word) => options.timeMs < word.startMs);
-		activeWordIndex = next < 0 ? sourceWords.length - 1 : Math.max(0, next - 1);
+	const { sourceWords, lineBreaks, pagination, unorderedPages, wordEndIndex } = layout;
+	const { timeMs } = options;
+	let activeWordIndex: number;
+	if (wordEndIndex) {
+		const next = findFirstIntervalEnd(wordEndIndex, timeMs, false);
+		activeWordIndex = next < sourceWords.length && sourceWords[next].startMs <= timeMs
+			? next : Math.max(0, next - 1);
+	} else {
+		activeWordIndex = sourceWords.findIndex(word => timeMs >= word.startMs && timeMs < word.endMs);
+		if (activeWordIndex < 0) {
+			const next = sourceWords.findIndex(word => timeMs < word.startMs);
+			activeWordIndex = next < 0 ? sourceWords.length - 1 : Math.max(0, next - 1);
+		}
 	}
-	const visiblePageIndex = getVisibleCaptionPageIndex(pages, options.timeMs);
-	if (visiblePageIndex < 0) {
-		return null;
+	const { lineStarts, lineWidths } = lineBreaks;
+	const pageAt = (index: number) => getCaptionPageAtIndex(lineStarts, sourceWords, pagination, index);
+	let visiblePageIndex: number;
+	if (unorderedPages) {
+		const { pages, endIndex } = unorderedPages;
+		visiblePageIndex = endIndex
+			? findFirstIntervalEnd(endIndex, timeMs, true)
+			: pages.findIndex(page => timeMs >= page.startMs && timeMs <= page.endMs);
+	} else {
+		let low = 0;
+		let high = pagination.pageCount;
+		while (low < high) {
+			const middle = (low + high) >>> 1;
+			if (pageAt(middle).endMs < timeMs) low = middle + 1;
+			else high = middle;
+		}
+		visiblePageIndex = low;
 	}
-	const visiblePage = pages[visiblePageIndex] ?? null;
-	const visibleLines = (visiblePage?.lines ?? lines.slice(0, maxRows)).map((line) => ({
-		...line,
-		words: line.words.map(
-			(word): CaptionWordLayout => ({
+	if (visiblePageIndex < 0 || visiblePageIndex >= pagination.pageCount) return null;
+	const visiblePage = pageAt(visiblePageIndex);
+	if (timeMs < visiblePage.startMs) return null;
+	// Keep pagination global while materializing only the rows consumed by this frame.
+	const visibleLines: CaptionLineLayout[] = [];
+	for (let lineIndex = visiblePage.startLine; lineIndex < visiblePage.endLine; lineIndex++) {
+		const startWordIndex = lineStarts[lineIndex];
+		const endWordIndex = lineStarts[lineIndex + 1] - 1;
+		const words: CaptionWordLayout[] = [];
+		for (let index = startWordIndex; index <= endWordIndex; index++) {
+			const word = sourceWords[index];
+			words.push({
 				...word,
-				state:
-					word.index < activeWordIndex
-						? "spoken"
-						: word.index === activeWordIndex
-							? "active"
-							: "upcoming",
-			}),
-		),
-	}));
-	const activeWord = activeWordIndex >= 0 ? words[activeWordIndex] : null;
+				index,
+				leadingSpace: index > startWordIndex && word.leadingSpace,
+				state: index < activeWordIndex ? "spoken" : index === activeWordIndex ? "active" : "upcoming",
+			});
+		}
+		visibleLines.push({ words, width: lineWidths[lineIndex], startWordIndex, endWordIndex });
+	}
+	const activeWord = sourceWords[activeWordIndex];
 	const activeWordProgress = activeWord
 		? clamp01(
 				(options.timeMs - activeWord.startMs) /
 					Math.max(1, activeWord.endMs - activeWord.startMs),
 			)
 		: 0;
-	const animationStartMs = visiblePage?.startMs ?? sourceWords[0].startMs;
-	const animationEndMs = visiblePage?.endMs ?? sourceWords[sourceWords.length - 1].endMs;
+	const animationStartMs = visiblePage.startMs;
+	const animationEndMs = visiblePage.endMs;
 	const pageStartWordIndex = visibleLines[0]?.startWordIndex ?? 0;
 	const visibleWords = visibleLines.flatMap((line) => line.words);
 	const visibleHasWordTimings = visibleWords.every((word) => word.hasRealTiming);
 	const pageCueId = sourceWords[pageStartWordIndex]?.cueId ?? sourceWords[0].cueId;
+	const cueIndex = options.cues === layout.cueIndex.cues ? layout.cueIndex : null;
 	const activeCue =
-		getActiveCaptionCue(options.cues, options.timeMs) ??
-		options.cues.find((candidate) => candidate.id === pageCueId) ??
+		getActiveCaptionCue(options.cues, options.timeMs, cueIndex?.cueEndIndex ?? null) ??
+		(cueIndex ? cueIndex.cuesById.get(pageCueId) : options.cues.find((candidate) => candidate.id === pageCueId)) ??
 		options.cues[0];
 	// `animationEndMs` is stretched to the next page's start (see buildCaptionPages)
 	// so consecutive pages stay on screen with no gap. That's right for continuous

@@ -1,6 +1,7 @@
+import { handleTrustedIpc } from "../../trustedIpc";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { ipcMain } from "electron";
+
 import { USER_DATA_PATH } from "../../appPaths";
 import { isAllowedLocalReadPath } from "../project/manager";
 import { createWaveformDiskCache, waveformCacheKey } from "../waveform/cache";
@@ -73,7 +74,7 @@ async function loadWaveform(key: string, filePath: string, report: (ratio: numbe
 }
 
 export function registerWaveformHandlers() {
-	ipcMain.handle(
+	handleTrustedIpc(
 		"generate-waveform-peaks",
 		async (event, filePath: string, requestId: number): Promise<WaveformPeaksResponse> => {
 			if (

@@ -202,7 +202,7 @@ export function useRecordingLibrary(
 			ui.clipInitializedRef.current = true;
 			ui.autoFullTrackClipIdRef.current = null;
 			ui.autoFullTrackClipEndMsRef.current = null;
-			ui.setCurrentTime((sequence.find((clip) => clip.id === id)?.startMs ?? 0) / 1000);
+			ui.playbackClock.setTime((sequence.find((clip) => clip.id === id)?.startMs ?? 0) / 1000);
 			ui.setDuration(media.totalDurationMs / 1000);
 			timeline.setClipRegions(sequence);
 			timeline.setZoomRegions((current) => [

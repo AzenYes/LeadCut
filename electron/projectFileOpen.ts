@@ -23,6 +23,9 @@ export function createProjectOpenQueue(deliver: (senderId: number, request: Proj
 	};
 	return {
 		get hasPending() { return Boolean(active || pending.length); },
+		takeForHydration() {
+			return readySender === null && !active ? pending.shift() : undefined;
+		},
 		enqueue(paths: string[]) {
 			for (const filePath of paths) {
 				if (active?.path !== filePath && !pending.includes(filePath)) pending.push(filePath);

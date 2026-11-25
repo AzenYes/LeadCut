@@ -25,7 +25,8 @@ export interface ForwardFrameSourceMetadata {
 export class ForwardFrameSource {
 	private demuxer: WebDemuxer | null = null;
 	private decoder: VideoDecoder | null = null;
-	private cancelled = false;
+	private readonly controller = new AbortController();
+	private readonly cancelFromParent = () => this.cancel();
 	private metadata: ForwardFrameSourceMetadata | null = null;
 	private pendingFrames: VideoFrame[] = [];
 	private frameResolve: ((frame: VideoFrame | null) => void) | null = null;
@@ -33,7 +34,9 @@ export class ForwardFrameSource {
 	private decodeDone = false;
 	private feedPromise: Promise<void> | null = null;
 	private reader: ReadableStreamDefaultReader<EncodedVideoChunk> | null = null;
+	private readerCancellation: Promise<void> | null = null;
 	private heldFrame: VideoFrame | null = null;
+	private reusableFrames = new WeakMap<VideoFrame, VideoFrame>();
 	private heldFrameSec = 0;
 	private lastTargetTimeSec = 0;
 	private lastFrameIntervalSec = 0;
@@ -42,34 +45,64 @@ export class ForwardFrameSource {
 	private frameTimelineOffsetUs = 0;
 	private decodeCapacityWaiters = new Set<() => void>();
 
+	constructor(private readonly parentSignal?: AbortSignal) {
+		if (parentSignal?.aborted) this.cancel();
+		else parentSignal?.addEventListener("abort", this.cancelFromParent, { once: true });
+	}
+
+	private get cancelled(): boolean {
+		return this.controller.signal.aborted;
+	}
+
 	async initialize(videoUrl: string, options?: { startTimeSec?: number }): Promise<ForwardFrameSourceMetadata> {
+		const { signal } = this.controller;
+		let rejectOnAbort!: () => void;
+		const aborted = new Promise<never>((_, reject) => {
+			rejectOnAbort = () => reject(signal.reason);
+		});
+		signal.addEventListener("abort", rejectOnAbort, { once: true });
+		try {
+			signal.throwIfAborted();
+			return await Promise.race([
+				this.initializeSource(videoUrl, options?.startTimeSec ?? 0),
+				aborted,
+			]);
+		} catch (error) {
+			await this.destroy();
+			throw error;
+		} finally {
+			signal.removeEventListener("abort", rejectOnAbort);
+		}
+	}
+
+	private async initializeSource(videoUrl: string, startTimeSec: number): Promise<ForwardFrameSourceMetadata> {
+		const { signal } = this.controller;
 		const resourceUrl = await resolveMediaResourceUrl(videoUrl);
+		signal.throwIfAborted();
 		const wasmUrl = new URL("./wasm/web-demuxer.wasm", window.location.href).href;
 		const loadMediaInfo = async (source: string | File) => {
-			this.demuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
-			await this.demuxer.load(source);
-			return this.demuxer.getMediaInfo();
+			signal.throwIfAborted();
+			const demuxer = new WebDemuxer({ wasmFilePath: wasmUrl });
+			this.demuxer = demuxer;
+			await demuxer.load(source);
+			signal.throwIfAborted();
+			return demuxer.getMediaInfo();
 		};
 
 		let mediaInfo;
 		try {
 			mediaInfo = await loadMediaInfo(resourceUrl);
 		} catch (error) {
+			signal.throwIfAborted();
 			console.warn(
 				"[ForwardFrameSource] Direct source load failed, retrying with a fresh media source:",
 				error,
 			);
-			const currentDemuxer = this.demuxer;
-			if (currentDemuxer) {
-				try {
-					(currentDemuxer as unknown as { destroy: () => void }).destroy();
-				} catch {
-					// Ignore cleanup errors before fallback re-init.
-				}
-			}
-			mediaInfo = await loadMediaInfo(await createFallbackDemuxerSource(videoUrl));
+			this.destroyDemuxer();
+			mediaInfo = await loadMediaInfo(await createFallbackDemuxerSource(videoUrl, signal));
 		}
 
+		signal.throwIfAborted();
 		const videoStream = mediaInfo.streams.find(
 			(stream) => stream.codec_type_string === "video",
 		);
@@ -95,21 +128,28 @@ export class ForwardFrameSource {
 			codec: videoStream?.codec_string || "unknown",
 		};
 
-		await this.startDecoder(options?.startTimeSec ?? 0);
+		await this.startDecoder(startTimeSec);
+		signal.throwIfAborted();
 		return this.metadata;
 	}
 
 	private async startDecoder(startTimeSec = 0): Promise<void> {
+		if (this.cancelled) return;
 		if (!this.demuxer || !this.metadata) {
 			throw new Error("Must call initialize() before starting decoder");
 		}
 
 		const decoderConfig = await this.demuxer.getDecoderConfig("video");
+		if (this.cancelled) return;
 		const codec = this.metadata.codec.toLowerCase();
 		const shouldPreferSoftwareDecode = codec.includes("av01") || codec.includes("av1");
 
-		this.decoder = new VideoDecoder({
+		const decoder = new VideoDecoder({
 			output: (frame: VideoFrame) => {
+				if (this.cancelled) {
+					frame.close();
+					return;
+				}
 				if (this.frameResolve) {
 					const resolve = this.frameResolve;
 					this.frameResolve = null;
@@ -120,6 +160,7 @@ export class ForwardFrameSource {
 				this.notifyDecoderCapacityAvailable();
 			},
 			error: (error: DOMException) => {
+				if (this.cancelled) return;
 				this.decodeError = new Error(`VideoDecoder error: ${error.message}`);
 				if (this.frameResolve) {
 					const resolve = this.frameResolve;
@@ -129,6 +170,9 @@ export class ForwardFrameSource {
 				this.notifyDecoderCapacityAvailable();
 			},
 		});
+		this.decoder = decoder;
+		// A decoder can accept several input chunks before producing a frame.
+		decoder.ondequeue = () => this.notifyDecoderCapacityAvailable();
 
 		const preferredDecoderConfig = shouldPreferSoftwareDecode
 			? {
@@ -138,12 +182,12 @@ export class ForwardFrameSource {
 			: decoderConfig;
 
 		try {
-			this.decoder.configure(preferredDecoderConfig);
+			decoder.configure(preferredDecoderConfig);
 		} catch (error) {
 			if (!shouldPreferSoftwareDecode) {
 				throw error;
 			}
-			this.decoder.configure(decoderConfig);
+			decoder.configure(decoderConfig);
 		}
 
 		const readEndSec =
@@ -153,36 +197,40 @@ export class ForwardFrameSource {
 					(this.metadata.streamStartTime ?? this.metadata.mediaStartTime ?? 0),
 			) + 0.5;
 		const readStartSec = startTimeSec > 0 ? startTimeSec + (this.metadata.mediaStartTime ?? 0) : 0;
-		this.reader = this.demuxer.read("video", readStartSec, readEndSec, AVSeekFlag.AVSEEK_FLAG_BACKWARD).getReader();
+		const reader = this.demuxer.read("video", readStartSec, readEndSec, AVSeekFlag.AVSEEK_FLAG_BACKWARD).getReader();
+		this.reader = reader;
 
 		this.feedPromise = (async () => {
 			try {
-				while (!this.cancelled) {
-					const { done, value: chunk } = await this.reader!.read();
+				while (!this.cancelled && !this.decodeError) {
+					const { done, value: chunk } = await reader.read();
 					if (done || !chunk) {
 						break;
 					}
 
 					while (
-						(this.decoder!.decodeQueueSize > DEFAULT_MAX_DECODE_QUEUE ||
-							this.pendingFrames.length > DEFAULT_MAX_PENDING_FRAMES) &&
-						!this.cancelled
+						!this.cancelled &&
+						!this.decodeError &&
+						(decoder.decodeQueueSize > DEFAULT_MAX_DECODE_QUEUE ||
+							this.pendingFrames.length > DEFAULT_MAX_PENDING_FRAMES)
 					) {
 						await this.waitForDecoderCapacity();
 					}
 
-					if (this.cancelled) {
+					if (this.cancelled || this.decodeError) {
 						break;
 					}
 
-					this.decoder!.decode(chunk);
+					decoder.decode(chunk);
 				}
 
-				if (!this.cancelled && this.decoder?.state === "configured") {
-					await this.decoder.flush();
+				if (!this.cancelled && !this.decodeError && decoder.state === "configured") {
+					await decoder.flush();
 				}
 			} catch (error) {
-				this.decodeError = error instanceof Error ? error : new Error(String(error));
+				if (!this.cancelled) {
+					this.decodeError = error instanceof Error ? error : new Error(String(error));
+				}
 			} finally {
 				this.decodeDone = true;
 				this.notifyDecoderCapacityAvailable();
@@ -237,7 +285,23 @@ export class ForwardFrameSource {
 		}
 	}
 
-	async getFrameAtTime(targetTimeSec: number): Promise<VideoFrame | null> {
+	private cloneFrame(frame: VideoFrame, reusableFrame?: VideoFrame | null): VideoFrame {
+		if (reusableFrame?.displayWidth && this.reusableFrames.get(reusableFrame) === frame) {
+			return reusableFrame;
+		}
+
+		const clone = new VideoFrame(frame, { timestamp: frame.timestamp });
+		if (reusableFrame !== undefined) {
+			this.reusableFrames.set(clone, frame);
+		}
+		return clone;
+	}
+
+	/** Pass null to begin reusing frames, then pass back the last caller-owned result. */
+	async getFrameAtTime(
+		targetTimeSec: number,
+		reusableFrame?: VideoFrame | null,
+	): Promise<VideoFrame | null> {
 		if (!this.metadata) {
 			throw new Error("Frame source not initialized");
 		}
@@ -259,7 +323,12 @@ export class ForwardFrameSource {
 
 		if (!this.heldFrame) {
 			const firstFrame = await this.getNextFrame();
+			if (this.cancelled) {
+				firstFrame?.close();
+				return null;
+			}
 			if (!firstFrame) {
+				if (this.decodeError) throw this.decodeError;
 				return null;
 			}
 			this.firstFrameTimestampUs = firstFrame.timestamp;
@@ -273,14 +342,17 @@ export class ForwardFrameSource {
 
 		while (!this.cancelled) {
 			const nextFrame = await this.getNextFrame();
+			if (this.cancelled) {
+				nextFrame?.close();
+				return null;
+			}
 			if (!nextFrame) {
+				if (this.decodeError) throw this.decodeError;
 				this.resolvedDecodedDurationSec = Math.max(
 					this.heldFrameSec,
 					this.heldFrameSec + Math.max(0, this.lastFrameIntervalSec),
 				);
-				return new VideoFrame(this.heldFrame, {
-					timestamp: this.heldFrame.timestamp,
-				});
+				return this.cloneFrame(this.heldFrame, reusableFrame);
 			}
 
 			const nextFrameSec = Math.max(
@@ -296,9 +368,7 @@ export class ForwardFrameSource {
 			const handoffBoundarySec = (this.heldFrameSec + nextFrameSec) / 2;
 			if (clampedTargetTime <= handoffBoundarySec) {
 				this.pendingFrames.unshift(nextFrame);
-				return new VideoFrame(this.heldFrame, {
-					timestamp: this.heldFrame.timestamp,
-				});
+				return this.cloneFrame(this.heldFrame, reusableFrame);
 			}
 
 			this.lastFrameIntervalSec = Math.max(0, nextFrameSec - this.heldFrameSec);
@@ -319,7 +389,9 @@ export class ForwardFrameSource {
 	}
 
 	cancel(): void {
-		this.cancelled = true;
+		if (this.cancelled) return;
+		this.parentSignal?.removeEventListener("abort", this.cancelFromParent);
+		this.controller.abort();
 		this.notifyDecoderCapacityAvailable();
 		if (this.frameResolve) {
 			const resolve = this.frameResolve;
@@ -327,23 +399,32 @@ export class ForwardFrameSource {
 			resolve(null);
 		}
 		if (this.reader) {
-			void this.reader.cancel().catch(() => {
+			this.readerCancellation = this.reader.cancel().catch(() => {
 				// Ignore cancellation errors during shutdown.
 			});
+		}
+		try {
+			if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
+		} catch {
+			// Ignore decoder shutdown errors.
+		}
+	}
+
+	private destroyDemuxer(): void {
+		const demuxer = this.demuxer;
+		this.demuxer = null;
+		try {
+			demuxer?.destroy();
+		} catch {
+			// Ignore demuxer shutdown errors.
 		}
 	}
 
 	async destroy(): Promise<void> {
-		this.cancelled = true;
-
-		if (this.reader) {
-			try {
-				await this.reader.cancel();
-			} catch {
-				// Ignore cancellation errors during shutdown.
-			}
-			this.reader = null;
-		}
+		this.cancel();
+		await this.readerCancellation;
+		this.reader = null;
+		this.readerCancellation = null;
 
 		if (this.feedPromise) {
 			try {
@@ -364,25 +445,9 @@ export class ForwardFrameSource {
 		}
 		this.pendingFrames = [];
 
-		if (this.decoder) {
-			try {
-				if (this.decoder.state === "configured") {
-					this.decoder.close();
-				}
-			} catch {
-				// Ignore decoder shutdown errors.
-			}
-			this.decoder = null;
-		}
+		this.decoder = null;
 
-		if (this.demuxer) {
-			try {
-				this.demuxer.destroy();
-			} catch {
-				// Ignore demuxer shutdown errors.
-			}
-			this.demuxer = null;
-		}
+		this.destroyDemuxer();
 
 		this.metadata = null;
 		this.decodeDone = false;

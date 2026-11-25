@@ -10,6 +10,7 @@ export interface RecordingJournal {
 	tempVideoPath: string;
 	tempSystemAudioPath?: string;
 	tempMicAudioPath?: string;
+	browserMicrophone?: { profile?: string; startDelayMs: number };
 	finalVideoPath: string;
 	cursorJournalPath?: string;
 	keyJournalPath?: string;
@@ -32,6 +33,12 @@ function isRecordingJournal(value: unknown): value is RecordingJournal {
 		absolutePath(journal.finalVideoPath) &&
 		optionalPath(journal.tempSystemAudioPath) &&
 		optionalPath(journal.tempMicAudioPath) &&
+		(journal.browserMicrophone === undefined ||
+			(Boolean(journal.browserMicrophone) &&
+				Number.isFinite(journal.browserMicrophone.startDelayMs) &&
+				journal.browserMicrophone.startDelayMs >= 0 &&
+				(journal.browserMicrophone.profile === undefined ||
+					typeof journal.browserMicrophone.profile === "string"))) &&
 		optionalPath(journal.cursorJournalPath) &&
 		optionalPath(journal.keyJournalPath) &&
 		(journal.keyCaptureMode === undefined || isKeystrokeCaptureMode(journal.keyCaptureMode))

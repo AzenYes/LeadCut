@@ -94,7 +94,14 @@
 			"availableGenericTitle": "업데이트를 사용할 수 있습니다."
 		},
 		"preparing": "Preparing recording",
-		"preparingSubtitle": "Opening the editor in a moment"
+		"startingCapture": "캡처를 시작하는 중",
+		"recoveringCapture": "녹화를 복구하는 중",
+		"stoppingCapture": "캡처 중지 중",
+		"savingCapture": "녹화 저장 중",
+		"openingEditor": "편집기 여는 중",
+		"discardingCapture": "녹화 삭제 중",
+		"savedAt": "녹화 저장 위치 {{path}}",
+		"revealSavedRecording": "폴더에서 녹화 보기"
 	},
 	"sourceSelector": {
 		"loadingSources": "소스를 불러오는 중...",

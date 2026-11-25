@@ -1,6 +1,6 @@
 {
   "name": "leadcut-mcp",
-  "version": "1.0.0",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "Local MCP for LeadCut sequence editing, zooms, captions and media analysis.",

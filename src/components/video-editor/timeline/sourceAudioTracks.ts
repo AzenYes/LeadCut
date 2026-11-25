@@ -5,17 +5,13 @@ import type { AudioPeaksData } from "./core/timelineTypes";
 
 const SOURCE_SIDECAR_EXTENSIONS = [".wav", ".m4a", ".webm"] as const;
 
-export function buildSourceSidecarPathCandidates(
-	source: string,
+export function getSourceSidecarWaveformPaths(
+	paths: readonly string[],
 	suffix: "mic" | "system",
 ): string[] {
-	const normalized = source.replace(/\\/g, "/");
-	const lastSlash = normalized.lastIndexOf("/");
-	const dir = lastSlash >= 0 ? normalized.slice(0, lastSlash + 1) : "";
-	const fileName = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
-	const dotIndex = fileName.lastIndexOf(".");
-	const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
-	return SOURCE_SIDECAR_EXTENSIONS.map((extension) => `${dir}${baseName}.${suffix}${extension}`);
+	return SOURCE_SIDECAR_EXTENSIONS.flatMap(extension =>
+		paths.filter(path => path.toLowerCase().endsWith(`.${suffix}${extension}`)),
+	);
 }
 
 export function buildTimelineSourceAudioTracks({

@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
 	exec: vi.fn(),
 	readFile: vi.fn(),
 	rm: vi.fn(),
+	stat: vi.fn(),
 	companions: vi.fn(),
 	delay: vi.fn(),
 	session: vi.fn(),
@@ -26,6 +27,7 @@ vi.mock("node:fs/promises", () => ({
 		access: vi.fn().mockResolvedValue(undefined),
 		readFile: mocks.readFile,
 		rm: mocks.rm,
+		stat: mocks.stat,
 	},
 }));
 vi.mock("electron", () => ({ app: { getPath: () => "/tmp" } }));
@@ -65,6 +67,7 @@ beforeEach(() => {
 		.mockReset()
 		.mockImplementation(async (file: string) => (file.endsWith(".json") ? json : srt));
 	mocks.rm.mockResolvedValue(undefined);
+	mocks.stat.mockReset().mockResolvedValue({ size: 64_044 });
 });
 
 const whisperPath = path.resolve("/whisper");
@@ -145,6 +148,25 @@ describe("caption generation pipeline", () => {
 			return { stderr: "" };
 		});
 		expect((await generateAutoCaptionsFromVideo(options)).cues[0].text).toBe("Hello world.");
+	});
+
+	it("offsets timestamps for each bounded transcription window", async () => {
+		mocks.stat.mockResolvedValue({ size: 32_000 * 620 + 44 });
+		const onProgress = vi.fn();
+		const result = await generateAutoCaptionsFromVideo({ ...options, onProgress });
+		expect(whisperCalls()).toHaveLength(2);
+		expect(result.transcript?.segments.map(segment => segment.startMs)).toEqual([0, 600_000]);
+		expect(onProgress).toHaveBeenCalledWith(0.45);
+		expect(onProgress).toHaveBeenLastCalledWith(1);
+	});
+
+	it("stops before running another transcription window after cancellation", async () => {
+		mocks.stat.mockResolvedValue({ size: 32_000 * 620 + 44 });
+		const controller = new AbortController();
+		await expect(generateAutoCaptionsFromVideo({
+			...options, signal: controller.signal, onProgress: () => controller.abort(),
+		})).rejects.toMatchObject({ name: "AbortError" });
+		expect(whisperCalls()).toHaveLength(1);
 	});
 });
 

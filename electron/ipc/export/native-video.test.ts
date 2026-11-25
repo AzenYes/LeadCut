@@ -62,6 +62,7 @@ import {
 	buildNativeStaticLayoutTimelineSegments,
 	buildNativeVideoAudioMuxArgs,
 	canCopyAudioCodecIntoMp4,
+	exportNativeStaticLayoutVideo,
 	getExperimentalNvidiaCudaExportSkipReason,
 	getExportHardwareInfo,
 	getNativeExportCapabilities,
@@ -348,8 +349,9 @@ describe("getNvidiaCudaAutoStallTimeoutMs", () => {
 });
 
 describe("getNativeGpuCompositorStallTimeoutMs", () => {
-	it("guards Windows GPU compositor stalls by default", () => {
-		expect(getNativeGpuCompositorStallTimeoutMs()).toBe(120_000);
+	it("bounds startup while giving a compositor that has reported frames time to continue", () => {
+		expect(getNativeGpuCompositorStallTimeoutMs(false)).toBe(15_000);
+		expect(getNativeGpuCompositorStallTimeoutMs(true)).toBe(120_000);
 	});
 
 	it("allows the Windows GPU stall guard to be disabled or tuned", () => {
@@ -358,13 +360,16 @@ describe("getNativeGpuCompositorStallTimeoutMs", () => {
 
 		try {
 			process.env[envName] = "0";
-			expect(getNativeGpuCompositorStallTimeoutMs()).toBeNull();
+			expect(getNativeGpuCompositorStallTimeoutMs(false)).toBeNull();
+			expect(getNativeGpuCompositorStallTimeoutMs(true)).toBeNull();
 
 			process.env[envName] = "5000";
-			expect(getNativeGpuCompositorStallTimeoutMs()).toBe(10_000);
+			expect(getNativeGpuCompositorStallTimeoutMs(false)).toBe(10_000);
+			expect(getNativeGpuCompositorStallTimeoutMs(true)).toBe(10_000);
 
 			process.env[envName] = "45000";
-			expect(getNativeGpuCompositorStallTimeoutMs()).toBe(45_000);
+			expect(getNativeGpuCompositorStallTimeoutMs(false)).toBe(45_000);
+			expect(getNativeGpuCompositorStallTimeoutMs(true)).toBe(45_000);
 		} finally {
 			if (originalValue === undefined) {
 				delete process.env[envName];
@@ -828,6 +833,26 @@ describe("buildExperimentalNvidiaCudaStaticLayoutArgs", () => {
 });
 
 describe("buildExperimentalWindowsGpuStaticLayoutArgs", () => {
+	it("enables GPU timestamp queries only for measured exports", () => {
+		const options = createNvidiaCudaSkipOptions();
+		expect(buildExperimentalWindowsGpuStaticLayoutArgs(options, "output.mp4"))
+			.not.toContain("--measure-gpu-stages");
+		expect(buildExperimentalWindowsGpuStaticLayoutArgs({ ...options, measureGpuStages: true }, "output.mp4"))
+			.toContain("--measure-gpu-stages");
+	});
+
+	it.each([
+		[1920, 1080, "12"],
+		[3840, 2160, "8"],
+	])("retains headroom above four startup surfaces at %s×%s", (width, height, limit) => {
+		const args = buildExperimentalWindowsGpuStaticLayoutArgs(
+			createNvidiaCudaSkipOptions({ width, height }),
+			"output.mp4",
+		);
+		expect(args[args.indexOf("--initial-surface-pool-size") + 1]).toBe("4");
+		expect(args[args.indexOf("--surface-pool-size") + 1]).toBe(limit);
+	});
+
 	it("passes background blur to the D3D11 compositor", () => {
 		const args = buildExperimentalWindowsGpuStaticLayoutArgs(
 			createNvidiaCudaSkipOptions({
@@ -921,6 +946,51 @@ describe("muxExportedVideoAudioBuffer", () => {
 });
 
 describe("buildNativeVideoAudioMuxArgs", () => {
+	it("renders pitch-preserved source audio to a fragmented pipe without opening the video", () => {
+		const args = buildNativeVideoAudioMuxArgs("video.mp4", "source.mp4", "pipe:1", {
+			audioMode: "edited-track",
+			editedTrackStrategy: "filtergraph-fast-path",
+			editedTrackSegments: [{ startMs: 0, endMs: 6_000, speed: 1.2 }],
+			audioSourceSampleRate: 48_000,
+			outputDurationSec: 5,
+		}, { audioOutputTimescale: 1_000 });
+		const graph = args[args.indexOf("-filter_complex") + 1];
+		expect(graph.startsWith("[0:a]atrim=")).toBe(true);
+		expect(graph).toContain("atempo=1.2");
+		expect(args).not.toContain("video.mp4");
+		expect(args).not.toContain("-c:v");
+		expect(args.slice(-7)).toEqual([
+			"-frag_duration", "1000000", "-movie_timescale", "1000", "-f", "mp4", "pipe:1",
+		]);
+	});
+
+	it("streams Annex B video and copies approved AAC into the same final MP4", () => {
+		const args = buildNativeVideoAudioMuxArgs(
+			"pipe:0",
+			"recording.mp4",
+			"out.mp4",
+			{ audioMode: "copy-source", audioSourceCodec: "aac", outputDurationSec: 18 },
+			{ videoInputFrameRate: 24, moovReservedBytes: 64_000 },
+		);
+		expect(args.join(" ")).toContain("-f h264 -r 24 -i pipe:0 -i recording.mp4");
+		expect(args.join(" ")).toContain("-c:v copy -c:a copy -t 18.000");
+		expect(args.slice(-3)).toEqual(["-moov_size", "64000", "out.mp4"]);
+	});
+
+	it("encodes piped WAV into an MP4 with metadata reserved at the front", () => {
+		const args = buildNativeVideoAudioMuxArgs(
+			"video.mp4",
+			"pipe:0",
+			"out.mp4",
+			{ audioMode: "edited-track", outputDurationSec: 60 },
+			{ wavFromStdin: true, moovReservedBytes: 110_000 },
+		);
+		expect(args).toEqual(expect.arrayContaining(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]));
+		expect(args.slice(args.indexOf("-f"), args.indexOf("-f") + 4)).toEqual(["-f", "wav", "-i", "pipe:0"]);
+		expect(args.slice(-3)).toEqual(["-moov_size", "110000", "out.mp4"]);
+		expect(args).not.toContain("+faststart");
+	});
+
 	it("stream-copies source audio and preserves the requested video duration", () => {
 		const args = buildNativeVideoAudioMuxArgs("video.mp4", "source.mp4", "out.mp4", {
 			audioMode: "copy-source",
@@ -1117,6 +1187,15 @@ describe("parseWindowsGpuExportSummary", () => {
 });
 
 describe("validateWindowsGpuExportSummary", () => {
+	it("rejects an output that omitted the requested cursor layer", () => {
+		const expected = { durationSec: 4, targetFrames: 120, cursorOverlay: true };
+		const summary = { success: true, frames: 120, seconds: 4 };
+		expect(validateWindowsGpuExportSummary(summary, expected)).toEqual([
+			"Windows GPU output omitted the requested cursor overlay",
+		]);
+		expect(validateWindowsGpuExportSummary({ ...summary, cursorOverlay: true }, expected)).toEqual([]);
+	});
+
 	it("rejects short Windows GPU outputs before muxing audio", () => {
 		expect(
 			validateWindowsGpuExportSummary(
@@ -1138,6 +1217,24 @@ describe("validateWindowsGpuExportSummary", () => {
 		).toEqual([]);
 	});
 });
+
+it.each([
+	[{ cursorTelemetry: [{ timeMs: 0, cx: 0.5, cy: 0.5 }] }, "cursor overlay"],
+	[{ cursorTelemetryPath: "cursor.csv" }, "cursor overlay"],
+	[{ zoomTelemetryPath: "zoom.csv" }, "zoom telemetry"],
+	[{ timelineMapPath: "timeline.csv" }, "timeline map"],
+] satisfies [Partial<NativeStaticLayoutExportOptions>, string][])(
+	"rejects FFmpeg static layout for GPU-dependent options %o",
+	async (effect, feature) => {
+		const options = createNvidiaCudaSkipOptions({
+			...effect,
+			experimentalWindowsGpuCompositor: false,
+		});
+		await expect(exportNativeStaticLayoutVideo("ffmpeg", options)).rejects.toThrow(
+			`FFmpeg static layout cannot render ${feature}`,
+		);
+	},
+);
 
 describe("parseNvidiaCudaExportSummary", () => {
 	it("parses the pretty JSON summary emitted by the CUDA wrapper", () => {

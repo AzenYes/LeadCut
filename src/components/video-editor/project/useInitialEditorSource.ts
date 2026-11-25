@@ -1,6 +1,8 @@
 /* biome-ignore-all lint/correctness/useExhaustiveDependencies: editor state setters are stable and initial source loading intentionally runs once per launch configuration. */
 import { type MutableRefObject, useEffect, useRef } from "react";
 import { useUiText } from "@/i18n/useUiText";
+import { loadInitialEditorProject } from "@/lib/startupEditorPreview";
+import { toast } from "@/components/ui/toast";
 import { notifyProjectFormat } from "./projectFormatNotice";
 import { fromFileUrl, resolveVideoUrl } from "../projectPersistence";
 import type { getDevOpenRecordingConfig, getSmokeExportConfig } from "../smokeExportConfig";
@@ -26,6 +28,7 @@ type Input = {
 	offerRelink: (result: ProjectLoadResult) => boolean;
 	resetSourceScopedEditorState: () => void;
 	applySessionPresentation: (session: SessionPresentation | null | undefined) => void;
+	refreshProjectLibrary: () => Promise<void>;
 };
 
 export function useInitialEditorSource({
@@ -40,6 +43,7 @@ export function useInitialEditorSource({
 	offerRelink,
 	resetSourceScopedEditorState,
 	applySessionPresentation,
+	refreshProjectLibrary,
 }: Input) {
 	const uiText = useUiText();
 	const initialLoadStartedRef = useRef(false);
@@ -153,7 +157,7 @@ export function useInitialEditorSource({
 					return;
 				}
 
-				const currentProject = await window.electronAPI.loadCurrentProjectFile();
+				const currentProject = await loadInitialEditorProject();
 				if (offerRelink(currentProject)) return;
 				if (
 					currentProject.success &&
@@ -162,6 +166,9 @@ export function useInitialEditorSource({
 				) {
 					notifyProjectFormat(currentProject, uiText);
 					return;
+				}
+				if (currentProject.startupOpen) {
+					toast.error(currentProject.error || currentProject.message || uiText("failedToLoadProject"));
 				}
 
 				const sessionResult = await window.electronAPI.getCurrentRecordingSession?.();
@@ -191,6 +198,7 @@ export function useInitialEditorSource({
 				if (!currentVideo.success || !currentVideo.path) {
 					// An empty session is the normal dashboard launch, not a load failure.
 					project.setProjectBrowserOpen(true);
+					void refreshProjectLibrary();
 					return;
 				}
 				const sourcePath = fromFileUrl(currentVideo.path);
@@ -220,25 +228,28 @@ export function useInitialEditorSource({
 		applySessionPresentation,
 		devConfig,
 		offerRelink,
+		refreshProjectLibrary,
 		resetSourceScopedEditorState,
 		smokeConfig,
 	]);
 
 	useEffect(() => {
 		if (!window.electronAPI.onRecordingSessionChanged) return;
-		return window.electronAPI.onRecordingSessionChanged((session) => {
+		return window.electronAPI.onRecordingSessionChanged((session, background) => {
 			const sessionSourcePath = session?.videoPath ? fromFileUrl(session.videoPath) : null;
 			const webcamPath = session?.webcamPath ? fromFileUrl(session.webcamPath) : null;
 			if (!session || sessionSourcePath !== videoSourcePath) return;
-			appearance.setWebcam((previous) => ({
-				...previous,
-				visibleRanges: undefined,
-				enabled: Boolean(webcamPath),
-				sourcePath: webcamPath,
-				timeOffsetMs: webcamPath
-					? (session.timeOffsetMs ?? previous.timeOffsetMs)
-					: DEFAULT_WEBCAM_TIME_OFFSET_MS,
-			}));
+			if (background !== "audio") {
+				appearance.setWebcam((previous) => ({
+					...previous,
+					visibleRanges: undefined,
+					enabled: Boolean(webcamPath),
+					sourcePath: webcamPath,
+					timeOffsetMs: webcamPath
+						? (session.timeOffsetMs ?? previous.timeOffsetMs)
+						: DEFAULT_WEBCAM_TIME_OFFSET_MS,
+				}));
+			}
 			timeline.setSourceAudioFallbackRefreshKey((key) => key + 1);
 		});
 	}, [videoSourcePath, appearance.setWebcam, timeline.setSourceAudioFallbackRefreshKey]);

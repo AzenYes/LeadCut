@@ -31,6 +31,8 @@ import type { useAppearanceState } from "../state/useAppearanceState";
 import type { useTimelineState } from "../state/useTimelineState";
 import type { TimelineEditorHandle } from "../timeline/TimelineEditor";
 import type { VideoPlaybackRef } from "../VideoPlayback";
+import type { ExportPreviewStore } from "../export/pausedExportPreview";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 import { EditorVideoPreview } from "./EditorVideoPreview";
 import { DetachablePreview } from "./DetachablePreview";
 import { PreviewScrubber } from "./PreviewScrubber";
@@ -46,11 +48,12 @@ type Props = {
 	previewAspectRatioValue: number;
 	videoPlaybackRef: RefObject<VideoPlaybackRef | null>;
 	timelineRef: RefObject<TimelineEditorHandle | null>;
-	currentTime: number;
+	playbackClock: PlaybackClock;
 	isPlaying: boolean;
 	previewVolume: number;
 	setPreviewVolume: Dispatch<SetStateAction<number>>;
 	suspendRendering: boolean;
+	exportPreview: ExportPreviewStore;
 	appearance: ReturnType<typeof useAppearanceState>;
 	timeline: ReturnType<typeof useTimelineState>;
 	audio: ReturnType<typeof useVideoEditorAudio>;
@@ -68,7 +71,6 @@ type Props = {
 	setDuration: Dispatch<SetStateAction<number>>;
 	isPreviewReady: boolean;
 	setIsPreviewReady: Dispatch<SetStateAction<boolean>>;
-	setCurrentTime: Dispatch<SetStateAction<number>>;
 	setIsPlaying: Dispatch<SetStateAction<boolean>>;
 	setError: (message: string | null) => void;
 };
@@ -85,11 +87,12 @@ export function EditorPreviewPanel(props: Props) {
 		previewAspectRatioValue,
 		videoPlaybackRef,
 		timelineRef,
-		currentTime,
+		playbackClock,
 		isPlaying,
 		previewVolume,
 		setPreviewVolume,
 		suspendRendering,
+	exportPreview,
 		appearance,
 		timeline,
 		audio,
@@ -106,7 +109,6 @@ export function EditorPreviewPanel(props: Props) {
 		setDuration,
 		isPreviewReady,
 		setIsPreviewReady,
-		setCurrentTime,
 		setIsPlaying,
 		setError,
 	} = props;
@@ -132,7 +134,7 @@ export function EditorPreviewPanel(props: Props) {
 		[timeline.markers, timeline.clipRegions],
 	);
 	const transportProps = {
-		currentTime: projection.timelinePlayheadTime,
+		playbackClock,
 		duration: projection.timelineDuration,
 		isPlaying,
 		playback,
@@ -220,12 +222,13 @@ export function EditorPreviewPanel(props: Props) {
 									previewVersion={previewVersion}
 									aspectRatio={aspectRatio}
 									playbackRef={videoPlaybackRef}
-									currentTime={currentTime}
+								playbackClock={playbackClock}
 									isPlaying={isPlaying}
 									previewPlaybackRate={playback.previewPlaybackRate}
 									timelineDuration={projection.timelineDuration}
 									previewVolume={previewVolume}
 									suspendRendering={suspendRendering}
+									exportPreview={exportPreview}
 									readOnly={Boolean(props.readOnly)}
 									appearance={appearance}
 									timeline={timeline}
@@ -235,7 +238,6 @@ export function EditorPreviewPanel(props: Props) {
 									effectiveShowCursor={effectiveShowCursor}
 									setDuration={setDuration}
 									setIsPreviewReady={handlePreviewReady}
-									setCurrentTime={setCurrentTime}
 									setIsPlaying={setIsPlaying}
 									setError={setError}
 									handlers={{
@@ -254,7 +256,7 @@ export function EditorPreviewPanel(props: Props) {
 								/>
 							</div>
 						</div>
-							<PreviewScrubber currentTime={projection.timelinePlayheadTime} duration={projection.timelineDuration}
+							<PreviewScrubber playbackClock={playbackClock} duration={projection.timelineDuration}
 								onSeek={playback.handleTimelineSeek} cuts={cuts} markers={markers}
 								chapters={timeline.chapterProgress.enabled ? timeline.chapterProgress.chapters : []} />
 						</DetachablePreview>
@@ -301,10 +303,11 @@ export function EditorPreviewPanel(props: Props) {
 					</DropdownMenu>
 					<Button
 							disabled={Boolean(props.readOnly) || projection.timelineDuration <= 0}
+						data-onboarding-target="zoom"
+						className="h-9 w-9 data-[onboarding-active]:ring-2 data-[onboarding-active]:ring-accent"
 						onClick={() => timelineRef.current?.addZoom()}
 						variant="ghost"
 						size="icon"
-						className="h-9 w-9"
 						title={t("timeline.zoom.addZoom")}
 					>
 						<MagnifyingGlassPlus className="h-4 w-4" />
@@ -321,9 +324,10 @@ export function EditorPreviewPanel(props: Props) {
 					</Button>
 					<Button
 						onClick={() => timelineRef.current?.splitClip()}
+						data-onboarding-target="split"
 						variant="ghost"
 						size="icon"
-						className="h-9 w-9"
+						className="h-9 w-9 data-[onboarding-active]:ring-2 data-[onboarding-active]:ring-accent"
 						title={t("editor.toolbar.splitClip")}
 					>
 						<Scissors className="h-4 w-4" />

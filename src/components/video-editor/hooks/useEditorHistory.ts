@@ -1,5 +1,6 @@
 import { captureAppearanceHistory, restoreAppearanceHistory } from "../appearanceHistory";
 import type { useAppearanceState } from "../state/useAppearanceState";
+import { createObservableValue } from "@/lib/observableValue";
 import type { AspectRatio } from "@/utils/aspectRatioUtils";
 import type { Dispatch, SetStateAction } from "react";
 import { emptyChapterProgress } from "../chapterProgress";
@@ -19,7 +20,6 @@ import {
 import { deriveNextId } from "../projectPersistence";
 import type { useTimelineState } from "../state/useTimelineState";
 import { normalizeTimelineMarkers } from "../timeline/core/timelineMarkers";
-import { cloneStructured } from "../videoEditorUtils";
 
 type Input = {
 	cropEditing?: boolean;
@@ -147,21 +147,23 @@ export function useEditorHistory({
 			window.removeEventListener("blur", end);
 		};
 	}, []);
-	const [historyFlags, setHistoryFlags] = useState({ canUndo: false, canRedo: false });
+	const [historyFlags] = useState(() => createObservableValue({ canUndo: false, canRedo: false }));
 	const syncButtons = useCallback(() => {
 		const next = {
 			canUndo: historyRef.current.past.length > 0,
 			canRedo: historyRef.current.future.length > 0,
 		};
-		setHistoryFlags((current) =>
-			current.canUndo === next.canUndo && current.canRedo === next.canRedo ? current : next,
-		);
-	}, []);
+		const current = historyFlags.get();
+		if (current.canUndo !== next.canUndo || current.canRedo !== next.canRedo) {
+			historyFlags.set(next);
+		}
+	}, [historyFlags]);
 	const buildSnapshot = useCallback(
 		(): EditorHistorySnapshot => ({
 			appearance: appearanceSnapshot,
 			aspectRatio,
 			autoCaptionSettings: timeline.autoCaptionSettings,
+			transcript: timeline.transcript,
 			sourceAudioTrackSettingsByClip: timeline.sourceAudioTrackSettingsByClip,
 			defaultSourceAudioTrackSettings: timeline.defaultSourceAudioTrackSettings,
 			chapterProgress: timeline.chapterProgress,
@@ -185,6 +187,7 @@ export function useEditorHistory({
 		[
 			appearanceSnapshot, aspectRatio, timeline.autoCaptionSettings, timeline.sourceAudioTrackSettingsByClip, timeline.defaultSourceAudioTrackSettings,
 			timeline.chapterProgress,
+			timeline.transcript,
 			timeline.keystrokeOverlay,
 			timeline.markers,
 			timeline.changeLog,
@@ -204,9 +207,8 @@ export function useEditorHistory({
 		],
 	);
 	const applySnapshot = useCallback(
-		(snapshot: EditorHistorySnapshot) => {
+		(cloned: EditorHistorySnapshot) => {
 			applyingRef.current = true;
-			const cloned = cloneStructured(snapshot);
 			if (cloned.appearance) restoreAppearanceHistory(appearance, cloned.appearance);
 			if (cloned.aspectRatio) setAspectRatio(cloned.aspectRatio);
 			if (cloned.autoCaptionSettings) timeline.setAutoCaptionSettings(cloned.autoCaptionSettings);
@@ -215,6 +217,7 @@ export function useEditorHistory({
 			timeline.setChapterProgress(cloned.chapterProgress ?? emptyChapterProgress());
 			timeline.setKeystrokeOverlay(cloned.keystrokeOverlay ?? DEFAULT_KEYSTROKE_OVERLAY);
 			timeline.setMarkers(cloned.markers ?? []);
+			timeline.setTranscript(cloned.transcript ?? null);
 			timeline.setChangeLog(cloned.changeLog ?? emptyChangeLog());
 			timeline.setVideoTracks(cloned.videoTracks ?? []);
 			timeline.setVideoRegions(cloned.videoRegions ?? []);
@@ -328,7 +331,7 @@ export function useEditorHistory({
 	}, [buildSnapshot, syncButtons, cropEditing, projectPath]);
 
 	return {
-		...historyFlags,
+		flags: historyFlags,
 		handleUndo,
 		handleRedo,
 		resetHistory,

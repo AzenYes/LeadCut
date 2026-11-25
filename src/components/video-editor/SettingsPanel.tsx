@@ -2,7 +2,6 @@ import { uiText } from "@/i18n/uiText";
 import { useUiText } from "@/i18n/useUiText";
 import { SettingsSections, SettingsCategory } from "./SettingsSections";
 import { Card, RadioGroup, Radio, Label, Description } from "@heroui/react";
-import { ProgressBar } from "@heroui/react";
 import { ColorControl, ColorPalette } from "@/components/ui/color-picker";
 import { Palette, Trash as Trash2, UploadSimple as Upload } from "@/components/ui/icons";
 import { AnimatePresence, motion } from "motion/react";
@@ -19,7 +18,6 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { ChoiceGroup, ChoiceItem } from "@/components/ui/choice-group";
-import { useTheme } from "@/contexts/ThemeContext";
 import { getAssetPath, getRenderableVideoUrl, getWallpaperThumbnailUrl } from "@/lib/assetPath";
 import { cn } from "@/lib/utils";
 import type { BuiltInWallpaper } from "@/lib/wallpapers";
@@ -30,10 +28,11 @@ import {
 } from "@/lib/wallpapers";
 import { type AspectRatio } from "@/utils/aspectRatioUtils";
 import { useI18n, useScopedT } from "../../contexts/I18nContext";
-import type { AppLocale } from "../../i18n/config";
-import { SUPPORTED_LOCALES } from "../../i18n/config";
 import { AnnotationSettingsPanel } from "./AnnotationSettingsPanel";
 import { CaptionAppearanceControls } from "./CaptionAppearanceControls";
+import { PreviewSlider } from "./PreviewSlider";
+import type { useAppearanceState } from "./state/useAppearanceState";
+import type { useTimelineState } from "./state/useTimelineState";
 import {
 	CURSOR_MOTION_PRESETS,
 	type CursorMotionPresetId,
@@ -43,7 +42,6 @@ import { loadEditorPreferences, saveEditorPreferences } from "./editorPreference
 import { getDefaultBorderRadiusPercent } from "./projectPersistence";
 import { SliderControl } from "./SliderControl";
 import { WallpaperGrid } from "./WallpaperGrid";
-import { useShortcuts } from "@/contexts/ShortcutsContext";
 import { SettingsRow } from "./SettingsRow";
 import type {
 	AnnotationRegion,
@@ -57,6 +55,7 @@ import type {
 	EditorEffectSection,
 	FigureData,
 	Padding,
+	PaddingSide,
 	WebcamOverlaySettings,
 	WebcamPositionPreset,
 	ZoomDepth,
@@ -65,6 +64,8 @@ import type {
 } from "./types";
 import {
 	ADVANCED_VERTICAL_PADDING_MAX,
+	CAPTION_FONT_SIZE_MIN,
+	CAPTION_FONT_SIZE_MAX,
 	DEFAULT_AUTO_CAPTION_SETTINGS,
 	DEFAULT_CROP_REGION,
 	DEFAULT_CURSOR_CLICK_BOUNCE_DURATION,
@@ -76,6 +77,7 @@ import {
 	DEFAULT_CURSOR_STYLE,
 	DEFAULT_CURSOR_SWAY,
 	DEFAULT_PADDING,
+	setPaddingSide,
 	DEFAULT_WEBCAM_MARGIN,
 	DEFAULT_WEBCAM_POSITION_PRESET,
 	DEFAULT_WEBCAM_POSITION_X,
@@ -95,6 +97,7 @@ import {
 	getCursorStyleSizeMultiplier,
 } from "./videoPlayback/uploadedCursorAssets";
 import { WebcamCropControl } from "./WebcamCropControl";
+import type { PlaybackClock } from "./videoPlayback/playbackClock";
 import {
 	getCropMatchedWebcamHeightPercent,
 	getWebcamPositionForPreset,
@@ -420,7 +423,8 @@ function CursorClickEffectCards({
 }
 
 interface SettingsPanelProps {
-	onShowOnboarding?: () => void;
+	onSaveRecordingDefault?: () => void;
+	savingRecordingDefault?: boolean;
 	advanced?: boolean;
 	panelMode?: "editor" | "background";
 	activeEffectSection?: EditorEffectSection;
@@ -453,8 +457,6 @@ interface SettingsPanelProps {
 	onBackgroundBlurChange?: (amount: number) => void;
 	connectZooms?: boolean;
 	onConnectZoomsChange?: (enabled: boolean) => void;
-	autoApplyFreshRecordingAutoZooms?: boolean;
-	onAutoApplyFreshRecordingAutoZoomsChange?: (enabled: boolean) => void;
 	zoomInDurationMs?: number;
 	onZoomInDurationMsChange?: (duration: number) => void;
 	zoomInOverlapMs?: number;
@@ -515,12 +517,14 @@ interface SettingsPanelProps {
 	onBorderRadiusChange?: (radius: number) => void;
 	webcam?: WebcamOverlaySettings;
 	webcamPreviewSrc?: string | null;
-	webcamPreviewCurrentTime?: number;
+	webcamPreviewClock?: PlaybackClock;
+	webcamPreviewTimeFromTimeline?: (seconds: number) => number;
 	webcamPreviewPlaying?: boolean;
 	onWebcamChange?: (webcam: WebcamOverlaySettings) => void;
 	onUploadWebcam?: () => void;
 	onClearWebcam?: () => void;
 	padding?: Padding;
+	paddingDraft?: ReturnType<typeof useAppearanceState>["paddingDraft"];
 	onPaddingChange?: (padding: Padding) => void;
 	cropRegion?: CropRegion;
 	onCropChange?: (region: CropRegion) => void;
@@ -537,11 +541,13 @@ interface SettingsPanelProps {
 	onAnnotationDelete?: (id: string) => void;
 	autoCaptions?: CaptionCue[];
 	autoCaptionSettings?: AutoCaptionSettings;
+	captionFontSizeDraft?: ReturnType<typeof useTimelineState>["captionFontSizeDraft"];
 	whisperExecutablePath?: string | null;
 	whisperModelPath?: string | null;
 	whisperModelDownloadStatus?: "idle" | "downloading" | "downloaded" | "error";
 	whisperModelDownloadProgress?: number;
 	isGeneratingCaptions?: boolean;
+	captionGenerationProgress?: number;
 	isImportingCaptions?: boolean;
 	isWorkingWithTranscript?: boolean;
 	hasTranscript?: boolean;
@@ -552,8 +558,10 @@ interface SettingsPanelProps {
 	onPickWhisperExecutable?: () => void;
 	onPickWhisperModel?: () => void;
 	onGenerateAutoCaptions?: () => void;
+	onCancelAutoCaptions?: () => void;
 	onClearAutoCaptions?: () => void;
 	onDownloadWhisperSmallModel?: () => void;
+	onCancelWhisperModelDownload?: () => void;
 	onDeleteWhisperSmallModel?: () => void;
 	nativeCaptureUnavailableSession?: boolean;
 	onOpenNativeCaptureUnavailableModal?: () => void;
@@ -613,19 +621,6 @@ const CAPTION_LANGUAGE_OPTIONS = [
 	{ value: "ja", label: "Japanese" },
 	{ value: "ko", label: "Korean" },
 ] as const;
-
-const APP_LANGUAGE_LABELS: Record<AppLocale, string> = {
-	en: "English",
-	es: "Español",
-	fr: "Français",
-	de: "Deutsch",
-	it: "Italiano",
-	nl: "Nederlands",
-	ko: "한국어",
-	"pt-BR": "Português",
-	"zh-CN": "简体中文",
-	"zh-TW": "繁體中文",
-};
 
 function loadPreviewImage(url: string) {
 	return new Promise<HTMLImageElement>((resolve, reject) => {
@@ -876,7 +871,8 @@ function CursorStylePreview({
 }
 
 export function SettingsPanel({
-	onShowOnboarding,
+	onSaveRecordingDefault,
+	savingRecordingDefault,
 	advanced = false,
 	panelMode = "editor",
 	activeEffectSection: activeEffectSectionProp,
@@ -909,8 +905,6 @@ export function SettingsPanel({
 	onBackgroundBlurChange,
 	connectZooms = true,
 	onConnectZoomsChange,
-	autoApplyFreshRecordingAutoZooms = true,
-	onAutoApplyFreshRecordingAutoZoomsChange,
 	zoomInDurationMs = DEFAULT_ZOOM_IN_DURATION_MS,
 	onZoomInDurationMsChange,
 	zoomOutDurationMs = DEFAULT_ZOOM_OUT_DURATION_MS,
@@ -959,12 +953,14 @@ export function SettingsPanel({
 	onBorderRadiusChange,
 	webcam,
 	webcamPreviewSrc = null,
-	webcamPreviewCurrentTime = 0,
+	webcamPreviewClock,
+	webcamPreviewTimeFromTimeline,
 	webcamPreviewPlaying = false,
 	onWebcamChange,
 	onUploadWebcam,
 	onClearWebcam,
 	padding = DEFAULT_PADDING,
+	paddingDraft,
 	onPaddingChange,
 	cropRegion,
 	onCropChange,
@@ -981,10 +977,11 @@ export function SettingsPanel({
 	onAnnotationDelete,
 	autoCaptions = [],
 	autoCaptionSettings = DEFAULT_AUTO_CAPTION_SETTINGS,
+	captionFontSizeDraft,
 	whisperModelPath,
 	whisperModelDownloadStatus = "idle",
-	whisperModelDownloadProgress = 0,
 	isGeneratingCaptions = false,
+	captionGenerationProgress = 0,
 	isImportingCaptions = false,
 	isWorkingWithTranscript = false,
 	hasTranscript = false,
@@ -1002,8 +999,7 @@ export function SettingsPanel({
 }: SettingsPanelProps) {
 	const uiText = useUiText();
 	const tSettings = useScopedT("settings");
-	const { locale, setLocale, t } = useI18n();
-	const { preference: themePreference, setPreference: setThemePreference } = useTheme();
+	const { locale, t } = useI18n();
 	const isBackgroundPanel = panelMode === "background";
 	const initialEditorPreferences = useMemo(() => loadEditorPreferences(), []);
 	const clipSpeedRange = useMemo(getPreviewPlaybackRateRange, []);
@@ -1013,7 +1009,6 @@ export function SettingsPanel({
 	const [customImages, setCustomImages] = useState<string[]>(
 		initialEditorPreferences.customWallpapers,
 	);
-	const { openConfig: openShortcutsConfig } = useShortcuts();
 	const [internalActiveEffectSection] = useState<EditorEffectSection>("scene");
 	const activeEffectSection = activeEffectSectionProp ?? internalActiveEffectSection;
 	const removeBackgroundStateRef = useRef<{
@@ -1052,12 +1047,11 @@ export function SettingsPanel({
 				const availableWallpapers = await getAvailableWallpapers();
 				const resolved = await Promise.all(
 					availableWallpapers.map(async (wallpaper) => {
-						const assetUrl = await getAssetPath(wallpaper.relativePath);
 						// Use tiny thumbnails for the grid; full-res loads on selection
 						if (isVideoWallpaperSource(wallpaper.publicPath)) {
-							return getRenderableVideoUrl(assetUrl);
+							return getRenderableVideoUrl(await getAssetPath(wallpaper.relativePath));
 						}
-						return getWallpaperThumbnailUrl(assetUrl);
+						return getWallpaperThumbnailUrl(wallpaper.publicPath);
 					}),
 				);
 				if (mounted) {
@@ -1269,21 +1263,15 @@ export function SettingsPanel({
 		}
 	};
 
-	const handlePaddingSideChange = (side: keyof Padding, value: number) => {
-		if (padding.linked !== false) {
-			onPaddingChange?.({
-				top: value,
-				bottom: value,
-				left: value,
-				right: value,
-				linked: true,
-			});
-		} else {
-			onPaddingChange?.({
-				...padding,
-				[side]: value,
-			});
-		}
+	const renderPaddingSlider = (side: PaddingSide, label: string, max: number) => {
+		const sliderProps = {
+			label, value: padding[side], min: 0, max, step: 1,
+			onChange: (value: number) => onPaddingChange?.(setPaddingSide(padding, side, value)),
+			formatValue: (value: number) => `${value}%`,
+		};
+		return paddingDraft ? <PreviewSlider {...sliderProps} draft={paddingDraft}
+			readDraft={pending => pending.side === side ? pending.value : null} createDraft={value => ({ side, value })} />
+			: <SliderControl {...sliderProps} />;
 	};
 
 	const webcamFileName = webcam?.sourcePath?.split(/[\\/]/).pop() ?? null;
@@ -1559,7 +1547,7 @@ export function SettingsPanel({
 		? annotationRegions.find((a) => a.id === selectedAnnotationId)
 		: null;
 
-	const backgroundSettingsContent = (
+	const renderBackgroundSettings = () => (
 		<div className="space-y-5">
 			<section className="flex flex-col gap-4">
 				<div className="flex items-center justify-between gap-3">
@@ -1771,13 +1759,13 @@ export function SettingsPanel({
 							{tSettings("background.title")}
 						</span>
 					</div>
-					{backgroundSettingsContent}
+					{renderBackgroundSettings()}
 				</div>
 			</Card>
 		);
 	}
 
-	const frameSectionContent = (
+	const renderFrameSection = () => (
 		<section className="flex flex-col gap-4">
 			<div className="flex items-center justify-between gap-3">
 				<SectionLabel>{tSettings("sections.frame", "Frame")}</SectionLabel>
@@ -1822,54 +1810,12 @@ export function SettingsPanel({
 						</div>
 					)}
 
-					{padding.linked !== false ? (
-						<SliderControl
-							label={tSettings("effects.padding")}
-							value={padding.top}
-							min={0}
-							max={100}
-							step={1}
-							onChange={(v) => handlePaddingSideChange("top", v)}
-							formatValue={(v) => `${v}%`}
-						/>
-					) : (
+					{padding.linked !== false ? renderPaddingSlider("top", tSettings("effects.padding"), 100) : (
 						<div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
-							<SliderControl
-								label={tSettings("effects.paddingTop", "Top")}
-								value={padding.top}
-								min={0}
-								max={ADVANCED_VERTICAL_PADDING_MAX}
-								step={1}
-								onChange={(v) => handlePaddingSideChange("top", v)}
-								formatValue={(v) => `${v}%`}
-							/>
-							<SliderControl
-								label={tSettings("effects.paddingBottom", "Bottom")}
-								value={padding.bottom}
-								min={0}
-								max={ADVANCED_VERTICAL_PADDING_MAX}
-								step={1}
-								onChange={(v) => handlePaddingSideChange("bottom", v)}
-								formatValue={(v) => `${v}%`}
-							/>
-							<SliderControl
-								label={tSettings("effects.paddingLeft", "Left")}
-								value={padding.left}
-								min={0}
-								max={100}
-								step={1}
-								onChange={(v) => handlePaddingSideChange("left", v)}
-								formatValue={(v) => `${v}%`}
-							/>
-							<SliderControl
-								label={tSettings("effects.paddingRight", "Right")}
-								value={padding.right}
-								min={0}
-								max={100}
-								step={1}
-								onChange={(v) => handlePaddingSideChange("right", v)}
-								formatValue={(v) => `${v}%`}
-							/>
+							{renderPaddingSlider("top", tSettings("effects.paddingTop", "Top"), ADVANCED_VERTICAL_PADDING_MAX)}
+							{renderPaddingSlider("bottom", tSettings("effects.paddingBottom", "Bottom"), ADVANCED_VERTICAL_PADDING_MAX)}
+							{renderPaddingSlider("left", tSettings("effects.paddingLeft", "Left"), 100)}
+							{renderPaddingSlider("right", tSettings("effects.paddingRight", "Right"), 100)}
 						</div>
 					)}
 				</div>
@@ -1887,7 +1833,7 @@ export function SettingsPanel({
 		</section>
 	);
 
-	const cropSectionContent = (
+	const renderCropSection = () => (
 		<section className="flex flex-col gap-4">
 			<div className="flex items-center justify-between gap-3">
 				<SectionLabel>{tSettings("sections.crop", "Crop")}</SectionLabel>
@@ -1944,7 +1890,7 @@ export function SettingsPanel({
 		</section>
 	);
 
-	const captionsSectionContent = (
+	const renderCaptionsSection = () => (
 		<section className="flex flex-col gap-4">
 			<div className="flex items-center justify-between gap-3">
 				<div className="flex items-center gap-3">
@@ -2028,12 +1974,7 @@ export function SettingsPanel({
 				</div>
 				<div className="flex flex-wrap items-center gap-2">
 					<div className="grid w-full grid-cols-1 gap-2">
-						{whisperModelDownloadStatus === "downloading" ? (
-							<Button type="button" disabled className="h-9 w-full px-4 text-sm">
-								{tSettings("captions.downloading", "Downloading...")}{" "}
-								{Math.round(whisperModelDownloadProgress)}%
-							</Button>
-						) : whisperModelPath ? (
+						{whisperModelDownloadStatus === "downloading" ? null : whisperModelPath ? (
 							<Button
 								type="button"
 								variant="outline"
@@ -2070,7 +2011,7 @@ export function SettingsPanel({
 						className="h-9 w-full px-4 text-sm"
 					>
 						{isGeneratingCaptions
-							? tSettings("captions.generating", "Generating...")
+							? `${tSettings("captions.generating", "Generating...")} ${captionGenerationProgress}%`
 							: captionCueCount > 0
 								? tSettings("captions.regenerateFull", "Regenerate Captions")
 								: tSettings("captions.generateFull", "Generate Captions")}
@@ -2096,30 +2037,7 @@ export function SettingsPanel({
 							</Button>
 						</div>
 					)}
-					{isGeneratingCaptions ? (
-						<div className="space-y-1">
-							<div className="text-xs text-muted-foreground">
-								{tSettings(
-									"captions.generatingStatus",
-									"Generating captions. This can take a moment.",
-								)}
-							</div>
-							<ProgressBar aria-label={uiText("downloadingCaptionModel")} isIndeterminate>
-								<ProgressBar.Track>
-									<ProgressBar.Fill />
-								</ProgressBar.Track>
-							</ProgressBar>
-						</div>
-					) : null}
 				</div>
-				{whisperModelDownloadStatus === "downloading" ? (
-					<div className="h-2 overflow-hidden rounded-full bg-foreground/5">
-						<div
-							className="h-full rounded-full bg-accent transition-all"
-							style={{ width: `${whisperModelDownloadProgress}%` }}
-						/>
-					</div>
-				) : null}
 			</div>
 
 			<div className="flex flex-col gap-3">
@@ -2132,15 +2050,16 @@ export function SettingsPanel({
 					settings={autoCaptionSettings}
 					onChange={updateAutoCaptionSettings}
 				/>
-				<SliderControl
-					label={tSettings("captions.fontSize", "Font size")}
-					value={autoCaptionSettings.fontSize}
-					min={16}
-					max={72}
-					step={1}
-					onChange={(value) => updateAutoCaptionSettings({ fontSize: value })}
-					formatValue={(value) => `${Math.round(value)}px`}
-				/>
+				{captionFontSizeDraft ? (
+					<PreviewSlider label={tSettings("captions.fontSize", "Font size")} value={autoCaptionSettings.fontSize}
+						min={CAPTION_FONT_SIZE_MIN} max={CAPTION_FONT_SIZE_MAX} step={1} formatValue={value => `${Math.round(value)}px`}
+						draft={captionFontSizeDraft} readDraft={value => value} createDraft={value => value}
+						onChange={fontSize => updateAutoCaptionSettings({ fontSize })} />
+				) : (
+					<SliderControl label={tSettings("captions.fontSize", "Font size")} value={autoCaptionSettings.fontSize}
+						min={CAPTION_FONT_SIZE_MIN} max={CAPTION_FONT_SIZE_MAX} step={1} onChange={fontSize => updateAutoCaptionSettings({ fontSize })}
+						formatValue={value => `${Math.round(value)}px`} />
+				)}
 				<div className="flex items-center justify-between py-2">
 					<span className="text-sm font-medium text-foreground">
 						{tSettings("captions.textColor", "Text color")}
@@ -2239,82 +2158,12 @@ export function SettingsPanel({
 	);
 
 	const effectSectionContent = (() => {
-		const settingsSectionContent = (
+		const renderMotionSection = () => (
 			<SettingsSections
-				categories={advanced && showDevMotionControls ? ["general", "motion", "advanced"] : ["general", "motion"]}
+				categories={advanced && showDevMotionControls ? ["motion", "advanced"] : ["motion"]}
 			>
-				<SettingsCategory category="general">
-					{onShowOnboarding && (
-						<SettingsRow title={tSettings("general.onboarding", "Onboarding")}>
-							<Button variant="secondary" size="sm" onClick={onShowOnboarding}>
-								{tSettings("general.showOnboarding", "Show onboarding")}
-							</Button>
-						</SettingsRow>
-					)}
-
-					<SettingsRow title={t("editor.theme.appearance", "Appearance")} stacked>
-						<ChoiceGroup
-							type="single"
-							aria-label={t("editor.theme.appearance", "Appearance")}
-							value={themePreference}
-							onValueChange={(value) => {
-								if (value === "light" || value === "dark" || value === "system")
-									setThemePreference(value);
-							}}
-							fullWidth
-							size="sm"
-						>
-							<ChoiceItem value="light" className="flex-1">
-								{t("editor.theme.light", "Light")}
-							</ChoiceItem>
-							<ChoiceItem value="dark" className="flex-1">
-								{t("editor.theme.dark", "Dark")}
-							</ChoiceItem>
-							<ChoiceItem value="system" className="flex-1">
-								{t("editor.theme.system", "System")}
-							</ChoiceItem>
-						</ChoiceGroup>
-					</SettingsRow>
-
-					<SettingsRow title={t("common.app.language", "Language")} stacked>
-						<Select
-							value={locale}
-							onValueChange={(value) => setLocale(value as AppLocale)}
-						>
-							<SelectTrigger className="h-9 w-full text-sm">
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								{SUPPORTED_LOCALES.map((candidateLocale) => (
-									<SelectItem key={candidateLocale} value={candidateLocale}>
-										{APP_LANGUAGE_LABELS[candidateLocale]}
-									</SelectItem>
-								))}
-							</SelectContent>
-						</Select>
-					</SettingsRow>
-				</SettingsCategory>
 				<SettingsCategory category="motion">
 					<section className="flex flex-col gap-6">
-						<SettingsRow
-							title={tSettings(
-								"effects.autoApplyFreshRecordingZooms",
-								"Auto-apply fresh recording zooms",
-							)}
-							description={tSettings(
-								"effects.autoApplyFreshRecordingZoomsDescription",
-								"Suggest cursor-follow zooms automatically when you open a new recording.",
-							)}
-						>
-							<Switch
-								aria-label={tSettings(
-									"effects.autoApplyFreshRecordingZooms",
-									"Auto-apply fresh recording zooms",
-								)}
-								checked={autoApplyFreshRecordingAutoZooms}
-								onCheckedChange={onAutoApplyFreshRecordingAutoZoomsChange}
-							/>
-						</SettingsRow>
 						<SettingsRow
 							title={tSettings("effects.connectZooms", "Connect neighboring zooms")}
 							description={tSettings(
@@ -2341,13 +2190,6 @@ export function SettingsPanel({
 							tSettings={tSettings}
 						/>
 					</section>
-				</SettingsCategory>
-				<SettingsCategory category="general">
-					<SettingsRow title={t("editor.keyboardShortcuts.title")}>
-						<Button variant="secondary" size="sm" onClick={openShortcutsConfig}>
-							{t("editor.keyboardShortcuts.customize")}
-						</Button>
-					</SettingsRow>
 				</SettingsCategory>
 				<SettingsCategory category="advanced">
 					{advanced && showDevMotionControls ? (
@@ -2527,15 +2369,21 @@ export function SettingsPanel({
 			</SettingsSections>
 		);
 
-		const sceneSectionContent = (
+		const renderSceneSection = () => (
 			<div className="space-y-5">
-				{backgroundSettingsContent}
-				{frameSectionContent}
-				{advanced && cropSectionContent}
+				{onSaveRecordingDefault && (
+					<Button type="button" size="sm" variant="outline"
+						onClick={onSaveRecordingDefault} disabled={savingRecordingDefault}>
+						{t("common.interface.saveRecordingAppearanceDefault")}
+					</Button>
+				)}
+				{renderBackgroundSettings()}
+				{renderFrameSection()}
+				{advanced && renderCropSection()}
 			</div>
 		);
 
-		const zoomItemSectionContent = (
+		const renderZoomItemSection = () => (
 			<section className="flex flex-col gap-4">
 				{selectedZoomId && (
 					<>
@@ -2636,7 +2484,7 @@ export function SettingsPanel({
 			</section>
 		);
 
-		const audioSectionContent = (
+		const renderAudioSection = () => (
 			<section className="flex flex-col gap-3">
 				<div className="flex items-center justify-between gap-3">
 					<SectionLabel>{tSettings("audio.volumeTitle", "Audio")}</SectionLabel>
@@ -2675,7 +2523,7 @@ export function SettingsPanel({
 			</section>
 		);
 
-		const clipSectionContent = (
+		const renderClipSection = () => (
 			<section className="flex flex-col gap-3">
 				<SliderControl
 					label={tSettings("speed.label", "Speed")}
@@ -2720,21 +2568,21 @@ export function SettingsPanel({
 
 		switch (activeEffectSection) {
 			case "settings":
-				return settingsSectionContent;
+				return renderMotionSection();
 			case "scene":
-				return sceneSectionContent;
+				return renderSceneSection();
 			case "zoom":
-				return zoomItemSectionContent;
+				return renderZoomItemSection();
 			case "clip":
-				return clipSectionContent;
+				return renderClipSection();
 			case "audio":
-				return audioSectionContent;
+				return renderAudioSection();
 			case "frame":
-				return sceneSectionContent;
+				return renderSceneSection();
 			case "crop":
-				return sceneSectionContent;
+				return renderSceneSection();
 			case "captions":
-				return captionsSectionContent;
+				return renderCaptionsSection();
 			case "cursor":
 				return (
 					<section className="flex flex-col gap-4">
@@ -3054,7 +2902,8 @@ export function SettingsPanel({
 											cropRegion={webcamCrop}
 											mirrored={webcam?.mirror ?? true}
 											previewSrc={webcamPreviewSrc}
-											previewCurrentTime={webcamPreviewCurrentTime}
+											previewClock={webcamPreviewClock}
+											previewTimeFromTimeline={webcamPreviewTimeFromTimeline}
 											previewPlaying={webcamPreviewPlaying}
 											previewTimeOffsetMs={webcam?.timeOffsetMs}
 											onCropChange={(cropRegion, previewFrame) =>
@@ -3230,7 +3079,7 @@ export function SettingsPanel({
 					</section>
 				);
 			default: {
-				return sceneSectionContent;
+				return renderSceneSection();
 			}
 		}
 	})();

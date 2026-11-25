@@ -1,18 +1,21 @@
+import { handleTrustedIpc } from "../../trustedIpc";
 import { uiText } from "../../uiI18n";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { app, ipcMain } from "electron";
+import { app } from "electron";
 import { USER_DATA_PATH } from "../../appPaths";
-import { getAssetRootPath } from "../project/manager";
+import { getPackagedRendererBaseUrl } from "../../rendererServer";
+import { getAssetRootPath, isAllowedLocalReadPath, isPathInsideDirectory } from "../project/manager";
 import { normalizePath } from "../utils";
 
 export function registerAssetHandlers() {
 	async function resolveReadableLocalFilePath(filePath: string) {
 		const normalizedPath = normalizePath(filePath);
-		const resolvedPath = await fs.realpath(normalizedPath).catch(() => normalizedPath);
+		if (!isAllowedLocalReadPath(normalizedPath)) throw new Error(uiText("pathIsNotAReadableFile"));
+		const resolvedPath = await fs.realpath(normalizedPath);
 		const stats = await fs.stat(resolvedPath);
 		if (!stats.isFile()) {
 			throw new Error(uiText("pathIsNotAReadableFile"));
@@ -27,7 +30,7 @@ export function registerAssetHandlers() {
 	const thumbCacheDir = path.join(USER_DATA_PATH, "wallpaper-thumbs");
 	let thumbGenerationQueue: Promise<void> = Promise.resolve();
 
-	ipcMain.handle("generate-wallpaper-thumbnail", async (_, filePath: string) => {
+	handleTrustedIpc("generate-wallpaper-thumbnail", async (_, filePath: string) => {
 		try {
 			const bundled = filePath.startsWith("/wallpapers/");
 			const wallpaperRoot = path.resolve(getAssetRootPath(), "wallpapers");
@@ -90,13 +93,33 @@ export function registerAssetHandlers() {
 		}
 	});
 
-	// Return base path for assets so renderer can resolve file:// paths in production
-	ipcMain.handle("get-asset-base-path", () => {
+	// Native exporters need a file path while the renderer uses the asset server URL.
+	handleTrustedIpc("resolve-native-bundled-image-path", async (_, asset: unknown) => {
+		if (typeof asset !== "string") return null;
+		const match = /^\/(wallpapers|app-icons)\/([^/\\]+)$/.exec(asset);
+		if (!match) return null;
+		try {
+			const fileName = decodeURIComponent(match[2]);
+			if (/[/\\:\0]/.test(fileName) || !/\.(?:avif|bmp|gif|ico|jpe?g|png|webp)$/i.test(fileName)) {
+				return null;
+			}
+			const directory = path.join(getAssetRootPath(), match[1]);
+			const resolved = await resolveReadableLocalFilePath(path.join(directory, fileName));
+			return isPathInsideDirectory(resolved, directory) ? resolved : null;
+		} catch {
+			return null;
+		}
+	});
+
+	// Return the base URL used by the renderer to load bundled assets.
+	handleTrustedIpc("get-asset-base-path", () => {
 		if (!app.isPackaged) {
 			return null;
 		}
 
 		try {
+			const rendererBase = getPackagedRendererBaseUrl();
+			if (rendererBase) return new URL("/bundled-assets/", rendererBase).href;
 			const assetPath = getAssetRootPath();
 			return pathToFileURL(`${assetPath}${path.sep}`).toString();
 		} catch (err) {
@@ -105,7 +128,7 @@ export function registerAssetHandlers() {
 		}
 	});
 
-	ipcMain.handle("list-asset-directory", async (_, relativeDir: string) => {
+	handleTrustedIpc("list-asset-directory", async (_, relativeDir: string) => {
 		try {
 			const normalizedRelativeDir = String(relativeDir ?? "")
 				.replace(/\\/g, "/")
@@ -133,13 +156,8 @@ export function registerAssetHandlers() {
 		}
 	});
 
-	ipcMain.handle("read-local-file", async (_, filePath: string) => {
+	handleTrustedIpc("read-local-file", async (_, filePath: string) => {
 		try {
-			// Intentionally more permissive than the media-server allowlist: this IPC
-			// is used for direct renderer-side local file reads after the app has
-			// already accepted a path, while URL-based media serving must stay scoped
-			// to approved/app-managed locations. We still canonicalize the path and
-			// require a real on-disk file so this cannot be used to read directories.
 			const resolved = await resolveReadableLocalFilePath(filePath);
 
 			const data = await fs.readFile(resolved);

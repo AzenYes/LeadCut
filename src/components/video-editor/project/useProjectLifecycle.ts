@@ -31,7 +31,8 @@ import type { useProjectState } from "../state/useProjectState";
 import type { useTimelineState } from "../state/useTimelineState";
 import { DEFAULT_WEBCAM_TIME_OFFSET_MS } from "../types";
 import type { VideoPlaybackRef } from "../VideoPlayback";
-import { cloneStructured } from "../videoEditorUtils";
+import { loadEditorPreferences } from "../editorPreferences";
+import { applyEditorAppearance } from "./applyEditorAppearance";
 
 type Input = {
 	t: (key: string) => string;
@@ -44,7 +45,7 @@ type Input = {
 	currentPersistedEditorState: Parameters<typeof createProjectData>[1];
 	videoPlaybackRef: RefObject<VideoPlaybackRef | null>;
 	setIsPlaying: Dispatch<SetStateAction<boolean>>;
-	setCurrentTime: Dispatch<SetStateAction<number>>;
+	setCurrentTime: (seconds: number) => void;
 	setDuration: Dispatch<SetStateAction<number>>;
 	applySessionPresentation: (
 		session:
@@ -52,7 +53,6 @@ type Input = {
 			| null
 			| undefined,
 	) => void;
-	refreshProjectLibrary: () => Promise<void>;
 	buildPersistedEditorState: (
 		editor: Parameters<typeof createProjectData>[1],
 	) => Parameters<typeof createProjectData>[1];
@@ -98,7 +98,7 @@ export function useProjectLifecycle(input: Input) {
 						: legacyBorderRadiusPixelsToPercent(persistedEditor.borderRadius)
 					: persistedEditor.borderRadius,
 		});
-		const videoUrl = await resolveVideoUrl(sourcePath);
+		const videoUrlPromise = resolveVideoUrl(sourcePath);
 		if (editor.webcam.sourcePath) {
 			const result = await window.electronAPI.setCurrentRecordingSession?.(
 				{
@@ -118,6 +118,7 @@ export function useProjectLifecycle(input: Input) {
 			if (!result.success) throw new Error(uiText("couldNotLoadProjectMedia"));
 			current.applySessionPresentation(null);
 		}
+		const videoUrl = await videoUrlPromise;
 		try {
 			current.videoPlaybackRef.current?.pause();
 		} catch {
@@ -133,46 +134,7 @@ export function useProjectLifecycle(input: Input) {
 		project.setCurrentProjectPath(path ?? null, revision);
 		project.setVideoPath(videoUrl);
 
-		appearance.setWallpaper(editor.wallpaper);
-		appearance.setShadowIntensity(editor.shadowIntensity);
-		appearance.setBackgroundBlur(editor.backgroundBlur);
-		appearance.setZoomMotionBlur(editor.zoomMotionBlur);
-		appearance.setZoomMotionBlurTuning({ ...editor.zoomMotionBlurTuning });
-		appearance.setConnectZooms(editor.connectZooms);
-		appearance.setZoomInDurationMs(editor.zoomInDurationMs);
-		appearance.setZoomInOverlapMs(editor.zoomInOverlapMs);
-		appearance.setZoomOutDurationMs(editor.zoomOutDurationMs);
-		appearance.setConnectedZoomGapMs(editor.connectedZoomGapMs);
-		appearance.setConnectedZoomDurationMs(editor.connectedZoomDurationMs);
-		appearance.setZoomInEasing(editor.zoomInEasing);
-		appearance.setZoomOutEasing(editor.zoomOutEasing);
-		appearance.setConnectedZoomEasing(editor.connectedZoomEasing);
-		appearance.setShowCursor(editor.showCursor);
-		appearance.setLoopCursor(editor.loopCursor);
-		appearance.setCursorStyle(editor.cursorStyle);
-		appearance.setCursorSize(editor.cursorSize);
-		appearance.setCursorSmoothing(editor.cursorSmoothing);
-		appearance.setCursorSpringStiffnessMultiplier(editor.cursorSpringStiffnessMultiplier);
-		appearance.setCursorSpringDampingMultiplier(editor.cursorSpringDampingMultiplier);
-		appearance.setCursorSpringMassMultiplier(editor.cursorSpringMassMultiplier);
-		appearance.setCameraSpringStiffnessMultiplier(editor.cameraSpringStiffnessMultiplier);
-		appearance.setCameraSpringDampingMultiplier(editor.cameraSpringDampingMultiplier);
-		appearance.setCameraSpringMassMultiplier(editor.cameraSpringMassMultiplier);
-		appearance.setCursorClickEffect(editor.cursorClickEffect);
-		appearance.setCursorClickEffectColor(editor.cursorClickEffectColor);
-		appearance.setCursorClickEffectScale(editor.cursorClickEffectScale);
-		appearance.setCursorClickEffectOpacity(editor.cursorClickEffectOpacity);
-		appearance.setCursorClickEffectDurationMs(editor.cursorClickEffectDurationMs);
-		appearance.setZoomSmoothness(editor.zoomSmoothness);
-		appearance.setZoomClassicMode(editor.zoomClassicMode);
-		appearance.setCursorMotionBlur(editor.cursorMotionBlur);
-		appearance.setCursorClickBounce(editor.cursorClickBounce);
-		appearance.setCursorClickBounceDuration(editor.cursorClickBounceDuration);
-		appearance.setCursorSway(editor.cursorSway);
-		appearance.setBorderRadius(editor.borderRadius);
-		appearance.setPadding(editor.padding);
-		appearance.setCropRegion(editor.cropRegion);
-		appearance.setWebcam(editor.webcam);
+		applyEditorAppearance(appearance, editor, current.setAspectRatio);
 		timeline.setZoomRegions(editor.zoomRegions);
 		timeline.setTrimRegions(editor.trimRegions);
 		timeline.setClipRegions(editor.clipRegions);
@@ -196,7 +158,6 @@ export function useProjectLifecycle(input: Input) {
 		timeline.setChangeLog(editor.changeLog ?? emptyChangeLog());
 		timeline.setAutoCaptions(editor.autoCaptions);
 		timeline.setAutoCaptionSettings(editor.autoCaptionSettings);
-		current.setAspectRatio(editor.aspectRatio);
 		timeline.setSelectedZoomId(null);
 		timeline.setSelectedClipId(null);
 		timeline.setSelectedAnnotationId(null);
@@ -221,16 +182,13 @@ export function useProjectLifecycle(input: Input) {
 			editor.annotationRegions.reduce((max, region) => Math.max(max, region.zIndex), 0) + 1;
 		current.resetHistory();
 		project.setLastSavedSnapshot(
-			cloneStructured(
-				createProjectData(
-					sourcePath,
-					current.buildPersistedEditorState(editor),
-					loadedProject.projectId ?? null,
-					loadedProject,
-				),
+			createProjectData(
+				sourcePath,
+				current.buildPersistedEditorState(editor),
+				loadedProject.projectId ?? null,
+				loadedProject,
 			),
 		);
-		await current.refreshProjectLibrary();
 		return true;
 	}, [uiText]);
 
@@ -337,6 +295,7 @@ export function useProjectLifecycle(input: Input) {
 	const resetSourceScopedEditorState = useCallback(() => {
 		const current = inputRef.current;
 		const { timeline, refs } = current;
+		applyEditorAppearance(current.appearance, normalizeProjectEditor(loadEditorPreferences()), current.setAspectRatio);
 		timeline.setZoomRegions([]);
 		timeline.setTrimRegions([]);
 		timeline.setClipRegions([]);

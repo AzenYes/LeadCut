@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { getFfmpegPath, getFfprobePath } from "./binaries.js";
 
@@ -43,7 +43,7 @@ export async function getMediaInfo(filePath: string): Promise<MediaInfo> {
 		"-show_format",
 		"-show_streams",
 		filePath,
-	]);
+	], { windowsHide: true, timeout: 30_000 });
 
 	const parsed = JSON.parse(stdout) as FfprobeOutput;
 	const videoStream = parsed.streams?.find((stream) => stream.codec_type === "video");
@@ -75,28 +75,15 @@ export const SILENCE_DETECT_MIN_S = 0.5;
 
 export async function detectSilence(
 	filePath: string,
-	options?: { noiseDb?: number; minDurationSec?: number },
+	options?: { noiseDb?: number; minDurationSec?: number; signal?: AbortSignal },
 ): Promise<SilenceInterval[]> {
 	const noiseDb = options?.noiseDb ?? SILENCE_NOISE_DB;
 	const minDurationSec = options?.minDurationSec ?? SILENCE_DETECT_MIN_S;
 
-	const stderr = await new Promise<string>((resolve, reject) => {
-		const child = spawn(getFfmpegPath(), [
-			"-i",
-			filePath,
-			"-af",
-			`silencedetect=noise=${noiseDb}dB:d=${minDurationSec}`,
-			"-f",
-			"null",
-			"-",
-		]);
-		let output = "";
-		child.stderr.on("data", (chunk: Buffer) => {
-			output += chunk.toString();
-		});
-		child.on("error", reject);
-		child.on("close", (code) => code === 0 ? resolve(output) : reject(new Error(`ffmpeg failed (${code}): ${output.slice(-1500)}`)));
-	});
+	const { stderr } = await execFileAsync(getFfmpegPath(), [
+		"-hide_banner", "-nostats", "-nostdin", "-i", filePath, "-vn", "-sn", "-dn",
+		"-af", `silencedetect=noise=${noiseDb}dB:d=${minDurationSec}`, "-f", "null", "-",
+	], { windowsHide: true, timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024, signal: options?.signal });
 
 	const intervals: SilenceInterval[] = [];
 	let pendingStartSec: number | null = null;

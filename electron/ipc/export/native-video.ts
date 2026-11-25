@@ -1,3 +1,8 @@
+import { stopProcessTree } from "../../../services/leadcut-mcp/src/stopProcessTree";
+import { type ExportRoutePlan, type NativeStaticExportRoute, planExportRoute } from "../../../src/lib/exporter/backendPolicy";
+import { EDITED_WAV_MIME_TYPE, getEditedWavByteLength, MAX_INLINE_EDITED_WAV_BYTES } from "../../../src/lib/exporter/editedAudioWav";
+import { isExportStorageFull } from "../../../src/lib/exporter/exportStorageError";
+import type { D3D11GpuStageTiming, MediaFoundationOutputTiming } from "../../../src/lib/exporter/types";
 import { readAppEnv } from "../../envCompat";
 import { logSubprocessStderr } from "../../logger";
 import { probeNativeVideoMetadata, type NativeVideoMetadataProbe } from "../ffmpeg/metadata";
@@ -10,15 +15,19 @@ export {
 } from "../ffmpeg/metadata";
 import type { ChildProcessByStdio } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import type { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import type { WebContents } from "electron";
 import { app, powerSaveBlocker } from "electron";
 import { getFfmpegBinaryPath, getFfprobeBinaryPath } from "../ffmpeg/binary";
+import { runExportProcess } from "./runExportProcess";
+import { appendAudioToReservedMp4 } from "./appendReservedMp4Audio";
 import type {
 	NativeExportEncodingMode,
 	NativeStaticLayoutBackend,
@@ -59,6 +68,7 @@ const NVIDIA_CUDA_FORCE_VIDEO_ONLY_ENV_SUFFIX = "NVIDIA_CUDA_FORCE_VIDEO_ONLY";
 const NVIDIA_CUDA_AUTO_STALL_TIMEOUT_ENV_SUFFIX = "NVIDIA_CUDA_AUTO_STALL_TIMEOUT_MS";
 const DEFAULT_NVIDIA_CUDA_AUTO_STALL_TIMEOUT_MS = 120_000;
 const NATIVE_GPU_STALL_TIMEOUT_ENV_SUFFIX = "NATIVE_GPU_STALL_TIMEOUT_MS";
+const DEFAULT_NATIVE_GPU_STARTUP_STALL_TIMEOUT_MS = 15_000;
 const DEFAULT_NATIVE_GPU_STALL_TIMEOUT_MS = 120_000;
 const NATIVE_STATIC_LAYOUT_SOURCE_PROXY_REFERENCE_PIXEL_RATE = 1920 * 1080 * 30;
 const NATIVE_STATIC_LAYOUT_SOURCE_PROXY_1080P30_BITRATE = 24_000_000;
@@ -101,9 +111,12 @@ export interface ExportHardwareInfo {
 
 export type NativeVideoExportSession = {
 	ffmpegProcess: ChildProcessByStdio<Writable, null, Readable>;
+	audioPipe?: Writable;
+	audioMuxedInStream?: boolean;
 	outputPath: string;
+	stagedBesideDestination?: boolean;
 	inputByteSize: number;
-	inputMode: "rawvideo" | "h264-stream";
+	inputMode: "rawvideo" | "h264-stream" | "mp4-stream";
 	maxQueuedWriteBytes: number;
 	stderrOutput: string;
 	encoderName: string;
@@ -112,6 +125,7 @@ export type NativeVideoExportSession = {
 	terminating: boolean;
 	writeSequence: Promise<void>;
 	completionPromise: Promise<void>;
+	finalization?: { controller: AbortController; finished: Promise<void> };
 	sender: WebContents | null;
 	pendingWriteRequestIds: Set<number>;
 };
@@ -185,6 +199,7 @@ export interface NativeStaticLayoutExportOptions {
 	timelineMapPath?: string | null;
 	chunkDurationSec?: number;
 	experimentalWindowsGpuCompositor?: boolean;
+	measureGpuStages?: boolean;
 	experimentalNvidiaCudaExport?: boolean;
 	audioOptions?: NativeVideoExportFinishOptions;
 	nvidiaCudaForceVideoOnly?: boolean;
@@ -223,6 +238,12 @@ type NativeVideoAudioMuxProgress = {
 
 type NativeVideoAudioMuxArgsOptions = {
 	progressPipe?: 1 | 2;
+	wavFromStdin?: boolean;
+	moovReservedBytes?: number;
+	measureOutputWrites?: boolean;
+	videoInputFrameRate?: number;
+	fragmentedMp4Input?: boolean;
+	audioOutputTimescale?: number;
 };
 
 export interface WindowsGpuExportSummary {
@@ -239,6 +260,7 @@ export interface WindowsGpuExportSummary {
 	cursorAtlas?: boolean;
 	zoomOverlay?: boolean;
 	surfacePoolSize?: number;
+	surfacePoolLimit?: number;
 	adapterIndex?: number;
 	adapterVendorId?: number;
 	adapterDeviceId?: number;
@@ -261,6 +283,11 @@ export interface WindowsGpuExportSummary {
 	clearMs?: number;
 	videoProcessMs?: number;
 	writeSampleMs?: number;
+	surfaceWaitMs?: number;
+	surfaceWaitMaxMs?: number;
+	surfaceWaitOver1ms?: number;
+	gpuStageTiming?: D3D11GpuStageTiming;
+	mediaFoundationOutputTiming?: MediaFoundationOutputTiming;
 	finalizeMs?: number;
 	realtimeMultiplier?: number;
 }
@@ -344,6 +371,8 @@ export interface NativeStaticLayoutExportMetrics extends NativeVideoAudioMuxMetr
 	staticAssetExecMs?: number;
 	fallbackChunkCount: number;
 	videoOnlyBytes?: number;
+	exportRoutePlan?: ExportRoutePlan<NativeStaticExportRoute>;
+	exportRoute?: NativeStaticExportRoute;
 	chunks: NativeStaticLayoutChunkMetric[];
 }
 
@@ -356,10 +385,12 @@ export async function cleanupNativeVideoExportSessions() {
 	const cleanup: Promise<void>[] = [];
 	for (const [sessionId, session] of nativeVideoExportSessions) {
 		session.terminating = true;
+		session.finalization?.controller.abort();
 		try {
 			if (!session.ffmpegProcess.stdin.destroyed) {
 				session.ffmpegProcess.stdin.destroy();
 			}
+			session.audioPipe?.destroy();
 		} catch {
 			/* stream may already be closed */
 		}
@@ -369,17 +400,13 @@ export async function cleanupNativeVideoExportSessions() {
 			/* process may already be exited */
 		}
 		nativeVideoExportSessions.delete(sessionId);
-		cleanup.push(session.completionPromise.catch(() => undefined)
+		cleanup.push(Promise.allSettled([session.completionPromise, session.finalization?.finished])
 			.then(() => removeTemporaryExportFile(session.outputPath)));
 	}
 
 	for (const [sessionId, session] of nativeStaticLayoutExportSessions) {
 		session.terminating = true;
-		try {
-			session.currentProcess?.kill("SIGKILL");
-		} catch {
-			/* process may already be exited */
-		}
+		cleanup.push(stopProcessTree(session.currentProcess));
 		nativeStaticLayoutExportSessions.delete(sessionId);
 	}
 	await Promise.allSettled(cleanup);
@@ -440,6 +467,7 @@ export function validateNvidiaCudaExportSummary(
 		durationSec: number;
 		targetFrames: number;
 		requiresTimelineSync?: boolean;
+		cursorOverlay?: boolean;
 	},
 ) {
 	const issues: string[] = [];
@@ -454,6 +482,9 @@ export function validateNvidiaCudaExportSummary(
 
 	if (!summary.outputVideo) {
 		issues.push("missing output video probe");
+	}
+	if (expected.cursorOverlay && summary.nativeSummary?.cursorAtlas !== true) {
+		issues.push("CUDA output omitted the requested cursor atlas");
 	}
 	if (expected.requiresTimelineSync && !isNvidiaCudaTimestampAlignedSummary(summary)) {
 		issues.push("CUDA timeline mode is not timestamp-aligned for audio export");
@@ -507,6 +538,7 @@ export function validateWindowsGpuExportSummary(
 	expected: {
 		durationSec: number;
 		targetFrames: number;
+		cursorOverlay?: boolean;
 	},
 ) {
 	const issues: string[] = [];
@@ -517,6 +549,9 @@ export function validateWindowsGpuExportSummary(
 	const frames = getFiniteNumber(summary.frames);
 	const mediaMs = getFiniteNumber(summary.mediaMs);
 	const seconds = getFiniteNumber(summary.seconds) ?? (mediaMs !== null ? mediaMs / 1000 : null);
+	if (expected.cursorOverlay && summary.cursorOverlay !== true) {
+		issues.push("Windows GPU output omitted the requested cursor overlay");
+	}
 
 	if (frames === null) {
 		issues.push("missing Windows GPU frame count");
@@ -964,12 +999,17 @@ export interface NativeExportCapabilities {
 export async function probeNativeVideoStreamStats(
 	ffprobePath: string,
 	inputPath: string,
+	session?: NativeStaticLayoutExportSession,
 ): Promise<NativeVideoStreamStatsProbe> {
-	const result = await execFileAsync(
+	const cancelled = () => new Error("Native static layout export was cancelled");
+	if (session?.terminating) throw cancelled();
+
+	const probe = execFileAsync(
 		ffprobePath,
 		[
 			"-v",
 			"error",
+			...(process.platform === "win32" ? ["-threads", "4"] : []),
 			"-select_streams",
 			"v:0",
 			"-count_frames",
@@ -979,13 +1019,21 @@ export async function probeNativeVideoStreamStats(
 			"json",
 			inputPath,
 		],
-		{ timeout: 120_000, maxBuffer: 2 * 1024 * 1024 },
+		{ timeout: 120_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
 	);
-	const stats = parseNativeVideoStreamStatsProbeOutput(result.stdout);
-	if (!stats) {
-		throw new Error("Unable to parse native video stream stats from FFprobe output");
-	}
+	if (session) session.currentProcess = probe.child;
 
+	const { stdout } = await probe
+		.catch((error: unknown) => {
+			if (session?.terminating) throw cancelled();
+			throw error;
+		})
+		.finally(() => {
+			if (session?.currentProcess === probe.child) session.currentProcess = null;
+		});
+	if (session?.terminating) throw cancelled();
+	const stats = parseNativeVideoStreamStatsProbeOutput(stdout);
+	if (!stats) throw new Error("Unable to parse native video stream stats from FFprobe output");
 	return stats;
 }
 
@@ -996,8 +1044,9 @@ async function validateNativeVideoOutputFile(
 		durationSec: number;
 		targetFrames: number;
 	},
+	session: NativeStaticLayoutExportSession,
 ) {
-	const stats = await probeNativeVideoStreamStats(ffprobePath, videoPath);
+	const stats = await probeNativeVideoStreamStats(ffprobePath, videoPath, session);
 	const issues = validateNativeVideoStreamStats(stats, expected);
 	if (issues.length > 0) {
 		throw new Error(`Native video output is invalid: ${issues.join("; ")}`);
@@ -1131,7 +1180,13 @@ async function runFfmpegWithMetrics(
 	signal: NodeJS.Signals | null;
 }> {
 	const startedAt = getNowMs();
-	return await new Promise((resolve) => {
+	const result = await new Promise<{
+		success: boolean;
+		elapsedMs: number;
+		stderr: string;
+		code: number | null;
+		signal: NodeJS.Signals | null;
+	}>((resolve) => {
 		const child = spawn(ffmpegPath, args, {
 			stdio: ["ignore", "ignore", "pipe"],
 		});
@@ -1187,6 +1242,8 @@ async function runFfmpegWithMetrics(
 			});
 		});
 	});
+	if (!result.success && isExportStorageFull(result.stderr)) throw new Error(result.stderr);
+	return result;
 }
 
 function parseFfmpegProgressClockSeconds(value: string) {
@@ -1264,11 +1321,17 @@ async function runFfmpegAudioMux(
 	options: NativeVideoExportFinishOptions,
 	onProgress?: (progress: NativeVideoAudioMuxProgress) => void,
 	session?: NativeStaticLayoutExportSession,
+	signal?: AbortSignal,
+	input?: Buffer,
+	measureOutputWrites = false,
 ) {
-	if (!onProgress && !session) {
-		await execFileAsync(ffmpegPath, args, {
+	signal?.throwIfAborted();
+	if (!onProgress && !session && !input && !measureOutputWrites) {
+		await runExportProcess(ffmpegPath, args, {
 			timeout: timeoutMs,
 			maxBuffer: 20 * 1024 * 1024,
+			windowsHide: true,
+			signal,
 		});
 		return;
 	}
@@ -1277,11 +1340,12 @@ async function runFfmpegAudioMux(
 		options.outputDurationSec,
 		onProgress,
 	);
-	await new Promise<void>((resolve, reject) => {
+	return new Promise<number | undefined>((resolve, reject) => {
 		const child = spawn(ffmpegPath, args, {
-			stdio: ["ignore", "ignore", "pipe"],
+			stdio: [input ? "pipe" : "ignore", "ignore", "pipe"],
+			windowsHide: true,
 		});
-		logSubprocessStderr(child, "export-ffmpeg");
+		if (!measureOutputWrites) logSubprocessStderr(child, "export-ffmpeg");
 		if (session) {
 			session.currentProcess = child;
 			if (session.terminating) {
@@ -1291,12 +1355,17 @@ async function runFfmpegAudioMux(
 
 		let stderr = "";
 		let settled = false;
+		const abort = () => {
+			child.kill("SIGKILL");
+			child.stdin?.destroy();
+		};
+		signal?.addEventListener("abort", abort, { once: true });
 		const timeout = setTimeout(() => {
 			if (settled) return;
-			child.kill("SIGKILL");
+			abort();
 		}, timeoutMs);
 
-		child.stderr.on("data", (chunk: Buffer) => {
+		child.stderr?.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
 			stderr += text;
 			handleProgressChunk(text);
@@ -1308,21 +1377,27 @@ async function runFfmpegAudioMux(
 				session.currentProcess = null;
 			}
 			clearTimeout(timeout);
+			signal?.removeEventListener("abort", abort);
 			reject(error);
 		});
-		child.once("close", (code, signal) => {
+		child.once("close", (code, exitSignal) => {
 			if (settled) return;
 			settled = true;
 			if (session?.currentProcess === child) {
 				session.currentProcess = null;
 			}
 			clearTimeout(timeout);
+			signal?.removeEventListener("abort", abort);
+			if (signal?.aborted) {
+				reject(signal.reason);
+				return;
+			}
 			if (session?.terminating) {
 				reject(new Error("Native static layout export was cancelled"));
 				return;
 			}
 			if (code !== 0) {
-				const suffix = signal ? ` (signal ${signal})` : "";
+				const suffix = exitSignal ? ` (signal ${exitSignal})` : "";
 				reject(
 					new Error(
 						`FFmpeg audio mux exited with code ${code ?? "unknown"}${suffix}` +
@@ -1342,8 +1417,17 @@ async function runFfmpegAudioMux(
 				}
 				onProgress(completeProgress);
 			}
-			resolve();
+			const outputWrites = measureOutputWrites
+				? /Statistics: (\d+) bytes written, \d+ seeks?, \d+ writeouts?/.exec(stderr)
+				: null;
+			resolve(outputWrites ? Number(outputWrites[1]) : undefined);
 		});
+		if (input) {
+			child.stdin?.on("error", () => {
+				// FFmpeg can close the pipe early when -t ends the output. Check its exit status.
+			});
+			child.stdin?.end(input);
+		}
 	});
 }
 
@@ -1367,6 +1451,7 @@ export function getNativeVideoExportSessionError(
 	session: NativeVideoExportSession,
 	fallback: string,
 ) {
+	if (isExportStorageFull(session.stderrOutput)) return session.stderrOutput.trim();
 	return (
 		session.stdinError?.message ||
 		session.processError?.message ||
@@ -1494,7 +1579,7 @@ export async function writeNativeVideoExportFrame(
 	frameData: Uint8Array | ArrayBuffer,
 ) {
 	if (
-		session.inputMode !== "h264-stream" &&
+		session.inputMode === "rawvideo" &&
 		getNativeVideoExportFrameLength(frameData) !== session.inputByteSize
 	) {
 		throw new Error(
@@ -1607,6 +1692,16 @@ function hasNativeStaticLayoutSourceCrop(options: NativeStaticLayoutExportOption
 			(options.sourceCropWidth ?? 0) >= 2 &&
 			(options.sourceCropHeight ?? 0) >= 2,
 	);
+}
+
+function getNativeStaticLayoutGpuOnlyFeatures(options: NativeStaticLayoutExportOptions): string[] {
+	const features: string[] = [];
+	if (options.webcamInputPath) features.push("webcam overlay");
+	if (options.cursorTelemetry?.length || options.cursorTelemetryPath) features.push("cursor overlay");
+	if (options.zoomTelemetry?.length || options.zoomTelemetryPath) features.push("zoom telemetry");
+	if (hasNativeStaticLayoutTimeline(options) || options.timelineMapPath) features.push("timeline map");
+	if (hasNativeStaticLayoutSourceCrop(options)) features.push("source crop");
+	return features;
 }
 
 export function buildNativeStaticLayoutTimelineSegments(
@@ -2010,7 +2105,7 @@ export function getNvidiaCudaAutoStallTimeoutMs(autoCandidateActive = false) {
 	return DEFAULT_NVIDIA_CUDA_AUTO_STALL_TIMEOUT_MS;
 }
 
-export function getNativeGpuCompositorStallTimeoutMs() {
+export function getNativeGpuCompositorStallTimeoutMs(hasReportedFrames: boolean) {
 	const rawValue = readAppEnv(NATIVE_GPU_STALL_TIMEOUT_ENV_SUFFIX)?.trim();
 	if (rawValue === "0" || rawValue?.toLowerCase() === "off") {
 		return null;
@@ -2021,7 +2116,7 @@ export function getNativeGpuCompositorStallTimeoutMs() {
 		return Math.max(10_000, Math.round(parsed));
 	}
 
-	return DEFAULT_NATIVE_GPU_STALL_TIMEOUT_MS;
+	return hasReportedFrames ? DEFAULT_NATIVE_GPU_STALL_TIMEOUT_MS : DEFAULT_NATIVE_GPU_STARTUP_STALL_TIMEOUT_MS;
 }
 
 export async function getExperimentalNvidiaCudaExportSkipReason(
@@ -2234,7 +2329,10 @@ export function buildExperimentalWindowsGpuStaticLayoutArgs(
 		options.backgroundColor,
 		"--surface-pool-size",
 		String(surfacePoolSize),
+		"--initial-surface-pool-size",
+		"4",
 	];
+	if (options.measureGpuStages === true) args.push("--measure-gpu-stages");
 
 	if (options.backgroundImagePath) {
 		args.push("--background-image", options.backgroundImagePath);
@@ -3033,18 +3131,16 @@ async function runExperimentalWindowsGpuStaticLayoutExport(
 	options: NativeStaticLayoutExportOptions,
 	outputPath: string,
 	session: NativeStaticLayoutExportSession,
+	executablePath: string,
 	onProgress?: (progress: NativeStaticLayoutExportProgress) => void,
 ) {
-	const executablePath = await resolveExperimentalWindowsGpuExporterPath();
-	if (!executablePath) {
-		throw new Error("Experimental Windows GPU exporter is not built");
-	}
-
-	const args = buildExperimentalWindowsGpuStaticLayoutArgs(options, outputPath);
+	const args = buildExperimentalWindowsGpuStaticLayoutArgs({
+		...options,
+		measureGpuStages: options.measureGpuStages === true || shouldPersistNativeExportDiagnostics(),
+	}, outputPath);
 	const startedAt = getNowMs();
 	const startedAtIso = new Date().toISOString();
 	const timeoutMs = Math.max(15 * 60 * 1000, options.durationSec * 1000);
-	const stallTimeoutMs = getNativeGpuCompositorStallTimeoutMs();
 
 	return await new Promise<{
 		elapsedMs: number;
@@ -3068,7 +3164,7 @@ async function runExperimentalWindowsGpuStaticLayoutExport(
 			percentage: number;
 			stage?: string;
 		} = { currentFrame: -1, percentage: -1 };
-		let stallTimedOut = false;
+		let stalledForMs: number | undefined;
 		let settled = false;
 		const timeout = setTimeout(() => {
 			if (settled) return;
@@ -3082,13 +3178,14 @@ async function runExperimentalWindowsGpuStaticLayoutExport(
 			}
 		};
 		const armStallTimeout = () => {
+			const stallTimeoutMs = getNativeGpuCompositorStallTimeoutMs(lastProgressForStallGuard.currentFrame > 0);
 			if (!stallTimeoutMs) {
 				return;
 			}
 			clearStallTimeout();
 			stallTimeout = setTimeout(() => {
 				if (settled) return;
-				stallTimedOut = true;
+				stalledForMs = stallTimeoutMs;
 				child.kill("SIGKILL");
 			}, stallTimeoutMs);
 		};
@@ -3165,15 +3262,15 @@ async function runExperimentalWindowsGpuStaticLayoutExport(
 				stderr,
 				stdout,
 				summary,
-				timedOut: stallTimedOut,
+				timedOut: stalledForMs !== undefined,
 			});
 
 			if (code !== 0 || !summary?.success) {
 				const suffix = signal ? ` (signal ${signal})` : "";
 				reject(
 					new Error(
-						(stallTimedOut && stallTimeoutMs
-							? `Experimental Windows GPU exporter stalled for ${stallTimeoutMs}ms without progress`
+						(stalledForMs
+							? `Experimental Windows GPU exporter stalled for ${stalledForMs}ms without progress`
 							: stderr.trim()) ||
 							stdout.trim() ||
 							`Experimental Windows GPU exporter exited with code ${code ?? "unknown"}${suffix}`,
@@ -3203,19 +3300,8 @@ export async function exportNativeStaticLayoutVideo(
 	if (!Number.isFinite(options.durationSec) || options.durationSec <= 0) {
 		throw new Error("Native static layout export requires a positive duration");
 	}
-	options = await normalizeNativeStaticLayoutBackground(options);
-	if (
-		options.webcamInputPath &&
-		!(options.experimentalWindowsGpuCompositor && process.platform === "win32")
-	) {
-		throw new Error("Native webcam overlay requires the Windows GPU compositor");
-	}
-	if (
-		options.zoomTelemetry?.length &&
-		!(options.experimentalWindowsGpuCompositor && process.platform === "win32")
-	) {
-		throw new Error("Native zoom telemetry requires the Windows GPU compositor");
-	}
+	const canTryGpu = options.experimentalWindowsGpuCompositor && process.platform === "win32";
+	const gpuOnlyFeatures = getNativeStaticLayoutGpuOnlyFeatures(options);
 
 	const chunkDurationSec = Math.max(1, Math.min(300, options.chunkDurationSec ?? 120));
 	const chunks = buildNativeStaticLayoutChunks(options.durationSec, chunkDurationSec);
@@ -3223,19 +3309,20 @@ export async function exportNativeStaticLayoutVideo(
 		throw new Error("Native static layout export produced no chunks");
 	}
 
-	const sessionId =
-		options.sessionId ??
-		`leadcut-static-layout-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	const tempId = `leadcut-static-layout-${randomUUID()}`;
+	const sessionId = options.sessionId ?? tempId;
+	if (nativeStaticLayoutExportSessions.has(sessionId)) throw new Error("Native static layout export is already running");
 	const session: NativeStaticLayoutExportSession = {
 		terminating: false,
 		currentProcess: null,
 	};
-	const chunkDirectory = path.join(app.getPath("temp"), sessionId);
+	const chunkDirectory = path.join(app.getPath("temp"), tempId);
 	const concatListPath = path.join(chunkDirectory, "chunks.txt");
-	const videoOnlyPath = path.join(app.getPath("temp"), `${sessionId}.mp4`);
+	const videoOnlyPath = path.join(app.getPath("temp"), `${tempId}.mp4`);
 	const ffprobePath = getFfprobeBinaryPath();
 	let outputPathToKeep: string | null = null;
 	let videoOutputValidated = false;
+	let tempDirectoryCreated = false;
 	const metrics: NativeStaticLayoutExportMetrics = {
 		chunkCount: chunks.length,
 		chunkDurationSec,
@@ -3244,16 +3331,40 @@ export async function exportNativeStaticLayoutVideo(
 		chunks: [],
 	};
 	const validateRenderedVideoOutput = async () => {
-		await validateNativeVideoOutputFile(ffprobePath, videoOnlyPath, {
-			durationSec: options.durationSec,
-			targetFrames: Math.ceil(options.durationSec * options.frameRate),
-		});
+		await validateNativeVideoOutputFile(
+			ffprobePath,
+			videoOnlyPath,
+			{
+				durationSec: options.durationSec,
+				targetFrames: Math.ceil(options.durationSec * options.frameRate),
+			},
+			session,
+		);
 		videoOutputValidated = true;
 	};
 
 	try {
 		nativeStaticLayoutExportSessions.set(sessionId, session);
+		options = await normalizeNativeStaticLayoutBackground(options);
+		const [cudaSkipReason, d3d11Path] = await Promise.all([
+			canTryGpu ? getExperimentalNvidiaCudaExportSkipReason(options) : "windows-gpu-compositor-disabled",
+			canTryGpu ? resolveExperimentalWindowsGpuExporterPath() : null,
+		]);
+		if (session.terminating) throw new Error("Native static layout export was cancelled");
+		const routeOptions = {
+			scope: "static-layout",
+			cudaSkipReason,
+			d3d11SkipReason: d3d11Path ? null : canTryGpu ? "d3d11-helper-unavailable" : "windows-gpu-compositor-disabled",
+			gpuOnlyFeatures,
+		} as const;
+		const routePlan = planExportRoute(routeOptions);
+		metrics.exportRoutePlan = routePlan;
+		if (!routePlan.primary) {
+			throw new Error(`FFmpeg static layout cannot render ${gpuOnlyFeatures.join(", ")}`);
+		}
+		const tryFfmpegLayout = routePlan.primary === "ffmpeg-static-layout" || routePlan.fallbacks.includes("ffmpeg-static-layout");
 		await fs.mkdir(chunkDirectory, { recursive: true });
+		tempDirectoryCreated = true;
 		const sourceInput = await prepareNativeStaticLayoutSourceInput(
 			ffmpegPath,
 			options,
@@ -3279,9 +3390,6 @@ export async function exportNativeStaticLayoutVideo(
 			path.join(chunkDirectory, "timeline-map.csv"),
 		);
 		if (timelineMapPath) {
-			if (!(options.experimentalWindowsGpuCompositor && process.platform === "win32")) {
-				throw new Error("Native timeline-map export requires the Windows GPU compositor");
-			}
 			options = {
 				...options,
 				timelineMapPath,
@@ -3314,7 +3422,7 @@ export async function exportNativeStaticLayoutVideo(
 		let didRenderVideo = false;
 		let didMuxAudioInline = false;
 
-		if (options.experimentalWindowsGpuCompositor && process.platform === "win32") {
+		if (routePlan.primary !== "ffmpeg-static-layout") {
 			try {
 				if (session.terminating) {
 					throw new Error("Native static layout export was cancelled");
@@ -3379,9 +3487,8 @@ export async function exportNativeStaticLayoutVideo(
 					}
 				}
 				let experimentalNvidiaCudaOptions = experimentalGpuOptions;
-				const nvidiaCudaSkipReason =
-					await getExperimentalNvidiaCudaExportSkipReason(options);
-				let shouldTryNvidiaCuda = nvidiaCudaSkipReason === null;
+				const nvidiaCudaSkipReason = cudaSkipReason;
+				let shouldTryNvidiaCuda = routePlan.primary === "nvidia-cuda-compositor";
 				const validatedCudaFallbackCandidate =
 					isValidatedNvidiaCudaFallbackCandidate(options);
 				if (
@@ -3433,6 +3540,9 @@ export async function exportNativeStaticLayoutVideo(
 						path.join(chunkDirectory, "cursor-atlas-nvidia.tsv"),
 					);
 					shouldTryNvidiaCuda = Boolean(cursorTelemetryPath && cursorAtlas);
+					if (!shouldTryNvidiaCuda) {
+						metrics.exportRoutePlan = planExportRoute({ ...routeOptions, cudaSkipReason: "cuda-cursor-assets-unavailable" });
+					}
 					if (cursorTelemetryPath && cursorAtlas) {
 						experimentalNvidiaCudaOptions = {
 							...experimentalNvidiaCudaOptions,
@@ -3462,6 +3572,7 @@ export async function exportNativeStaticLayoutVideo(
 								durationSec: options.durationSec,
 								targetFrames: Math.ceil(options.durationSec * options.frameRate),
 								requiresTimelineSync: shouldMuxAudioInline,
+								cursorOverlay: gpuOnlyFeatures.includes("cursor overlay"),
 							},
 						);
 						if (cudaValidationIssues.length > 0) {
@@ -3520,9 +3631,10 @@ export async function exportNativeStaticLayoutVideo(
 							nvidiaCudaSummary: cudaResult.summary,
 						});
 						didRenderVideo = true;
+						metrics.exportRoute = "nvidia-cuda-compositor";
 						didMuxAudioInline = shouldMuxAudioInline;
 					} catch (error) {
-						if (session.terminating) {
+						if (session.terminating || isExportStorageFull(error)) {
 							throw error;
 						}
 						metrics.fallbackChunkCount++;
@@ -3534,16 +3646,18 @@ export async function exportNativeStaticLayoutVideo(
 					}
 				}
 
-				if (!didRenderVideo) {
+				if (!didRenderVideo && d3d11Path) {
 					const gpuResult = await runExperimentalWindowsGpuStaticLayoutExport(
 						experimentalGpuOptions,
 						videoOnlyPath,
 						session,
+						d3d11Path,
 						onProgress,
 					);
 					const gpuValidationIssues = validateWindowsGpuExportSummary(gpuResult.summary, {
 						durationSec: options.durationSec,
 						targetFrames: Math.ceil(options.durationSec * options.frameRate),
+						cursorOverlay: gpuOnlyFeatures.includes("cursor overlay"),
 					});
 					if (gpuValidationIssues.length > 0) {
 						throw new Error(
@@ -3559,6 +3673,7 @@ export async function exportNativeStaticLayoutVideo(
 						frames: gpuResult.summary.frames,
 						realtimeMultiplier: gpuResult.summary.realtimeMultiplier,
 						surfacePoolSize: gpuResult.summary.surfacePoolSize,
+						surfacePoolLimit: gpuResult.summary.surfacePoolLimit,
 						gpuDecodeSurface: gpuResult.summary.gpuDecodeSurface,
 						adapterIndex: gpuResult.summary.adapterIndex,
 						encoderBackend: gpuResult.summary.encoderBackend,
@@ -3566,6 +3681,9 @@ export async function exportNativeStaticLayoutVideo(
 						readMs: gpuResult.summary.readMs,
 						videoProcessMs: gpuResult.summary.videoProcessMs,
 						writeSampleMs: gpuResult.summary.writeSampleMs,
+						surfaceWaitMs: gpuResult.summary.surfaceWaitMs,
+						gpuStageTiming: gpuResult.summary.gpuStageTiming,
+						mediaFoundationOutputTiming: gpuResult.summary.mediaFoundationOutputTiming,
 						finalizeMs: gpuResult.summary.finalizeMs,
 						webcamOverlay: gpuResult.summary.webcamOverlay,
 						cursorOverlay: gpuResult.summary.cursorOverlay,
@@ -3586,12 +3704,13 @@ export async function exportNativeStaticLayoutVideo(
 						windowsGpuSummary: gpuResult.summary,
 					});
 					didRenderVideo = true;
+					metrics.exportRoute = "windows-d3d11-compositor";
 				}
 			} catch (error) {
-				if (session.terminating) {
+				if (session.terminating || isExportStorageFull(error)) {
 					throw error;
 				}
-				if (hasNativeStaticLayoutTimeline(options)) {
+				if (!tryFfmpegLayout) {
 					throw error;
 				}
 				metrics.fallbackChunkCount++;
@@ -3600,18 +3719,13 @@ export async function exportNativeStaticLayoutVideo(
 					error,
 				);
 				await removeTemporaryExportFile(videoOnlyPath);
-				if (options.webcamInputPath || options.zoomTelemetry?.length) {
-					throw error;
-				}
 			}
 		}
 
-		if (!didRenderVideo && hasNativeStaticLayoutTimeline(options)) {
-			throw new Error("Native timeline-map export requires a GPU compositor backend");
+		if (!didRenderVideo && !tryFfmpegLayout) {
+			throw new Error(`FFmpeg static layout cannot render ${gpuOnlyFeatures.join(", ")}`);
 		}
-		if (!didRenderVideo && hasNativeStaticLayoutSourceCrop(options)) {
-			throw new Error("Native crop export requires a GPU compositor backend");
-		}
+		if (!didRenderVideo) metrics.exportRoute = "ffmpeg-static-layout";
 
 		if (!didRenderVideo && usePrecompositedLayout) {
 			const maskPath = path.join(chunkDirectory, "layout-mask.pgm");
@@ -3838,14 +3952,13 @@ export async function exportNativeStaticLayoutVideo(
 			metrics,
 		};
 	} catch (error) {
-		await removeTemporaryExportFile(videoOnlyPath);
-		await removeTemporaryExportFile(videoOnlyPath.replace(/\.mp4$/, "-final.mp4"));
+		if (tempDirectoryCreated) await removeTemporaryExportFile(videoOnlyPath.replace(/\.mp4$/, "-final.mp4"));
 		throw error;
 	} finally {
 		nativeStaticLayoutExportSessions.delete(sessionId);
-		await fs.rm(chunkDirectory, { force: true, recursive: true }).catch(() => undefined);
-		if (outputPathToKeep !== videoOnlyPath) {
-			await removeTemporaryExportFile(videoOnlyPath);
+		if (tempDirectoryCreated) {
+			await fs.rm(chunkDirectory, { force: true, recursive: true }).catch(() => undefined);
+			if (outputPathToKeep !== videoOnlyPath) await removeTemporaryExportFile(videoOnlyPath);
 		}
 	}
 }
@@ -3898,6 +4011,9 @@ export async function probeNativeVideoEncoder(
 	encoderName: string,
 	encodingMode: NativeExportEncodingMode,
 ) {
+	// Some hardware encoders reject a 64 × 64 frame before testing the codec.
+	const width = 320;
+	const height = 240;
 	const outputPath = path.join(
 		app.getPath("temp"),
 		`leadcut-export-probe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`,
@@ -3905,8 +4021,8 @@ export async function probeNativeVideoEncoder(
 	const args = buildNativeVideoExportArgs(
 		encoderName,
 		{
-			width: 64,
-			height: 64,
+			width,
+			height,
 			frameRate: 1,
 			bitrate: 1_500_000,
 			encodingMode,
@@ -3933,8 +4049,11 @@ export async function probeNativeVideoEncoder(
 			void removeTemporaryExportFile(outputPath);
 			resolve(code === 0);
 		});
+		process.once("error", () => resolve(false));
 
-		process.stdin.end(Buffer.alloc(getNativeVideoInputByteSize(64, 64), 0));
+		// A failed encoder may close its input before the probe frame is written.
+		process.stdin.on("error", () => undefined);
+		process.stdin.end(Buffer.alloc(getNativeVideoInputByteSize(width, height)));
 	});
 }
 
@@ -3993,7 +4112,10 @@ export function buildNativeVideoAudioMuxArgs(
 	const audioMode = options.audioMode ?? "none";
 	const useEditedTrackFiltergraph =
 		audioMode === "edited-track" && options.editedTrackStrategy === "filtergraph-fast-path";
-	const args = ["-y", "-hide_banner", "-loglevel", "error"];
+	const audioOnly = argsOptions.audioOutputTimescale !== undefined;
+	const inputIndex = audioOnly ? 0 : 1;
+	const videoMapping = audioOnly ? [] : ["-map", "0:v:0"];
+	const args = ["-y", "-hide_banner", "-loglevel", argsOptions.measureOutputWrites ? "debug" : "error"];
 	if (argsOptions.progressPipe) {
 		args.push(
 			"-stats_period",
@@ -4003,19 +4125,32 @@ export function buildNativeVideoAudioMuxArgs(
 			"-nostats",
 		);
 	}
-	args.push("-i", videoPath, "-i", audioInputPath);
+	if (audioOnly) {
+		args.push("-nostdin");
+	} else if (argsOptions.fragmentedMp4Input) {
+		args.push("-nostdin", "-thread_queue_size", "16", "-f", "mp4");
+	} else if (argsOptions.videoInputFrameRate) {
+		args.push("-nostdin", "-thread_queue_size", "16", "-f", "h264", "-r", String(argsOptions.videoInputFrameRate));
+	}
+	if (!audioOnly) args.push("-i", videoPath);
+	if (argsOptions.wavFromStdin) {
+		args.push("-f", "wav", "-i", "pipe:0");
+	} else {
+		args.push("-i", audioInputPath);
+	}
 
 	if (audioMode === "trim-source") {
-		const filter = buildTrimmedSourceAudioFilter(options.trimSegments ?? []);
+		const filter = buildTrimmedSourceAudioFilter(options.trimSegments ?? [], inputIndex);
 		if (filter) {
-			args.push("-filter_complex", filter, "-map", "0:v:0", "-map", "[aout]");
+			args.push("-filter_complex", filter, ...videoMapping, "-map", "[aout]");
 		} else {
-			args.push("-map", "0:v:0", "-map", "1:a:0");
+			args.push(...videoMapping, "-map", `${inputIndex}:a:0`);
 		}
 	} else if (useEditedTrackFiltergraph) {
 		const filter = buildEditedTrackSourceAudioFilter(
 			options.editedTrackSegments ?? [],
 			options.audioSourceSampleRate ?? 0,
+			inputIndex,
 		);
 		if (!filter) {
 			throw new Error("Edited-track filtergraph inputs are incomplete for native export");
@@ -4029,19 +4164,18 @@ export function buildNativeVideoAudioMuxArgs(
 			args.push(
 				"-filter_complex",
 				`${filter};[aout]apad,atrim=duration=${duration},asetpts=PTS-STARTPTS[aout_sync]`,
-				"-map",
-				"0:v:0",
+				...videoMapping,
 				"-map",
 				"[aout_sync]",
 			);
 		} else {
-			args.push("-filter_complex", filter, "-map", "0:v:0", "-map", "[aout]");
+			args.push("-filter_complex", filter, ...videoMapping, "-map", "[aout]");
 		}
 	} else {
-		args.push("-map", "0:v:0", "-map", "1:a:0");
+		args.push(...videoMapping, "-map", `${inputIndex}:a:0`);
 	}
 
-	args.push("-c:v", "copy");
+	if (!audioOnly) args.push("-c:v", "copy");
 	if (audioMode === "copy-source" && canCopyAudioCodecIntoMp4(options.audioSourceCodec)) {
 		args.push("-c:a", "copy");
 	} else {
@@ -4056,9 +4190,98 @@ export function buildNativeVideoAudioMuxArgs(
 	} else if (audioMode !== "copy-source") {
 		args.push("-shortest");
 	}
-	args.push("-movflags", "+faststart", outputPath);
+	if (audioOnly) {
+		args.push("-movflags", "+delay_moov+default_base_moof+skip_sidx+skip_trailer",
+			"-frag_duration", "1000000", "-movie_timescale", String(argsOptions.audioOutputTimescale), "-f", "mp4", outputPath);
+	} else if (argsOptions.moovReservedBytes) {
+		args.push("-moov_size", String(argsOptions.moovReservedBytes), outputPath);
+	} else {
+		args.push("-movflags", "+faststart", outputPath);
+	}
 
 	return args;
+}
+
+function estimateInlineAudioMoovBytes(wav: Buffer, frameCount: number | undefined) {
+	if (!frameCount || !Number.isSafeInteger(frameCount) || frameCount < 0) return;
+	const blockAlign = wav.readUInt16LE(32);
+	if (blockAlign === 0) return;
+	const audioPackets = Math.ceil((wav.byteLength - 44) / (blockAlign * 1024)) + 2;
+	// Reserve room for both tracks' sample, timestamp and offset tables.
+	const bytes = 8192 + 24 * (frameCount + audioPackets);
+	if (bytes <= 2 * 1024 * 1024) return bytes;
+}
+
+async function* streamCompatibleAudio(
+	ffmpegPath: string,
+	args: string[],
+	wav?: Buffer | Readable,
+	signal?: AbortSignal,
+) {
+	signal?.throwIfAborted();
+	const child = spawn(ffmpegPath, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+	let stderr = "";
+	let processError: Error | undefined;
+	child.stderr.setEncoding("utf8").on("data", (text: string) => { stderr = (stderr + text).slice(-8192); });
+	child.on("error", error => { processError = error; });
+	const closed = new Promise<number | null>(resolve => child.once("close", resolve));
+	const stop = () => {
+		child.stdin.destroy();
+		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+	};
+	signal?.addEventListener("abort", stop, { once: true });
+	try {
+		child.stdin.on("error", () => { /* Report FFmpeg's exit rather than EPIPE. */ });
+		if (wav && !Buffer.isBuffer(wav)) {
+			void pipeline(wav, child.stdin).catch(() => undefined);
+		} else {
+			child.stdin.end(wav);
+		}
+		if (signal?.aborted) stop();
+		for await (const data of child.stdout) {
+			signal?.throwIfAborted();
+			yield Buffer.from(data);
+		}
+		const status = await closed;
+		signal?.throwIfAborted();
+		if (processError) throw processError;
+		if (status !== 0) throw new Error(stderr.trim() || `FFmpeg audio encoding exited with status ${status}`);
+	} finally {
+		signal?.removeEventListener("abort", stop);
+		stop();
+		await closed;
+	}
+}
+
+export async function appendCompatibleAudio(
+	videoPath: string,
+	audioPath: string,
+	options: NativeVideoExportFinishOptions,
+	wav?: Buffer | Readable,
+	signal?: AbortSignal,
+	readyToCommit?: Promise<void>,
+) {
+	const duration = options.outputDurationSec;
+	if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0) {
+		throw new Error("Audio append requires a positive export duration");
+	}
+	const start = getNowMs();
+	const ffmpeg = getFfmpegBinaryPath();
+	const { outputBytes } = await appendAudioToReservedMp4(videoPath, duration * 1000,
+		async function* (timescale) {
+			const args = buildNativeVideoAudioMuxArgs(videoPath, audioPath, "pipe:1", options, {
+				wavFromStdin: Boolean(wav), audioOutputTimescale: timescale,
+			});
+			yield* streamCompatibleAudio(ffmpeg, args, wav, signal);
+			await readyToCommit;
+			signal?.throwIfAborted();
+		}, signal);
+	return { ffmpegExecMs: getNowMs() - start, muxedVideoBytes: outputBytes };
+}
+
+export function canRetryCompatibleAudio(error: unknown) {
+	return !isExportStorageFull(error) &&
+		!(error && typeof error === "object" && "code" in error && error.code === "EXPORT_AUDIO_ROLLBACK_FAILED");
 }
 
 export async function muxNativeVideoExportAudio(
@@ -4066,7 +4289,9 @@ export async function muxNativeVideoExportAudio(
 	options: NativeVideoExportFinishOptions,
 	onProgress?: (progress: NativeVideoAudioMuxProgress) => void,
 	session?: NativeStaticLayoutExportSession,
+	signal?: AbortSignal,
 ) {
+	signal?.throwIfAborted();
 	const audioMode = options.audioMode ?? "none";
 	if (audioMode === "none") {
 		return {
@@ -4079,24 +4304,36 @@ export async function muxNativeVideoExportAudio(
 	const metrics: NativeVideoAudioMuxMetrics = {};
 	const tempArtifacts: string[] = [];
 	let audioInputPath = options.audioSourcePath ?? null;
+	let inlineWav: Buffer | undefined;
 	const useEditedTrackFiltergraph =
 		audioMode === "edited-track" && options.editedTrackStrategy === "filtergraph-fast-path";
 
 	if (audioMode === "edited-track" && !useEditedTrackFiltergraph) {
-		if (!options.editedAudioData) {
+		if (!options.editedAudioData && !audioInputPath) {
 			throw new Error("Edited audio data is missing for native export");
 		}
 
-		const extension = getEditedAudioExtension(options.editedAudioMimeType);
-		audioInputPath = path.join(
-			app.getPath("temp"),
-			`leadcut-export-audio-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${extension}`,
-		);
-		const tempAudioWriteStartedAt = getNowMs();
-		await fs.writeFile(audioInputPath, Buffer.from(options.editedAudioData));
-		metrics.tempEditedAudioWriteMs = getNowMs() - tempAudioWriteStartedAt;
-		metrics.tempEditedAudioBytes = options.editedAudioData.byteLength;
-		tempArtifacts.push(audioInputPath);
+		const audioData = options.editedAudioData;
+		if (
+			audioData && options.editedAudioMimeType === EDITED_WAV_MIME_TYPE &&
+			audioData.byteLength <= MAX_INLINE_EDITED_WAV_BYTES &&
+			getEditedWavByteLength(audioData) === audioData.byteLength
+		) {
+			inlineWav = Buffer.from(audioData);
+			metrics.inlineEditedAudioBytes = inlineWav.byteLength;
+			audioInputPath = "pipe:0";
+		} else if (audioData) {
+			const extension = getEditedAudioExtension(options.editedAudioMimeType);
+			audioInputPath = path.join(
+				app.getPath("temp"),
+				`leadcut-export-audio-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${extension}`,
+			);
+			const tempAudioWriteStartedAt = getNowMs();
+			await fs.writeFile(audioInputPath, Buffer.from(audioData));
+			metrics.tempEditedAudioWriteMs = getNowMs() - tempAudioWriteStartedAt;
+			metrics.tempEditedAudioBytes = audioData.byteLength;
+			tempArtifacts.push(audioInputPath);
+		}
 	}
 
 	if (!audioInputPath) {
@@ -4106,23 +4343,54 @@ export async function muxNativeVideoExportAudio(
 		};
 	}
 
+	if (options.reuseVideoMp4) {
+		try {
+			Object.assign(metrics, await appendCompatibleAudio(videoPath, audioInputPath, options, inlineWav, signal));
+			await Promise.allSettled(tempArtifacts.map(artifact => removeTemporaryExportFile(artifact)));
+			return { outputPath: videoPath, metrics };
+		} catch (error) {
+			if (signal?.aborted || !canRetryCompatibleAudio(error)) {
+				await Promise.allSettled(tempArtifacts.map(artifact => removeTemporaryExportFile(artifact)));
+				signal?.throwIfAborted();
+				throw error;
+			}
+			console.warn("[native-video-export] Could not append audio to the reserved MP4, using the compatible muxer", error);
+		}
+	}
+
 	const outputPath = path.join(
 		path.dirname(videoPath),
 		`${path.basename(videoPath, path.extname(videoPath))}-final.mp4`,
 	);
 
-	const args = buildNativeVideoAudioMuxArgs(
-		videoPath,
-		audioInputPath,
-		outputPath,
-		options,
-		onProgress ? { progressPipe: 2 } : {},
+	const moovReservedBytes = inlineWav && estimateInlineAudioMoovBytes(inlineWav, options.outputVideoFrameCount);
+	const measureOutputWrites = readAppEnv("EXPORT_MUX_WRITE_DIAGNOSTICS") === "1";
+	const muxAudioInput = audioInputPath;
+	const mux = (reservedBytes?: number) => runFfmpegAudioMux(
+		ffmpegPath,
+		buildNativeVideoAudioMuxArgs(videoPath, muxAudioInput, outputPath, options, {
+			progressPipe: onProgress ? 2 : undefined,
+			wavFromStdin: Boolean(inlineWav),
+			moovReservedBytes: reservedBytes,
+			measureOutputWrites,
+		}),
+		15 * 60 * 1000, options, onProgress, session, signal, inlineWav, measureOutputWrites,
 	);
 
 	try {
 		const ffmpegExecStartedAt = getNowMs();
-		await runFfmpegAudioMux(ffmpegPath, args, 15 * 60 * 1000, options, onProgress, session);
+		let outputWrites: number | undefined;
+		try {
+			outputWrites = await mux(moovReservedBytes);
+		} catch (error) {
+			if (!moovReservedBytes || !/reserved_moov_size is too small/.test(String(error))) throw error;
+			signal?.throwIfAborted();
+			await removeTemporaryExportFile(outputPath);
+			outputWrites = await mux();
+		}
+		signal?.throwIfAborted();
 		metrics.ffmpegExecMs = getNowMs() - ffmpegExecStartedAt;
+		if (outputWrites !== undefined) metrics.ffmpegMuxOutputWriteBytes = outputWrites;
 		console.info("[native-video-export] Audio mux completed", {
 			ffmpegExecMs: metrics.ffmpegExecMs,
 			audioMode: options.audioMode,
@@ -4134,6 +4402,9 @@ export async function muxNativeVideoExportAudio(
 			outputPath,
 			metrics,
 		};
+	} catch (error) {
+		await removeTemporaryExportFile(outputPath);
+		throw error;
 	} finally {
 		await Promise.allSettled(
 			tempArtifacts.map((artifactPath) => removeTemporaryExportFile(artifactPath)),
@@ -4144,6 +4415,7 @@ export async function muxNativeVideoExportAudio(
 export async function muxExportedVideoAudioBuffer(
 	videoData: ArrayBuffer,
 	options: NativeVideoExportFinishOptions,
+	signal?: AbortSignal,
 ) {
 	const tempVideoPath = path.join(
 		app.getPath("temp"),
@@ -4154,11 +4426,12 @@ export async function muxExportedVideoAudioBuffer(
 	let outputPath = tempVideoPath;
 
 	try {
+		signal?.throwIfAborted();
 		const tempVideoWriteStartedAt = getNowMs();
 		await fs.writeFile(tempVideoPath, Buffer.from(videoData));
 		metrics.tempVideoWriteMs = getNowMs() - tempVideoWriteStartedAt;
 		metrics.tempVideoBytes = videoData.byteLength;
-		const finalized = await muxNativeVideoExportAudio(tempVideoPath, options);
+		const finalized = await muxNativeVideoExportAudio(tempVideoPath, options, undefined, undefined, signal);
 		Object.assign(metrics, finalized.metrics);
 		outputPath = finalized.outputPath;
 		// Record byte size via stat instead of reading the whole file into a

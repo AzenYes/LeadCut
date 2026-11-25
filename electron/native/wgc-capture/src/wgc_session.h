@@ -33,7 +33,8 @@ public:
     void pollDesktopDuplicationFrame(UINT timeoutMs = 20);
     bool usesDesktopDuplication() const { return desktopDuplication_.Get() != nullptr; }
     void stopCapture();
-    bool hasFatalError() const { return fatalError_.load(); }
+    bool sourceClosed() const { return windowHandle_ && !IsWindow(windowHandle_); }
+    bool hasFatalError() const { return fatalError_.load() || sourceClosed(); }
 
     int captureWidth() const { return captureWidth_; }
     int captureHeight() const { return captureHeight_; }

@@ -32,6 +32,7 @@ vi.mock("../ffmpeg/binary", () => ({
 }));
 
 import { moveExportedTempFile } from "./export";
+import { registerOwnedExportPath, releaseOwnedExportPath } from "../export/exportStream";
 
 const tempDirs: string[] = [];
 
@@ -68,20 +69,50 @@ describe("moveExportedTempFile", () => {
 		await fs.writeFile(tempPath, "new-export");
 		await fs.writeFile(destinationPath, "previous-export");
 
-		const originalRename = fs.rename.bind(fs);
-		const renameSpy = vi.spyOn(fs, "rename");
-		renameSpy.mockImplementation(async (from, to) => {
-			if (from === tempPath && to === destinationPath) {
-				const error = new Error("destination exists") as NodeJS.ErrnoException;
-				error.code = "EEXIST";
-				throw error;
-			}
-
-			return originalRename(from, to);
-		});
+		vi.spyOn(fs, "rename").mockRejectedValueOnce(Object.assign(new Error("destination exists"), { code: "EEXIST" }));
+		const copy = vi.spyOn(fs, "copyFile");
 
 		await moveExportedTempFile(tempPath, destinationPath);
 
+		await expect(fs.readFile(destinationPath, "utf8")).resolves.toBe("new-export");
+		await expect(fs.access(tempPath)).rejects.toThrow();
+		expect(copy).not.toHaveBeenCalled();
+	});
+
+	it("replaces the existing export from a private folder on the destination volume without copying", async () => {
+		const target = await makeTempDir();
+		const stagingDirectory = await fs.mkdtemp(path.join(target, ".leadcut-export-"));
+		const tempPath = path.join(stagingDirectory, "leadcut-export-stream-test-final.mp4");
+		const destinationPath = path.join(target, "export-final.mp4");
+		await fs.writeFile(tempPath, "new-export");
+		await fs.writeFile(destinationPath, "previous-export");
+		registerOwnedExportPath(tempPath, true);
+		vi.spyOn(fs, "rename").mockRejectedValueOnce(Object.assign(new Error("destination exists"), { code: "EPERM" }));
+		const copy = vi.spyOn(fs, "copyFile");
+
+		try {
+			await moveExportedTempFile(tempPath, destinationPath);
+		} finally {
+			releaseOwnedExportPath(tempPath);
+		}
+
+		await expect(fs.readFile(destinationPath, "utf8")).resolves.toBe("new-export");
+		await expect(fs.readdir(target)).resolves.toEqual(["export-final.mp4"]);
+		expect(copy).not.toHaveBeenCalled();
+	});
+
+	it("copies into the destination volume only when the source and destination cannot be renamed across volumes", async () => {
+		const source = await makeTempDir();
+		const destination = await makeTempDir();
+		const tempPath = path.join(source, "export-temp.mp4");
+		const destinationPath = path.join(destination, "export-final.mp4");
+		await fs.writeFile(tempPath, "new-export");
+		vi.spyOn(fs, "rename").mockRejectedValueOnce(Object.assign(new Error("different volume"), { code: "EXDEV" }));
+		const copy = vi.spyOn(fs, "copyFile");
+
+		await moveExportedTempFile(tempPath, destinationPath);
+
+		expect(copy).toHaveBeenCalledTimes(1);
 		await expect(fs.readFile(destinationPath, "utf8")).resolves.toBe("new-export");
 		await expect(fs.access(tempPath)).rejects.toThrow();
 	});

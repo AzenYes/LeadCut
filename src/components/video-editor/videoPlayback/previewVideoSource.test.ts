@@ -176,6 +176,25 @@ describe("PreviewVideoSource", () => {
 		expect(frames[1].close).toHaveBeenCalledOnce();
 	});
 
+	it("retains a color-converted canvas when the renderer requires one", () => {
+		const createFrame = vi.fn();
+		vi.stubGlobal("VideoFrame", class TestFrame {
+			constructor() { createFrame(); }
+		});
+		const video = new TestVideo();
+		const owner = new PreviewVideoSource();
+		owner.setVideo(video.asElement());
+		const source = owner.getSource(true);
+		const canvas = source.resource as HTMLCanvasElement;
+		const draw = canvas.getContext("2d")!.drawImage;
+		expect(draw).toHaveBeenCalledWith(video, 0, 0, video.videoWidth, video.videoHeight);
+		video.dispatchEvent(new Event("seeked"));
+		expect(draw).toHaveBeenCalledTimes(2);
+		expect(source.resource).toBe(canvas);
+		expect(createFrame).not.toHaveBeenCalled();
+		owner.setVideo(null);
+	});
+
 	it("ignores already queued callbacks belonging to a replaced video", () => {
 		const first = new TestVideo();
 		const next = new TestVideo();

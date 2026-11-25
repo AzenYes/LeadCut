@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_SHORTCUTS, SHORTCUT_ACTIONS, type ShortcutAction } from "@/lib/shortcuts";
+import { useEditorShortcuts } from "../../hooks/useEditorShortcuts";
 import { useTimelineKeyboardShortcuts } from "./useTimelineKeyboardShortcuts";
 
 vi.mock("react", () => ({
 	useEffect: (effect: () => void) => effect(),
 	useCallback: (callback: () => boolean) => callback,
+	useRef: (current: unknown) => ({ current }),
 }));
 class Element {
 	isContentEditable = false;
@@ -25,7 +28,6 @@ function setup(overrides: Partial<Params> = {}) {
 	const addEventListener = vi.fn();
 	vi.stubGlobal("window", { addEventListener, removeEventListener: vi.fn() });
 	const params: Params = {
-		isMac: true,
 		isTimelineFocusedRef: { current: false },
 		hasAnyZoomBlocks: true,
 		activateSelectAllZooms: vi.fn(),
@@ -43,9 +45,19 @@ function setup(overrides: Partial<Params> = {}) {
 		cycleAnnotationsAtCurrentTime: vi.fn(),
 		...overrides,
 	};
-	// biome-ignore lint/correctness/useHookAtTopLevel: useEffect is mocked to capture the listener without a React render.
-	const deleteSelected = useTimelineKeyboardShortcuts(params);
-	const handler = addEventListener.mock.calls[0][1] as (event: KeyboardEvent) => void;
+	// biome-ignore lint/correctness/useHookAtTopLevel: React hooks are mocked to exercise the scoped commands.
+	const { deleteSelected, selectAllZooms, cycleAnnotations } = useTimelineKeyboardShortcuts(params);
+	const actions = Object.fromEntries(SHORTCUT_ACTIONS.map(action => [action, vi.fn()])) as Record<ShortcutAction, () => void>;
+	// biome-ignore lint/correctness/useHookAtTopLevel: useEffect is mocked to capture the shared dispatch listener.
+	useEditorShortcuts(DEFAULT_SHORTCUTS, true, actions, {
+		fixedActions: {
+			deleteSelection: deleteSelected,
+			selectAllZooms,
+			nextAnnotation: () => cycleAnnotations(false),
+			previousAnnotation: () => cycleAnnotations(true),
+		},
+	});
+	const handler = addEventListener.mock.calls.find(([name]) => name === "keydown")?.[1] as (event: KeyboardEvent) => void;
 	const press = (options: Record<string, unknown> = {}) => {
 		const event = {
 			key: "Backspace",
@@ -55,6 +67,7 @@ function setup(overrides: Partial<Params> = {}) {
 			shiftKey: false,
 			target: new Element(),
 			preventDefault: vi.fn(),
+			stopImmediatePropagation: vi.fn(),
 			...options,
 		};
 		handler(event as unknown as KeyboardEvent);

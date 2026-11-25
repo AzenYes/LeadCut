@@ -1,5 +1,6 @@
 import { uiText } from "@/i18n/uiText";
 import type { ChangeReviewMarkers } from "../../../changeLogRestore";
+import type { PlaybackClock } from "../../../videoPlayback/playbackClock";
 import { useTimelinePresentation } from "../../core/TimelinePresentation";
 import { Plus } from "@/components/ui/icons";
 import { useDndMonitor } from "@dnd-kit/core";
@@ -12,6 +13,7 @@ import {
 	memo,
 	useCallback,
 	useEffect,
+	useImperativeHandle,
 	useMemo,
 	useRef,
 	useState,
@@ -62,6 +64,8 @@ import { CaptionOverview, type CaptionOverviewMark, type CaptionOverviewSelectio
 
 
 
+export type TimelineTimeAtClientX = (clientX: number) => number | undefined;
+
 interface TimelineCanvasProps {
 	keystrokeTrack?: KeystrokeTrackControls;
 	changeMarkers?: ChangeReviewMarkers;
@@ -75,7 +79,8 @@ interface TimelineCanvasProps {
 	videoPath?: string | null;
 	items: TimelineRenderItem[];
 	videoDurationMs: number;
-	currentTimeMs: number;
+	playbackClock: PlaybackClock;
+	timeAtClientXRef?: RefObject<TimelineTimeAtClientX | null>;
 	onSeek?: (time: number) => void;
 	canPlaceZoomAtMs?: (startMs: number) => boolean;
 	onSelectZoom?: (id: string | null) => void;
@@ -1021,7 +1026,8 @@ export default function TimelineCanvas({
 	videoPath,
 	items,
 	videoDurationMs,
-	currentTimeMs,
+	playbackClock,
+	timeAtClientXRef,
 	onSeek,
 	onAddZoomAtMs,
 	canPlaceZoomAtMs,
@@ -1157,6 +1163,10 @@ export default function TimelineCanvas({
 		},
 		[direction, pixelsToValue, range.start, sidebarWidth, videoDurationMs, clipPresentation],
 	);
+	useImperativeHandle(timeAtClientXRef, () => (clientX: number) => {
+		const canvas = localTimelineRef.current;
+		return canvas ? getAbsoluteMsFromClientX(clientX, canvas.getBoundingClientRect()) : undefined;
+	}, [getAbsoluteMsFromClientX]);
 
 	const handleTimelineMouseDown = useCallback(
 		(e: MouseEvent<HTMLDivElement>) => {
@@ -1343,7 +1353,7 @@ export default function TimelineCanvas({
 			<div aria-hidden="true" style={{ height: TIMELINE_AXIS_HEIGHT_PX, flexShrink: 0 }} />
 			<PlaybackCursor
 				clips={clipPresentation}
-				currentTimeMs={currentTimeMs}
+				playbackClock={playbackClock}
 				videoDurationMs={videoDurationMs}
 				onSeek={onSeek}
 				timelineRef={localTimelineRef}

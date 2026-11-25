@@ -3,7 +3,7 @@ import { Export } from "@phosphor-icons/react";
 import { useLayoutEffect, useRef, useState } from "react";
 import { Card } from "@heroui/react";
 import { motion, useReducedMotion } from "motion/react";
-import { ProgressBar } from "@heroui/react";
+import { BackgroundTaskStatus } from "@/components/ui/BackgroundTaskStatus";
 
 import { toast } from "@/components/ui/toast";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,8 @@ import type { useExportDimensions } from "../export/useExportDimensions";
 import type { useExportPreflight } from "../export/useExportPreflight";
 import type { useExportSession } from "../export/useExportSession";
 import type { useExportSettings } from "../export/useExportSettings";
-import type { useExportStatusViewModel } from "../export/useExportStatusViewModel";
+import { useExportStatusViewModel } from "../export/useExportStatusViewModel";
+import { useExportMessages } from "../export/useExportMessages";
 import { ExportPreflightPanel } from "./ExportPreflightPanel";
 
 type Props = {
@@ -25,7 +26,6 @@ type Props = {
 	preflight: ReturnType<typeof useExportPreflight>;
 	exportDimensions: ReturnType<typeof useExportDimensions>;
 	timelineDuration: number;
-	exportStatus: ReturnType<typeof useExportStatusViewModel>;
 	hasCaptionsForSidecar: boolean;
 	nvidiaCudaExportAvailable: boolean;
 	experimentalNvidiaCudaExport: boolean;
@@ -36,7 +36,6 @@ type Props = {
 	handleRetrySaveExport: () => void;
 	handleStartExportFromDropdown: () => void;
 	revealExportedFile: () => void;
-	exportMessage: string | null;
 	projectTitle: string;
 };
 
@@ -77,7 +76,6 @@ export function EditorExportMenu(props: Props) {
 		exportSession,
 		preflight,
 		exportDimensions,
-		exportStatus,
 		hasCaptionsForSidecar,
 		nvidiaCudaExportAvailable,
 		experimentalNvidiaCudaExport,
@@ -88,7 +86,6 @@ export function EditorExportMenu(props: Props) {
 		handleRetrySaveExport,
 		handleStartExportFromDropdown,
 		revealExportedFile,
-		exportMessage,
 	} = props;
 	const {
 		exportQuality,
@@ -115,7 +112,6 @@ export function EditorExportMenu(props: Props) {
 	} = exportSettings;
 	const {
 		isExporting,
-		exportProgress,
 		exportError,
 		showExportDropdown,
 		setShowExportDropdown,
@@ -124,7 +120,10 @@ export function EditorExportMenu(props: Props) {
 		hasPendingExportSave,
 	} = exportSession;
 	const { gifOutputDimensions, mp4OutputDimensions } = exportDimensions;
+	const exportStatus = useExportStatusViewModel({ t, session: exportSession, settings: exportSettings });
+	const exportMessage = useExportMessages({ t, active: exportStatus.isLightningExportInProgress });
 	const {
+		exportProgress,
 		isExportPreparing,
 		isExportSaving,
 		isRenderingAudio,
@@ -192,7 +191,8 @@ export function EditorExportMenu(props: Props) {
 				<PopoverTrigger asChild>
 					<Button
 						type="button"
-						className="inline-flex h-9 min-w-[104px] items-center justify-center gap-2 px-4.5"
+						data-onboarding-target="export"
+						className="inline-flex h-9 min-w-[104px] items-center justify-center gap-2 px-4.5 data-[onboarding-active]:ring-2 data-[onboarding-active]:ring-accent"
 					>
 						<Export className="h-4 w-4" />
 						<span className="text-sm font-semibold tracking-tight">
@@ -201,6 +201,7 @@ export function EditorExportMenu(props: Props) {
 					</Button>
 				</PopoverTrigger>
 				<PopoverContent
+					data-export-menu
 					aria-label={t("editor.actions.exportVideo", "Export video")}
 					align="end"
 					sideOffset={10}
@@ -221,65 +222,18 @@ export function EditorExportMenu(props: Props) {
 							<div>
 								{isExporting ? (
 									<Card className="rounded-none bg-transparent p-5 text-foreground shadow-none">
-										<div className="mb-3 flex items-center justify-between gap-3">
-											<div>
-												<p className="text-sm font-semibold text-foreground">
-													{t(
-														"editor.exportStatus.exporting",
-														"Exporting",
-													)}
-												</p>
-												<p className="text-xs text-muted-foreground">
-													{t(
-														"editor.exportStatus.renderingFile",
-														"Rendering your file.",
-													)}
-												</p>
-												{isLightningExportInProgress && exportMessage ? (
-													<p className="mt-1 text-[11px] leading-relaxed text-muted-foreground/70">
-														{exportMessage}
-													</p>
-												) : null}
-												{isLegacyExportInProgress ? (
-													<p className="mt-1 text-[11px] text-muted-foreground/70">
-														{uiText("exportTooSlowCancelAndTryLightningExport")}</p>
-												) : null}
-											</div>
-											<Button
-												type="button"
-												variant="outline"
-												onClick={handleCancelExport}
-												className="h-8 px-3 text-xs"
-											>
+										<BackgroundTaskStatus
+											title={t("editor.exportStatus.exporting", "Exporting")}
+											detail={exportPercentLabel}
+											progress={isExportPreparing || isExportSaving || isExportFinalSaveIndeterminate
+												? null : Math.min(100, isRenderingAudio ? (exportProgress?.audioProgress ?? 0) * 100
+													: exportFinalizingProgress ?? exportProgress?.percentage ?? 8)}
+											action={<Button type="button" variant="outline" onClick={handleCancelExport} className="h-8 px-3 text-xs">
 												{t("common.actions.cancel")}
-											</Button>
-										</div>
-										<ProgressBar
-											aria-label={t(
-												"editor.exportStatus.exporting",
-												"Exporting",
-											)}
-											isIndeterminate={
-												isExportPreparing ||
-												isExportSaving ||
-												isExportFinalSaveIndeterminate
-											}
-											value={Math.min(
-												isRenderingAudio
-													? (exportProgress?.audioProgress ?? 0) * 100
-													: (exportFinalizingProgress ??
-															exportProgress?.percentage ??
-															8),
-												100,
-											)}
-										>
-											<ProgressBar.Track>
-												<ProgressBar.Fill />
-											</ProgressBar.Track>
-										</ProgressBar>
-										<p className="mt-2 text-xs text-muted-foreground">
-											{exportPercentLabel}
-										</p>
+											</Button>}
+										/>
+										{isLightningExportInProgress && exportMessage && <p className="mt-1 text-[11px] text-muted-foreground">{exportMessage}</p>}
+										{isLegacyExportInProgress && <p className="mt-1 text-[11px] text-muted-foreground">{uiText("exportTooSlowCancelAndTryLightningExport")}</p>}
 										{isRenderingAudio ? (
 											<p className="mt-1 text-[11px] text-muted-foreground/70">
 												{t(

@@ -1,8 +1,68 @@
 import { spawnSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import react from "@vitejs/plugin-react";
-import { defineConfig, type Plugin } from "vite";
+import type { Plugin as EsbuildPlugin } from "esbuild";
+import { defineConfig, normalizePath, type Plugin } from "vite";
 import electron from "vite-plugin-electron/simple";
+
+const pixiModuleRoot = "/node_modules/pixi.js/lib/";
+const pixiRendererPatches = new Map<string, [string, string][]>([
+	["utils/browser/isWebGPUSupported.mjs", [
+		// Pixi 8.14 checks device creation once per document and discards the result.
+		["await adapter.requestDevice();", "const probeDevice = await adapter.requestDevice();\n      probeDevice.destroy();"],
+	]],
+	["rendering/batcher/shared/DefaultBatcher.mjs", [
+		// A WebGL preview and a WebGPU export can have different texture limits.
+		["let defaultShader = null;", "const defaultShaders = new Map();"],
+		["defaultShader ?? (defaultShader = new DefaultShader(options.maxTextures));\n    this.shader = defaultShader;",
+			"let shader = defaultShaders.get(options.maxTextures);\n    if (!shader) {\n      shader = new DefaultShader(options.maxTextures);\n      defaultShaders.set(options.maxTextures, shader);\n    }\n    this.shader = shader;"],
+	]],
+	["rendering/batcher/gpu/getTextureBatchBindGroup.mjs", [
+		["return cachedGroups[uid] || generateTextureBatchBindGroup(textures, size, uid, maxTextures);",
+			"const key = `${maxTextures}:${uid}`;\n  return cachedGroups[key] || generateTextureBatchBindGroup(textures, size, key, maxTextures);"],
+	]],
+]);
+
+function getPixiRendererPatches(filename: string) {
+	const normalized = normalizePath(filename);
+	const offset = normalized.lastIndexOf(pixiModuleRoot);
+	return offset < 0 ? undefined : pixiRendererPatches.get(normalized.slice(offset + pixiModuleRoot.length));
+}
+
+function applyPixiRendererPatches(source: string, filename: string, patches: [string, string][]): string {
+	for (const [original, replacement] of patches) {
+		if (!source.includes(original)) throw new Error(`Review the LeadCut patch for ${path.basename(filename)} after updating pixi.js`);
+		source = source.replace(original, replacement);
+	}
+	return source;
+}
+
+function pixiRendererCompatibility(): Plugin {
+	return {
+		name: "leadcut-pixi-renderer-compatibility",
+		enforce: "pre",
+		transform(source, id) {
+			const patches = getPixiRendererPatches(id);
+			if (patches) return applyPixiRendererPatches(source, id, patches);
+		},
+	};
+}
+
+const prebundlePixiRendererCompatibility: EsbuildPlugin = {
+	name: "leadcut-pixi-renderer-compatibility",
+	setup(build) {
+		build.onLoad({ filter: /(?:isWebGPUSupported|DefaultBatcher|getTextureBatchBindGroup)\.mjs$/ }, async ({ path: filename }) => {
+			const patches = getPixiRendererPatches(filename);
+			if (!patches) return;
+			return {
+				contents: applyPixiRendererPatches(await readFile(filename, "utf8"), filename, patches),
+				loader: "js",
+				resolveDir: path.dirname(filename),
+			};
+		});
+	},
+};
 
 function electronMainCjsOutputPlugin(): Plugin {
 	return {
@@ -57,10 +117,13 @@ function electronMainCjsGuardPlugin(): Plugin {
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => ({
 	server: {
-		watch: { ignored: ["**/electron/native/**", "**/release/**", "**/dist/**", "**/dist-electron/**", "**/test-results/**", "**/playwright-report/**", "**/.tmp/**", "**/.code/**"] },
+		watch: process.env.LEADCUT_RENDERER_ONLY === "1"
+			? null
+			: { ignored: ["**/electron/native/**", "**/release/**", "**/dist/**", "**/dist-electron/**", "**/test-results/**", "**/playwright-report/**", "**/.tmp/**", "**/.code/**"] },
 	},
 	plugins: [
 		react(),
+		pixiRendererCompatibility(),
 		...(mode === "ui" || process.env.LEADCUT_RENDERER_ONLY === "1"
 			? []
 			: [
@@ -121,6 +184,7 @@ export default defineConfig(({ mode }) => ({
 	},
 	optimizeDeps: {
 		entries: ["index.html"],
+		esbuildOptions: { plugins: [prebundlePixiRendererCompatibility] },
 		// React Aria imports this CommonJS shim through its ESM collection modules.
 		include: ["use-sync-external-store/shim"],
 		exclude: [
@@ -143,6 +207,10 @@ export default defineConfig(({ mode }) => ({
 			},
 		},
 		rollupOptions: {
+			input: {
+				app: path.resolve(__dirname, "index.html"),
+				exportFrame: path.resolve(__dirname, "export-frame.html"),
+			},
 			output: {
 				manualChunks: {
 					"react-vendor": ["react", "react-dom"],

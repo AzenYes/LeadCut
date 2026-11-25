@@ -47,7 +47,7 @@ export async function assertProjectNotOpen(projectPath: string, dryRun: boolean)
 	const marker = await readEditorLock(projectPath);
 	const openInEditor = marker !== null && isLiveEditorLock(marker);
 	if (openInEditor && !dryRun) {
-		throw new Error("工程正在 LeadCut 编辑器中打开，请先在编辑器里点「主页」释放工程，再重试。");
+		throw new Error("工程正在 LeadCut 编辑器中打开。请在编辑器里点「交给 Agent」，或回到「主页」释放工程，再重试。");
 	}
 	return openInEditor;
 }

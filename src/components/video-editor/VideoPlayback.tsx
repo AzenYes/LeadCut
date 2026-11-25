@@ -1,11 +1,12 @@
 import { ChapterProgressOverlay } from "./ChapterProgressOverlay";
 import { KeystrokeOverlay } from "./keystrokes/KeystrokeOverlay";
 import type { KeystrokePresentation } from "./keystrokes/keystrokeLayout";
-import { chapterCaptionSettings } from "@/lib/exporter/chapterRenderer";
 import { uiText } from "@/i18n/uiText";
 import { VideoLayerCompositor } from "@/lib/videoLayerCompositor";
+import { findStartupPreviewVideo, retainStartupPreviewVideo, takeStartupPreviewRenderer } from "@/lib/startupEditorPreview";
 import type { VideoRegion, VideoTrack } from "./videoTracks";
-import { Application, Container, Graphics, Rectangle, Sprite, Texture } from "pixi.js";
+import type { ExportPreviewRenderer } from "./export/pausedExportPreview";
+import { Application, Container, Graphics, Rectangle, RendererType, Sprite, Texture } from "pixi.js";
 import { MotionBlurFilter } from "pixi-filters/motion-blur";
 import { ZoomBlurFilter } from "pixi-filters/zoom-blur";
 import type React from "react";
@@ -16,6 +17,7 @@ import {
 	useCallback,
 	useEffect,
 	useImperativeHandle,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -40,22 +42,9 @@ import {
 } from "@/lib/wallpapers";
 import { type AspectRatio, formatAspectRatioForCSS } from "@/utils/aspectRatioUtils";
 import { AnnotationOverlay } from "./AnnotationOverlay";
-import { type CaptionEditTarget, normalizeCaptionEditText } from "./captionEditing";
-import { getActiveCaptionLayout, prepareCaptionLayout } from "./captionLayout";
-import { getCaptionTimeMs } from "./captionTimeline";
-import {
-	getCaptionFontStack, getCaptionFontWeight,
-	getCaptionAnchor,
-	getCaptionPreviewTextStyle,
-	CAPTION_LINE_HEIGHT,
-	getCaptionPadding,
-	getCaptionScaledFontSize,
-	getCaptionScaledRadius,
-	getCaptionTextMaxWidth,
-	getCaptionWordVisualState,
-	type CaptionPosition,
-} from "./captionStyle";
-import { useCaptionPositionDrag } from "./videoPlayback/useCaptionPositionDrag";
+import type { CaptionEditTarget } from "./captionEditing";
+import type { CaptionPosition } from "./captionStyle";
+import { PreviewCaptionOverlay, type CaptionFontSizeDraft, type PreviewCaptionOverlayRef } from "./videoPlayback/PreviewCaptionOverlay";
 import {
 	type AnnotationRegion,
 	type AutoCaptionSettings,
@@ -164,11 +153,6 @@ type PlaybackAnimationState = {
 	y: number;
 };
 
-type CaptionEditSession = {
-	target: CaptionEditTarget;
-	draft: string;
-};
-
 type SceneTransformState = {
 	scale: number;
 	x: number;
@@ -274,6 +258,7 @@ interface VideoPlaybackProps {
 	onKeystrokePositionChange?: (position: { x: number; y: number }) => void;
 	autoCaptions?: CaptionCue[];
 	autoCaptionSettings?: AutoCaptionSettings;
+	captionFontSizeDraft?: CaptionFontSizeDraft;
 	onEditAutoCaption?: (target: CaptionEditTarget, text: string) => void;
 	onSelectAutoCaption?: (id: string) => void;
 	onCaptionPositionChange?: (position: CaptionPosition) => void;
@@ -307,6 +292,7 @@ interface VideoPlaybackProps {
 	cursorSway?: number;
 	volume?: number;
 	suspendRendering?: boolean;
+	exportPreviewRenderer?: ExportPreviewRenderer;
 }
 
 export interface VideoPlaybackRef {
@@ -370,6 +356,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			onKeystrokePositionChange,
 			autoCaptions = [],
 			autoCaptionSettings,
+			captionFontSizeDraft,
 			onEditAutoCaption,
 			onSelectAutoCaption,
 			onCaptionPositionChange,
@@ -403,6 +390,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			cursorSway = DEFAULT_CURSOR_SWAY,
 			volume = 1,
 			suspendRendering = false,
+			exportPreviewRenderer,
 		},
 		ref,
 	) => {
@@ -417,6 +405,36 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			videoRef.current = video;
 			setTimelinePreviewVideo(window, video);
 		}, []);
+		const startupVideo = useMemo(() => findStartupPreviewVideo(videoPath), [videoPath]);
+		const mediaHandlers = useRef<{
+			metadata: (video: HTMLVideoElement) => void;
+			duration: (value: number) => void;
+			error: (video: HTMLVideoElement) => void;
+		} | null>(null);
+		useLayoutEffect(() => {
+			if (!startupVideo) return;
+			const releaseStartupVideo = retainStartupPreviewVideo(startupVideo);
+			startupVideo.setAttribute("aria-hidden", "true");
+			if (!startupVideo.isConnected) document.body.append(startupVideo);
+			attachVideo(startupVideo);
+			performance.mark("leadcut-early-video-adopted");
+			const metadata = () => mediaHandlers.current?.metadata(startupVideo);
+			const duration = () => mediaHandlers.current?.duration(startupVideo.duration);
+			const error = () => mediaHandlers.current?.error(startupVideo);
+			startupVideo.addEventListener("loadedmetadata", metadata);
+			startupVideo.addEventListener("durationchange", duration);
+			startupVideo.addEventListener("error", error);
+			if (startupVideo.readyState >= HTMLMediaElement.HAVE_METADATA) metadata();
+			if (startupVideo.error) error();
+			return () => {
+				startupVideo.removeEventListener("loadedmetadata", metadata);
+				startupVideo.removeEventListener("durationchange", duration);
+				startupVideo.removeEventListener("error", error);
+				if (videoRef.current === startupVideo) attachVideo(null);
+				startupVideo.remove();
+				releaseStartupVideo();
+			};
+		}, [attachVideo, startupVideo]);
 		const previewFrameRef = useRef<HTMLDivElement | null>(null);
 		const containerRef = useRef<HTMLDivElement | null>(null);
 		const appRef = useRef<Application | null>(null);
@@ -458,31 +476,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const [webcamSynchronizedPath, setWebcamSynchronizedPath] = useState<string | null>(null);
 		const webcamMediaSynchronized =
 			Boolean(webcamVideoPath) && webcamSynchronizedPath === webcamVideoPath;
-		const captionBoxRef = useRef<HTMLDivElement | null>(null);
-		const captionEditInputRef = useRef<HTMLTextAreaElement | null>(null);
-		const captionEditSessionRef = useRef<CaptionEditSession | null>(null);
-		const [captionEditSession, setCaptionEditSession] = useState<CaptionEditSession | null>(
-			null,
-		);
-		const captionDrag = useCaptionPositionDrag({
-			frameRef: previewFrameRef,
-			settings: autoCaptionSettings,
-			chapters: chapterProgress,
-			editing: Boolean(captionEditSession),
-			onCommit: onCaptionPositionChange,
-		});
-		const captionFrameWidth = previewFrameRef.current?.clientWidth ?? previewViewportWidth;
-		const captionFrameHeight = previewFrameRef.current?.clientHeight ?? previewViewportWidth * 9 / 16;
-		const captionPosition = captionDrag.offset ?? chapterCaptionSettings(
-			autoCaptionSettings, chapterProgress, captionFrameWidth, captionFrameHeight,
-		);
-		const captionAnchor = captionPosition
-			? getCaptionAnchor(captionPosition, captionFrameWidth, captionFrameHeight, 0)
-			: null;
 		const currentTime = mapTimelineTimeToSourceTime(timelineTime * 1000, clipRegions) / 1000;
 		const isGap = !findPreviewClipAtTimelineTime(timelineTime * 1000, clipRegions);
 		const clipRegionsRef = useRef(clipRegions);
 		const clipPlaybackRef = useRef<ReturnType<typeof createClipPlayback> | null>(null);
+		const captionOverlayRef = useRef<PreviewCaptionOverlayRef | null>(null);
+		const pauseForCaptionEdit = useCallback(() => clipPlaybackRef.current?.pause(), []);
 		const onPlaybackErrorRef = useRef(onError);
 		const timelineTimeRef = useRef(timelineTime);
 		const previewPlaybackRateRef = useRef(previewPlaybackRate);
@@ -497,8 +496,12 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		useEffect(() => {
 			if (!pixiReady || !appRef.current) return;
 			const app = appRef.current;
-			const layers = new VideoLayerCompositor(() => {
-				if (appRef.current === app && !isPlayingRef.current) { shouldSnapPausedFrameRef.current = true; app.render(); }
+			const layers = new VideoLayerCompositor({
+				onPreviewFrame: () => {
+					if (appRef.current !== app || isPlayingRef.current) return;
+					shouldSnapPausedFrameRef.current = true;
+					app.render();
+				},
 			});
 			videoLayersRef.current = layers;
 			app.stage.addChild(layers.container);
@@ -570,7 +573,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		const cursorTelemetryRef = useRef<CursorTelemetryPoint[]>([]);
 		const showCursorRef = useRef(showCursor);
 		const cursorSizeRef = useRef(cursorSize);
-		const cursorStyleRef = useRef(cursorStyle);
 		const cursorSmoothingRef = useRef(cursorSmoothing);
 		const cursorSpringStiffnessMultiplierRef = useRef(cursorSpringStiffnessMultiplier);
 		const cursorSpringDampingMultiplierRef = useRef(cursorSpringDampingMultiplier);
@@ -609,6 +611,19 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 		const initializePixiRenderer = useCallback(
 			async (container: HTMLDivElement): Promise<Application> => {
+				const reused = exportPreviewRenderer?.take();
+				const pending = reused ? undefined : takeStartupPreviewRenderer(videoRef.current);
+				const prepared = reused ?? (pending ? await pending : null);
+				if (prepared) {
+					try {
+						prepared.renderer.resize(container.clientWidth, container.clientHeight);
+						prepared.start();
+						if (!reused) performance.mark("leadcut-early-renderer-adopted");
+						return prepared;
+					} catch {
+						destroyPixiApplication(prepared, "preview renderer resize");
+					}
+				}
 				const backendOrder: PixiPreviewBackend[] = ["webgl", "webgpu"];
 				const attempts: PixiRendererAttempt[] = [];
 
@@ -661,207 +676,9 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 				throw new Error(summarizeRendererAttempts(attempts));
 			},
-			[],
+			[exportPreviewRenderer],
 		);
 
-		const overlayCaptionWidth = overlayRef.current?.clientWidth || 960;
-		const captionLayout = useMemo(() => {
-			if (
-				!autoCaptionSettings?.enabled ||
-				autoCaptions.length === 0 ||
-				typeof document === "undefined"
-			) {
-				return null;
-			}
-
-			const fontSize = getCaptionScaledFontSize(
-				autoCaptionSettings.fontSize,
-				overlayCaptionWidth,
-				autoCaptionSettings.maxWidth,
-			);
-			const maxTextWidthPx = getCaptionTextMaxWidth(
-				overlayCaptionWidth,
-				autoCaptionSettings.maxWidth,
-				fontSize,
-			);
-			const measurementCanvas = document.createElement("canvas");
-			const measurementContext = measurementCanvas.getContext("2d");
-			if (!measurementContext) {
-				return null;
-			}
-
-			measurementContext.font = `${getCaptionFontWeight(autoCaptionSettings)} ${fontSize}px ${getCaptionFontStack(autoCaptionSettings)}`;
-
-			return prepareCaptionLayout({
-				cues: autoCaptions,
-				settings: autoCaptionSettings,
-				maxWidthPx: maxTextWidthPx,
-				measureText: (text) => measurementContext.measureText(text).width,
-			});
-		}, [autoCaptionSettings, autoCaptions, overlayCaptionWidth]);
-		const activeCaptionLayout = useMemo(() => autoCaptionSettings
-			? getActiveCaptionLayout(captionLayout, {
-				cues: autoCaptions,
-				settings: autoCaptionSettings,
-				timeMs: getCaptionTimeMs(autoCaptions, Math.round(currentTime * 1000), Math.round(timelineTime * 1000)),
-			}) : null, [captionLayout, autoCaptions, autoCaptionSettings, currentTime, timelineTime]);
-		const isCaptionEditing = captionEditSession !== null;
-		const captionEditDraft = captionEditSession?.draft ?? "";
-		const captionEditTargetId = captionEditSession?.target.id ?? null;
-		const captionEditTextMetrics = useMemo(() => {
-			if (!captionEditSession || !autoCaptionSettings || typeof document === "undefined") {
-				return null;
-			}
-
-			const overlayWidth = overlayRef.current?.clientWidth || 960;
-			const fontSize = getCaptionScaledFontSize(
-				autoCaptionSettings.fontSize,
-				overlayWidth,
-				autoCaptionSettings.maxWidth,
-			);
-			const maxTextWidthPx = getCaptionTextMaxWidth(
-				overlayWidth,
-				autoCaptionSettings.maxWidth,
-				fontSize,
-			);
-			const measurementCanvas = document.createElement("canvas");
-			const measurementContext = measurementCanvas.getContext("2d");
-			if (!measurementContext) {
-				return null;
-			}
-
-			measurementContext.font = `${getCaptionFontWeight(autoCaptionSettings)} ${fontSize}px ${getCaptionFontStack(autoCaptionSettings)}`;
-			const measuredWidth = Math.max(
-				...captionEditSession.draft
-					.split(/\r?\n/)
-					.map((line) => measurementContext.measureText(line || " ").width),
-			);
-
-			return {
-				fontSize,
-				maxTextWidthPx,
-				widthPx: Math.ceil(
-					Math.min(maxTextWidthPx, Math.max(fontSize * 2, measuredWidth + 2)),
-				),
-			};
-		}, [autoCaptionSettings, captionEditSession]);
-		const captionEditSizeKey = captionEditSession
-			? `${captionEditTextMetrics?.widthPx ?? 0}:${captionEditDraft}`
-			: "";
-
-		const beginCaptionEdit = useCallback(() => {
-			if (!activeCaptionLayout?.editTarget || !onEditAutoCaption) {
-				return;
-			}
-
-			clipPlaybackRef.current?.pause();
-			const nextSession = {
-				target: activeCaptionLayout.editTarget,
-				draft: activeCaptionLayout.editTarget.text,
-			};
-			captionEditSessionRef.current = nextSession;
-			setCaptionEditSession(nextSession);
-		}, [activeCaptionLayout, onEditAutoCaption]);
-
-		const commitCaptionEdit = useCallback(() => {
-			const session = captionEditSessionRef.current;
-			if (!session || !onEditAutoCaption) {
-				captionEditSessionRef.current = null;
-				setCaptionEditSession(null);
-				return;
-			}
-
-			const normalizedDraft = normalizeCaptionEditText(session.draft);
-			captionEditSessionRef.current = null;
-			if (!normalizedDraft) {
-				setCaptionEditSession(null);
-				return;
-			}
-
-			if (normalizedDraft !== normalizeCaptionEditText(session.target.text)) {
-				onEditAutoCaption(session.target, session.draft);
-			}
-			setCaptionEditSession(null);
-		}, [onEditAutoCaption]);
-
-		const cancelCaptionEdit = useCallback(() => {
-			captionEditSessionRef.current = null;
-			setCaptionEditSession(null);
-		}, []);
-
-		useEffect(() => {
-			if (!captionEditTargetId) {
-				return;
-			}
-
-			const frame = requestAnimationFrame(() => {
-				const input = captionEditInputRef.current;
-				if (!input) {
-					return;
-				}
-
-				input.focus();
-				const cursorPosition = input.value.length;
-				input.setSelectionRange(cursorPosition, cursorPosition);
-			});
-
-			return () => cancelAnimationFrame(frame);
-		}, [captionEditTargetId]);
-
-		useEffect(() => {
-			if (!captionEditSizeKey) {
-				return;
-			}
-
-			const frame = requestAnimationFrame(() => {
-				const input = captionEditInputRef.current;
-				if (!input) {
-					return;
-				}
-
-				input.style.height = "auto";
-				input.style.height = `${input.scrollHeight}px`;
-			});
-
-			return () => cancelAnimationFrame(frame);
-		}, [captionEditSizeKey]);
-
-		useEffect(() => {
-			const captionBox = captionBoxRef.current;
-			if (!captionBox || !activeCaptionLayout || !autoCaptionSettings) {
-				if (captionBox) {
-					captionBox.style.clipPath = "";
-					captionBox.style.removeProperty("-webkit-clip-path");
-				}
-				return;
-			}
-
-			const frame = requestAnimationFrame(() => {
-				const width = captionBox.offsetWidth;
-				const height = captionBox.offsetHeight;
-				if (width <= 0 || height <= 0) {
-					return;
-				}
-
-				const fontSize = getCaptionScaledFontSize(
-					autoCaptionSettings.fontSize,
-					overlayRef.current?.clientWidth || 960,
-					autoCaptionSettings.maxWidth,
-				);
-
-				const squirclePath = getSquircleSvgPath({
-					x: 0,
-					y: 0,
-					width,
-					height,
-					radius: getCaptionScaledRadius(autoCaptionSettings.boxRadius, fontSize),
-				});
-				captionBox.style.clipPath = `path('${squirclePath}')`;
-				captionBox.style.setProperty("-webkit-clip-path", `path('${squirclePath}')`);
-			});
-
-			return () => cancelAnimationFrame(frame);
-		}, [activeCaptionLayout, autoCaptionSettings]);
 		const motionBlurStateRef = useRef<MotionBlurState>(createMotionBlurState());
 		const webcamEnabled = webcam?.enabled ?? false;
 		const webcamMargin = webcam?.margin ?? 24;
@@ -1168,11 +985,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			layoutVideoContentRef.current = layoutVideoContent;
 		}, [layoutVideoContent]);
 
-		// Always re-run geometric layout when layout props change, even if frame sprite isn't reloaded.
-		useEffect(() => {
-			layoutVideoContent();
-		}, [layoutVideoContent]);
-
 		const selectedZoom = useMemo(() => {
 			if (!selectedZoomId) return null;
 			return zoomRegions.find((region) => region.id === selectedZoomId) ?? null;
@@ -1195,7 +1007,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			pause: () => {
 				clipPlaybackRef.current?.pause();
 			},
-			cancelCaptionEdit,
+			cancelCaptionEdit: () => captionOverlayRef.current?.cancelEdit(),
 			refreshFrame: async () => {
 				const video = videoRef.current;
 				if (!video || Number.isNaN(video.currentTime)) {
@@ -1505,11 +1317,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 		}, [showCursor, requestPausedFrameRefresh]);
 
 		useEffect(() => {
-			cursorStyleRef.current = cursorStyle;
-			requestPausedFrameRefresh();
-		}, [cursorStyle, requestPausedFrameRefresh]);
-
-		useEffect(() => {
 			cursorSizeRef.current = cursorSize;
 			requestPausedFrameRefresh();
 		}, [cursorSize, requestPausedFrameRefresh]);
@@ -1651,14 +1458,14 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			}
 
 			const observer = new ResizeObserver(() => {
-				layoutVideoContent();
+				layoutVideoContentRef.current?.();
 			});
 
 			observer.observe(container);
 			return () => {
 				observer.disconnect();
 			};
-		}, [pixiReady, videoReady, layoutVideoContent]);
+		}, [pixiReady, videoReady]);
 
 		useEffect(() => {
 			if (!pixiReady || !videoReady) return;
@@ -1815,17 +1622,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			let app: Application | null = null;
 
 			(async () => {
-				let cursorOverlayEnabled = true;
-				try {
-					await preloadCursorAssets();
-				} catch (error) {
-					cursorOverlayEnabled = false;
-					console.warn(
-						"Native cursor assets are unavailable in preview; continuing without cursor overlay.",
-						error,
-					);
-				}
-
 				app = await initializePixiRenderer(container);
 
 				app.ticker.maxFPS = 60;
@@ -1865,38 +1661,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				cursorContainerRef.current = cursorContainer;
 				cameraContainer.addChild(cursorContainer);
 
-				// Cursor overlay - rendered above the masked video so it can sit in front
-				// of the content without getting clipped.
-				if (cursorOverlayEnabled) {
-					const cursorOverlay = new PixiCursorOverlay({
-						dotRadius: DEFAULT_CURSOR_CONFIG.dotRadius * cursorSizeRef.current,
-						minViewportScale: 0,
-						style: cursorStyleRef.current,
-						smoothingFactor: cursorSmoothingRef.current,
-						springTuning: {
-							stiffnessMultiplier: cursorSpringStiffnessMultiplierRef.current,
-							dampingMultiplier: cursorSpringDampingMultiplierRef.current,
-							massMultiplier: cursorSpringMassMultiplierRef.current,
-						},
-						motionBlur: cursorMotionBlurRef.current,
-						clickEffect: cursorClickEffectRef.current,
-						clickEffectColor: cursorClickEffectColorRef.current,
-						clickEffectScale: cursorClickEffectScaleRef.current,
-						clickEffectOpacity: cursorClickEffectOpacityRef.current,
-						clickEffectDurationMs: cursorClickEffectDurationMsRef.current,
-						clickBounce: cursorClickBounceRef.current,
-						clickBounceDuration: cursorClickBounceDurationRef.current,
-						sway: cursorSwayRef.current,
-					});
-					cursorOverlayRef.current = cursorOverlay;
-					cursorOverlay.setFilterResolution(
-						app.renderer.resolution || window.devicePixelRatio || 1,
-					);
-					cursorContainer.addChild(cursorOverlay.container);
-				} else {
-					cursorOverlayRef.current = null;
-				}
-
 				setPixiReady(true);
 			})().catch((error) => {
 				if (!mounted) return;
@@ -1907,6 +1671,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			return () => {
 				mounted = false;
 				setPixiReady(false);
+				setCursorLoadSettled(false);
 				if (cursorOverlayRef.current) {
 					cursorOverlayRef.current.destroy();
 					cursorOverlayRef.current = null;
@@ -1918,7 +1683,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				motionBlurFilterRef.current?.destroy();
 				zoomBlurFilterRef.current = null;
 				motionBlurFilterRef.current = null;
-				destroyPixiApplication(app, "preview renderer");
+				if (!app || !exportPreviewRenderer?.park(app)) destroyPixiApplication(app, "preview renderer");
 				appRef.current = null;
 				cameraContainerRef.current = null;
 				videoEffectsContainerRef.current = null;
@@ -1926,22 +1691,65 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				cursorContainerRef.current = null;
 				videoSpriteRef.current = null;
 			};
-		}, [initializePixiRenderer, onError, syncPreviewMotionBlurQuality]);
+		}, [exportPreviewRenderer, initializePixiRenderer, onError, syncPreviewMotionBlurQuality]);
+
+		const needsCursorOverlay = showCursor && cursorTelemetry.length > 0;
+		const [cursorLoadSettled, setCursorLoadSettled] = useState(false);
+		useEffect(() => {
+			const app = appRef.current;
+			const cursorContainer = cursorContainerRef.current;
+			if (!pixiReady || !needsCursorOverlay || !app || !cursorContainer || cursorLoadSettled) return;
+			let cancelled = false;
+			void preloadCursorAssets(cursorStyle).then(() => {
+				if (cancelled || appRef.current !== app) return;
+				const cursorOverlay = new PixiCursorOverlay({
+					dotRadius: DEFAULT_CURSOR_CONFIG.dotRadius * cursorSizeRef.current,
+					minViewportScale: 0,
+					style: cursorStyle,
+					smoothingFactor: cursorSmoothingRef.current,
+					springTuning: {
+						stiffnessMultiplier: cursorSpringStiffnessMultiplierRef.current,
+						dampingMultiplier: cursorSpringDampingMultiplierRef.current,
+						massMultiplier: cursorSpringMassMultiplierRef.current,
+					},
+					motionBlur: cursorMotionBlurRef.current,
+					clickEffect: cursorClickEffectRef.current,
+					clickEffectColor: cursorClickEffectColorRef.current,
+					clickEffectScale: cursorClickEffectScaleRef.current,
+					clickEffectOpacity: cursorClickEffectOpacityRef.current,
+					clickEffectDurationMs: cursorClickEffectDurationMsRef.current,
+					clickBounce: cursorClickBounceRef.current,
+					clickBounceDuration: cursorClickBounceDurationRef.current,
+					sway: cursorSwayRef.current,
+				});
+				cursorOverlayRef.current = cursorOverlay;
+				cursorOverlay.setFilterResolution(
+					app.renderer.resolution || window.devicePixelRatio || 1,
+				);
+				cursorContainer.addChild(cursorOverlay.container);
+				requestPausedFrameRefresh();
+			}).catch(error => {
+				console.warn("Native cursor assets are unavailable in preview; continuing without cursor overlay.", error);
+			}).finally(() => {
+				if (!cancelled) setCursorLoadSettled(true);
+			});
+			return () => { cancelled = true; };
+		}, [cursorLoadSettled, cursorStyle, needsCursorOverlay, pixiReady, requestPausedFrameRefresh]);
 
 		// biome-ignore lint/correctness/useExhaustiveDependencies: A new media path must reset the persistent video element.
 		useEffect(() => {
 			const video = videoRef.current;
 			if (!video) return;
 			video.pause();
-			video.currentTime = 0;
+			if (video.currentTime !== 0) video.currentTime = 0;
 			lastRenderedContentTimeRef.current = null;
 			shouldSnapPausedFrameRef.current = true;
 			lockedVideoDimensionsRef.current = null;
 		}, [videoPath]);
 
 		useEffect(() => {
-			onPreviewReadyChange?.(videoReady && pixiReady);
-		}, [onPreviewReadyChange, videoReady, pixiReady]);
+			onPreviewReadyChange?.(videoReady && pixiReady && (!needsCursorOverlay || cursorLoadSettled));
+		}, [cursorLoadSettled, needsCursorOverlay, onPreviewReadyChange, videoReady, pixiReady]);
 
 		useEffect(() => {
 			if (!pixiReady || !videoReady) return;
@@ -1964,7 +1772,8 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 				return;
 			if (video.videoWidth === 0 || video.videoHeight === 0) return;
 
-			const source = previewVideoSourceRef.current.getSource();
+			// Chromium can change video colors when WebGPU uploads a YUV frame directly.
+			const source = previewVideoSourceRef.current.getSource(app.renderer.type === RendererType.WEBGPU);
 			const videoTexture = new Texture({ source, dynamic: true });
 
 			const videoSprite = new Sprite(videoTexture);
@@ -2283,7 +2092,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 
 			void (async () => {
 				try {
-					await preloadCursorAssets();
+					await preloadCursorAssets(cursorStyle);
 				} catch (error) {
 					console.warn("Failed to refresh cursor assets for preview:", error);
 					return;
@@ -2321,8 +2130,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			cursorSway,
 		]);
 
-		const handleLoadedMetadata = (e: React.SyntheticEvent<HTMLVideoElement, Event>) => {
-			const video = e.currentTarget;
+		const handleLoadedMetadata = (video: HTMLVideoElement) => {
 			onDurationChange(video.duration);
 
 			const targetTime = clampMediaTimeToDuration(
@@ -2333,6 +2141,22 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			video.pause();
 			currentTimeRef.current = targetTime * 1000;
 		};
+		const handleMediaError = (video: HTMLVideoElement) => {
+			const mediaError = video.error;
+			const code = mediaError?.code;
+			const detail = code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
+				? uiText("formatNotSupported")
+				: code === MediaError.MEDIA_ERR_NETWORK
+					? uiText("networkError")
+					: code === MediaError.MEDIA_ERR_DECODE
+						? uiText("decodeError") : mediaError?.message || `code ${code ?? "unknown"}`;
+			console.error("[VideoPlayback] Video load error:", detail, "src:", videoPath);
+			onError(uiText("failedToLoadVideoValue", { value0: detail }));
+		};
+		mediaHandlers.current = { metadata: handleLoadedMetadata, duration: onDurationChange, error: handleMediaError };
+		useLayoutEffect(() => {
+			if (startupVideo) startupVideo.style.visibility = isGap ? "hidden" : "visible";
+		}, [startupVideo, isGap]);
 
 		const [resolvedWallpaper, setResolvedWallpaper] = useState<string | null>(null);
 		const [resolvedWallpaperKind, setResolvedWallpaperKind] = useState<
@@ -2436,7 +2260,6 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 			backgroundBlur,
 			shadowIntensity: showShadow ? shadowIntensity : 0,
 		});
-		const captionFontFamily = getCaptionFontStack(autoCaptionSettings);
 		// Overscan blurred wallpaper layers so the browser never samples transparent
 		// pixels beyond the preview bounds, which otherwise looks like a vignette.
 		const backgroundBlurOverscan = sceneEffects.backgroundOverscanPx;
@@ -2581,244 +2404,21 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 								</div>
 							</div>
 						) : null}
-						{captionDrag.offset && (
-							<div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10">
-								<div className="absolute inset-y-0 left-1/2 border-l border-dashed border-white/80" />
-								<div className="absolute inset-x-0 bottom-[5%] border-t border-dashed border-white/80" />
-							</div>
-						)}
-						{(!isGap || autoCaptions[0]?.timeBasis === "timeline") && activeCaptionLayout && autoCaptionSettings && captionAnchor ? (
-							<div
-								className="absolute inset-x-0 flex justify-center"
-								style={{
-									zIndex: 2,
-									bottom: captionFrameHeight - captionAnchor.centerY,
-									transform: `translateX(${captionAnchor.centerX - captionFrameWidth / 2}px)`,
-									pointerEvents: "none",
-								}}
-							>
-								<div
-									style={{
-										maxWidth: `${autoCaptionSettings.maxWidth}%`,
-										opacity: activeCaptionLayout.opacity,
-										transform: `translateY(${activeCaptionLayout.translateY}px) scale(${activeCaptionLayout.scale})`,
-										transformOrigin: "center center",
-									}}
-								>
-									<div
-										ref={captionBoxRef}
-										className="focus-visible:outline-2 focus-visible:outline-accent"
-										role={
-											onEditAutoCaption && !isCaptionEditing
-												? "button"
-												: undefined
-										}
-										tabIndex={
-											onEditAutoCaption && !isCaptionEditing ? 0 : undefined
-										}
-										aria-label={
-											onEditAutoCaption && !isCaptionEditing
-												? uiText("editCurrentCaption")
-												: undefined
-										}
-										onClick={(event) => {
-											event.stopPropagation();
-											const id = activeCaptionLayout.cue.id;
-											if (id && !isCaptionEditing && !captionDrag.offset) onSelectAutoCaption?.(id);
-										}}
-										onDoubleClick={(event) => {
-											event.stopPropagation();
-											if (!isCaptionEditing) {
-												beginCaptionEdit();
-											}
-										}}
-										{...captionDrag.pointerHandlers}
-										onKeyDown={(event) => {
-											if (!onEditAutoCaption || isCaptionEditing) {
-												return;
-											}
-
-											if (event.key === "Enter" || event.key === " ") {
-												event.preventDefault();
-												beginCaptionEdit();
-											}
-										}}
-										style={{
-											backgroundColor: `rgba(0, 0, 0, ${autoCaptionSettings.backgroundOpacity})`,
-											fontFamily: captionFontFamily,
-											fontSize: `${getCaptionScaledFontSize(
-												autoCaptionSettings.fontSize,
-												overlayRef.current?.clientWidth || 960,
-												autoCaptionSettings.maxWidth,
-											)}px`,
-											lineHeight: CAPTION_LINE_HEIGHT,
-											textAlign: "center",
-											fontWeight: getCaptionFontWeight(autoCaptionSettings),
-											padding: `${
-												getCaptionPadding(
-													getCaptionScaledFontSize(
-														autoCaptionSettings.fontSize,
-														overlayRef.current?.clientWidth || 960,
-														autoCaptionSettings.maxWidth,
-													),
-												).y
-											}px ${
-												getCaptionPadding(
-													getCaptionScaledFontSize(
-														autoCaptionSettings.fontSize,
-														overlayRef.current?.clientWidth || 960,
-														autoCaptionSettings.maxWidth,
-													),
-												).x
-											}px`,
-											borderRadius: `${getCaptionScaledRadius(
-												autoCaptionSettings.boxRadius,
-												getCaptionScaledFontSize(
-													autoCaptionSettings.fontSize,
-													overlayRef.current?.clientWidth || 960,
-													autoCaptionSettings.maxWidth,
-												),
-											)}px`,
-											boxSizing: "border-box",
-											cursor: onCaptionPositionChange && !isCaptionEditing
-												? captionDrag.offset ? "grabbing" : "grab"
-												: onEditAutoCaption ? "text" : undefined,
-											touchAction: onCaptionPositionChange && !isCaptionEditing ? "none" : undefined,
-											pointerEvents: onEditAutoCaption || onCaptionPositionChange ? "auto" : undefined,
-										}}
-									>
-										{captionEditSession ? (
-											<textarea
-												ref={captionEditInputRef}
-												value={captionEditSession.draft}
-												onChange={(event) => {
-													const draft = event.target.value;
-													setCaptionEditSession((session) => {
-														const nextSession = session
-															? { ...session, draft }
-															: session;
-														captionEditSessionRef.current = nextSession;
-														return nextSession;
-													});
-												}}
-												onBlur={commitCaptionEdit}
-												onClick={(event) => event.stopPropagation()}
-												onKeyDown={(event) => {
-													if (event.key === "Escape") {
-														event.preventDefault();
-														cancelCaptionEdit();
-														return;
-													}
-
-													if (event.key === "Enter" && !event.shiftKey) {
-														event.preventDefault();
-														event.currentTarget.blur();
-													}
-												}}
-												rows={Math.max(
-													1,
-													activeCaptionLayout.visibleLines.length,
-												)}
-												aria-label={uiText("editCurrentCaption")}
-												style={{
-													display: "block",
-													width: `${
-														captionEditTextMetrics?.widthPx ??
-														Math.max(
-															48,
-															activeCaptionLayout.visibleLines.reduce(
-																(width, line) =>
-																	Math.max(width, line.width),
-																0,
-															),
-														)
-													}px`,
-													maxWidth: `${
-														captionEditTextMetrics?.maxTextWidthPx ??
-														getCaptionTextMaxWidth(
-															overlayRef.current?.clientWidth || 960,
-															autoCaptionSettings.maxWidth,
-															getCaptionScaledFontSize(
-																autoCaptionSettings.fontSize,
-																overlayRef.current?.clientWidth ||
-																	960,
-																autoCaptionSettings.maxWidth,
-															),
-														)
-													}px`,
-													minHeight: `${
-														Math.max(
-															1,
-															activeCaptionLayout.visibleLines.length,
-														) *
-														(
-															captionEditTextMetrics?.fontSize ??
-																getCaptionScaledFontSize(
-																	autoCaptionSettings.fontSize,
-																	overlayRef.current
-																		?.clientWidth || 960,
-																	autoCaptionSettings.maxWidth,
-																)
-														) *
-														CAPTION_LINE_HEIGHT
-													}px`,
-													resize: "none",
-													border: "0",
-													outline: "0",
-													padding: "0",
-													margin: "0",
-													overflow: "hidden",
-													background: "transparent",
-													color: autoCaptionSettings.textColor,
-													font: "inherit",
-													lineHeight: "inherit",
-													textAlign: "center",
-												}}
-											/>
-										) : (
-											activeCaptionLayout.visibleLines.map((line) => (
-												<div
-													key={`${activeCaptionLayout.blockKey}-${line.startWordIndex}`}
-													style={{
-														display: "flex",
-														justifyContent: "center",
-														flexWrap: "nowrap",
-														whiteSpace: "nowrap",
-													}}
-												>
-													{line.words.map((word) => {
-														const visualState =
-															getCaptionWordVisualState(
-																activeCaptionLayout.hasWordTimings,
-																word.state,
-															);
-
-														return (
-															<span
-																key={`${activeCaptionLayout.blockKey}-${word.index}`}
-																style={{
-																	display: "inline-block",
-																	whiteSpace: "pre",
-																	color: visualState.isInactive
-																		? autoCaptionSettings.inactiveTextColor
-																		: autoCaptionSettings.textColor,
-																opacity: visualState.opacity,
-																...getCaptionPreviewTextStyle(autoCaptionSettings, getCaptionScaledFontSize(
-																	autoCaptionSettings.fontSize, overlayRef.current?.clientWidth || 960, autoCaptionSettings.maxWidth,
-																)),
-																}}
-															>
-																{`${word.leadingSpace ? " " : ""}${word.text}`}
-															</span>
-														);
-													})}
-												</div>
-											))
-										)}
-									</div>
-								</div>
-							</div>
-						) : null}
+						<PreviewCaptionOverlay
+							ref={captionOverlayRef}
+							previewFrameRef={previewFrameRef}
+							autoCaptions={autoCaptions}
+							settings={autoCaptionSettings}
+							fontSizeDraft={captionFontSizeDraft}
+							chapterProgress={chapterProgress}
+							currentTime={currentTime}
+							timelineTime={timelineTime}
+							isGap={isGap}
+							onPause={pauseForCaptionEdit}
+							onEditAutoCaption={onEditAutoCaption}
+							onSelectAutoCaption={onSelectAutoCaption}
+							onCaptionPositionChange={onCaptionPositionChange}
+						/>
 						<div
 							className="absolute inset-0"
 							style={{
@@ -2917,7 +2517,7 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					onMove={isPlaying ? undefined : onKeystrokePositionChange} />}
 				{/* Keep source media in its original document. Adopting it into the floating
 					window resets Chromium's decoder and readiness even if React retains the node. */}
-				{createPortal(<video
+				{!startupVideo && createPortal(<video
 					ref={attachVideo}
 					// The media server uses a separate origin; keep captured frames safe for WebGL.
 					crossOrigin="anonymous"
@@ -2927,30 +2527,11 @@ const VideoPlayback = forwardRef<VideoPlaybackRef, VideoPlaybackProps>(
 					preload="auto"
 					playsInline
 					aria-hidden="true"
-					onLoadedMetadata={handleLoadedMetadata}
+					onLoadedMetadata={(event) => handleLoadedMetadata(event.currentTarget)}
 					onDurationChange={(e) => {
 						onDurationChange(e.currentTarget.duration);
 					}}
-					onError={(e) => {
-						const mediaError = e.currentTarget.error;
-						const code = mediaError?.code;
-						const msg = mediaError?.message;
-						const detail =
-							code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
-								? uiText("formatNotSupported")
-								: code === MediaError.MEDIA_ERR_NETWORK
-									? uiText("networkError")
-									: code === MediaError.MEDIA_ERR_DECODE
-										? uiText("decodeError")
-										: msg || `code ${code ?? "unknown"}`;
-						console.error(
-							"[VideoPlayback] Video load error:",
-							detail,
-							"src:",
-							videoPath,
-						);
-						onError(uiText("failedToLoadVideoValue", { value0: detail }));
-					}}
+					onError={(event) => handleMediaError(event.currentTarget)}
 				/>, document.body)}
 			</div>
 		);

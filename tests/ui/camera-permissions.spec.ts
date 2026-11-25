@@ -22,6 +22,9 @@ test("editor mode never opens the camera and releases an active recorder preview
 		};
 		window.addEventListener("test-leave-editor", () => visible?.(false));
 		window.addEventListener("test-enter-editor", () => visible?.(true));
+		Object.defineProperty(navigator.mediaDevices, "enumerateDevices", {
+			value: async () => [{ kind: "videoinput", deviceId: "built-in-camera", label: "", groupId: "camera" }],
+		});
 		let requests = 0;
 		Object.defineProperty(navigator.mediaDevices, "getUserMedia", {
 			value: async () => {

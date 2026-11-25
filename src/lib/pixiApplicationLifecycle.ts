@@ -7,6 +7,7 @@ const initializationStates = new WeakMap<Application, PixiInitializationState>()
 const destroyRequests = new WeakSet<Application>();
 const destroyContexts = new WeakMap<Application, string>();
 const completedCleanups = new WeakSet<Application>();
+const borrowedGpuDevices = new WeakSet<Application>();
 
 const RENDERER_DESTROY_OPTIONS = {
 	removeView: true,
@@ -18,6 +19,11 @@ const STAGE_DESTROY_OPTIONS = {
 	texture: false,
 	textureSource: false,
 } as const;
+
+export function getPixiRendererBackend(app: Application): "webgl" | "webgpu" | undefined {
+	const name = app.renderer.name;
+	if (name === "webgl" || name === "webgpu") return name;
+}
 
 function reportCleanupError(app: Application, error: unknown): void {
 	const context = destroyContexts.get(app) ?? "Pixi application";
@@ -44,15 +50,31 @@ function completeDestroy(app: Application): void {
 	if (completedCleanups.has(app)) return;
 	completedCleanups.add(app);
 
-	if (initializationStates.get(app) !== "initialized") {
-		destroyFailedApplication(app);
-		return;
-	}
-
+	// Pixi drops its device reference during teardown. Explicitly release a device
+	// created for this application so repeated exports do not wait for garbage collection.
+	const renderer = app.renderer;
+	const webgpu = renderer && "gpu" in renderer ? renderer : undefined;
+	const canvas = webgpu?.canvas as HTMLCanvasElement | undefined;
+	const device = !borrowedGpuDevices.has(app) ? webgpu?.gpu?.device : undefined;
 	try {
-		app.destroy(RENDERER_DESTROY_OPTIONS, STAGE_DESTROY_OPTIONS);
+		if (initializationStates.get(app) === "initialized") {
+			app.destroy(RENDERER_DESTROY_OPTIONS, STAGE_DESTROY_OPTIONS);
+		} else {
+			destroyFailedApplication(app);
+		}
 	} catch (error) {
 		reportCleanupError(app, error);
+	} finally {
+		try {
+			try {
+				// Pixi destroys the view texture without destroying its canvas source.
+				canvas?.getContext("webgpu")?.unconfigure();
+			} finally {
+				device?.destroy();
+			}
+		} catch (error) {
+			reportCleanupError(app, error);
+		}
 	}
 }
 
@@ -65,6 +87,7 @@ export async function initializePixiApplication(
 	}
 
 	initializationStates.set(app, "initializing");
+	if (options && "gpu" in options && options.gpu) borrowedGpuDevices.add(app);
 	try {
 		await app.init(options);
 		initializationStates.set(app, "initialized");

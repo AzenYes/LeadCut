@@ -99,6 +99,25 @@ describe("Pixi application lifecycle", () => {
 		expect(app.destroy).toHaveBeenCalledTimes(1);
 	});
 
+	it.each([false, true])("releases the GPU device only when it owns it (borrowed=%s)", async borrowed => {
+		const app = createApplication();
+		const device = { destroy: vi.fn() };
+		const gpu = { device };
+		const context = { unconfigure: vi.fn() };
+		const canvas = { getContext: vi.fn(() => context) };
+		Object.assign(app.renderer, { gpu, canvas });
+
+		await initializePixiApplication(app, borrowed ? { gpu } as never : {});
+		destroyPixiApplication(app, "GPU export");
+		destroyPixiApplication(app, "GPU export");
+
+		expect(app.destroy).toHaveBeenCalledOnce();
+		expect(canvas.getContext).toHaveBeenCalledWith("webgpu");
+		expect(context.unconfigure).toHaveBeenCalledOnce();
+		expect(device.destroy).toHaveBeenCalledTimes(borrowed ? 0 : 1);
+		if (!borrowed) expect(context.unconfigure).toHaveBeenCalledBefore(device.destroy);
+	});
+
 	it("reports cleanup errors without throwing or retrying unsafe teardown", async () => {
 		const app = createApplication();
 		const cleanupError = new Error("renderer cleanup failed");

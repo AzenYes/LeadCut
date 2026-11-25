@@ -110,15 +110,20 @@ test("populated project and preset popovers fit long names and dismiss outside",
 	test.setTimeout(60000);
 	await installDesktopBridge(page);
 	await page.goto("/?windowType=editor");
-	await expect(page.getByRole("button", { name: "Home", exact: true })).toBeVisible();
+	const home = page.getByRole("banner").getByRole("button", { name: "Home", exact: true });
+	await expect(home).toBeVisible();
 	await page.evaluate(() => {
-		window.electronAPI.openProjectFileAtPath = async path => ({
-			success: true, path, project: {
-				version: 2, projectId: "restored-popovers",
-				videoPath: `${location.origin}/tests/ui/fixtures/preview.mp4`,
-				editor: { clipRegions: [{ id: "screen", startMs: 0, endMs: 6000, sourceStartMs: 0, speed: 1 }] },
-			},
-		});
+		let selectedPath: string | null = null;
+		window.electronAPI.openProjectFileAtPath = async path => {
+			selectedPath = path;
+			return {
+				success: true, path, project: {
+					version: 2, projectId: "restored-popovers",
+					videoPath: `${location.origin}/tests/ui/fixtures/preview.mp4`,
+					editor: { clipRegions: [{ id: "screen", startMs: 0, endMs: 6000, sourceStartMs: 0, speed: 1 }] },
+				},
+			};
+		};
 		window.electronAPI.listProjectFiles = async () => ({
 			success: true,
 			projects: [],
@@ -127,13 +132,17 @@ test("populated project and preset popovers fit long names and dismiss outside",
 				name: `A very long project name with many words ${i}`,
 				updatedAt: Date.now(),
 				thumbnailPath: null,
-				isCurrent: i === 0,
+				isCurrent: selectedPath === `/projects/${i}.leadcut`,
 				isInProjectsDirectory: true,
 			})),
 		});
 	});
-	await page.getByRole("button", { name: "Home", exact: true }).click();
+	await home.click();
 	const projects = page.getByRole("dialog", { name: "Projects dashboard", exact: true });
+	await projects.getByRole("button", { name: "A very long project name with many words 0", exact: true }).click();
+	await expect(page.locator('[data-region-id="screen"]')).toBeVisible();
+	await expect(projects).toHaveCount(0);
+	await home.click();
 	await expect(projects.getByRole("button", { name: /^A very long project name with many words \d$/ })).toHaveCount(5);
 	await expectButtonsFit(projects);
 	await page.screenshot({
@@ -142,6 +151,7 @@ test("populated project and preset popovers fit long names and dismiss outside",
 	});
 	await page.keyboard.press("Escape");
 	await expect(projects).toHaveCount(0);
+	await expect(page.locator('[data-region-id="screen"]')).toBeVisible();
 	await page.getByRole("button", { name: "Open presets", exact: true }).click();
 	const presets = page.getByRole("dialog", { name: "Presets", exact: true });
 	await presets

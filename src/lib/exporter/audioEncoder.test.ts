@@ -53,6 +53,83 @@ function fakeAudioBuffer(channels: Float32Array[]): AudioBuffer {
 }
 
 describe("AudioProcessor offline render preparation", () => {
+	it.each([true, false])("requests exact source frames and accepts a short decoded tail with a shared reader set to %s", async sharedReader => {
+		const processor = new AudioProcessor(true) as unknown as {
+			loadOfflineAudioInput(url: string): Promise<import("./audioProcessorShared").OfflineAudioInput>;
+			releaseOfflineAudioSources(): Promise<void>;
+		};
+		const stage = vi.fn().mockResolvedValue({
+			memoryWindows: true, frames: 313, channels: 1, sampleRate: 10, sourceDurationSec: 31.3,
+		});
+		const read = vi.fn().mockResolvedValue(Uint8Array.of(0, 64, 0, 128));
+		const fetchRange = vi.fn();
+		const open = vi.fn().mockResolvedValue("shared-reader");
+		const close = vi.fn().mockResolvedValue(undefined);
+		vi.stubGlobal("window", { electronAPI: {
+			prepareExportAudioPcm: stage, readExportAudioPcmWindow: read,
+			...(sharedReader ? { openExportAudioPcmReader: open, closeExportAudioPcmReader: close } : {}),
+		} });
+		vi.stubGlobal("fetch", fetchRange);
+		try {
+			const input = await processor.loadOfflineAudioInput("file:///tmp/source.mp4");
+			if (!("readWindow" in input)) throw new Error("Expected an audio window reader");
+			const data = new Float32Array(2);
+			const buffer = { getChannelData: () => data } as unknown as AudioBuffer;
+			const context = { createBuffer: vi.fn().mockReturnValue(buffer) } as unknown as BaseAudioContext;
+			const tail = await input.readWindow(context, 31.25, 0.15, 0.1);
+			expect(stage.mock.calls[0].slice(1)).toEqual([undefined, true]);
+			expect(read.mock.calls[0][1]).toEqual({ firstFrame: 311, endFrame: 315, channels: 1, sampleRate: 10 });
+			expect(read.mock.calls[0][2]).toBe(sharedReader ? "shared-reader" : undefined);
+			expect(fetchRange).not.toHaveBeenCalled();
+			expect(tail.offsetSec).toBeCloseTo(0.15);
+			expect([...data]).toEqual([0.5, -1]);
+		} finally {
+			await processor.releaseOfflineAudioSources();
+			vi.unstubAllGlobals();
+		}
+		if (sharedReader) {
+			expect(open).toHaveBeenCalledTimes(1);
+			expect(close).toHaveBeenCalledExactlyOnceWith("shared-reader");
+		}
+	});
+
+	it.each(["file", "memory"])("reads compact PCM from %s while retaining absolute source timing", async location => {
+		const processor = new AudioProcessor() as unknown as {
+			loadOfflineAudioInput(url: string): Promise<import("./audioProcessorShared").OfflineAudioInput>;
+		};
+		const samples = new ArrayBuffer(4);
+		new DataView(samples).setInt16(0, 16_384, true);
+		const pcm = new Uint8Array(200);
+		pcm.set(new Uint8Array(samples), 24);
+		const stage = vi.fn().mockResolvedValue({
+			...(location === "file" ? { path: "audio.pcm", url: "http://localhost/audio.pcm" } : { pcm }),
+			frames: 100, channels: 1, sampleRate: 10, firstFrame: 300, sourceDurationSec: 600,
+		});
+		const fetchRange = vi.fn().mockResolvedValue(new Response(samples, { status: 206 }));
+		vi.stubGlobal("window", { electronAPI: { prepareExportAudioPcm: stage } });
+		vi.stubGlobal("fetch", fetchRange);
+		try {
+			const input = await processor.loadOfflineAudioInput("file:///tmp/source.mp4");
+			expect(input.duration).toBe(600);
+			if (!("readWindow" in input)) throw new Error("Expected a staged PCM source");
+			const data = new Float32Array(2);
+			const buffer = { getChannelData: () => data } as unknown as AudioBuffer;
+			const context = { createBuffer: vi.fn().mockReturnValue(buffer) } as unknown as BaseAudioContext;
+			const window = await input.readWindow(context, 31.25, 0.1);
+			if (location === "file") {
+				expect(fetchRange).toHaveBeenCalledWith("http://localhost/audio.pcm", expect.objectContaining({
+					headers: { Range: "bytes=24-27" },
+				}));
+			} else {
+				expect(fetchRange).not.toHaveBeenCalled();
+			}
+			expect(window.offsetSec).toBeCloseTo(0.05);
+			expect([...data]).toEqual([0.5, 0]);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	it("renders a single full-length clip when only its per-clip audio settings changed", async () => {
 		const processor = new AudioProcessor();
 		const render = vi.spyOn(processor as unknown as OfflineRenderTestHarness, "renderAndMuxOfflineAudio").mockResolvedValue();

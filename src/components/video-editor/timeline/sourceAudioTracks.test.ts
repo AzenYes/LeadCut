@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { AudioPeaksData } from "./core/timelineTypes";
 import {
-	buildSourceSidecarPathCandidates,
 	buildTimelineSourceAudioTracks,
 	getSourceSidecarWaveformStartDelayMs,
+	getSourceSidecarWaveformPaths,
 } from "./sourceAudioTracks";
 
 function peaks(id: number): AudioPeaksData {
@@ -38,12 +38,12 @@ describe("timeline source audio tracks", () => {
 		})).toEqual([{ id: "mic", label: "Source Mic", peaks: mic, startDelayMs: 1140 }]);
 	});
 
-	it("builds candidates for Windows and macOS sidecar containers", () => {
-		expect(buildSourceSidecarPathCandidates("C:\\Recordly\\recording-1.mp4", "mic")).toEqual([
-			"C:/Recordly/recording-1.mic.wav",
-			"C:/Recordly/recording-1.mic.m4a",
-			"C:/Recordly/recording-1.mic.webm",
-		]);
+	it("selects only discovered paths for the requested track in container fallback order", () => {
+		const wave = "C:/Recordly/recording-1.mic.wav";
+		const webm = "C:/Recordly/recording-1.mic.webm";
+		const audio = [webm, "C:/Recordly/recording-1.system.m4a", wave];
+		expect(getSourceSidecarWaveformPaths(audio, "mic")).toEqual([wave, webm]);
+		expect(getSourceSidecarWaveformPaths([], "system")).toEqual([]);
 	});
 
 	it("keeps embedded system audio controllable when mic is a sidecar", () => {

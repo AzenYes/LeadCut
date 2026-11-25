@@ -5,6 +5,7 @@ export class PreviewVideoSource {
 	private video: HTMLVideoElement | null = null;
 	private source: ImageSource | null = null;
 	private retainedFrame: VideoFrame | null = null;
+	private useCanvasUpload = false;
 	private canRetainVideoFrame = true;
 	private canvas: HTMLCanvasElement | null = null;
 	private context: CanvasRenderingContext2D | null = null;
@@ -30,7 +31,7 @@ export class PreviewVideoSource {
 
 		// Retain the decoded picture even after the media element starts seeking.
 		// Pixi can upload this directly without rasterizing every 4K frame into a canvas.
-		if (this.canRetainVideoFrame && typeof VideoFrame === "function") {
+		if (!this.useCanvasUpload && this.canRetainVideoFrame && typeof VideoFrame === "function") {
 			let frame: VideoFrame | undefined;
 			try {
 				frame = new VideoFrame(video, {
@@ -116,8 +117,9 @@ export class PreviewVideoSource {
 		}
 	}
 
-	getSource(): ImageSource {
+	getSource(useCanvasUpload = false): ImageSource {
 		if (!this.video) throw new Error("Preview video element is not attached");
+		this.useCanvasUpload = useCanvasUpload;
 		if (!this.source) {
 			this.canvas = DOMAdapter.get().createCanvas(1, 1) as HTMLCanvasElement;
 			this.context = this.canvas.getContext("2d", { alpha: false });

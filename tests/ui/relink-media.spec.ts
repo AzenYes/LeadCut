@@ -1,6 +1,27 @@
 import { expect, test } from "@playwright/test";
 import { installDesktopBridge, installDesktopBridgeOverrides } from "./bridge";
 
+test("canceling a startup relink loads the project dashboard", async ({ page }) => {
+	await installDesktopBridge(page);
+	await installDesktopBridgeOverrides(page, () => {
+		window.electronAPI.loadCurrentProjectFile = async () => ({
+			success: false, startupOpen: true, code: "media-missing", path: "/projects/missing.leadcut",
+			revision: "missing", missing: [{ kind: "video", path: "/old/capture.mp4" }],
+		});
+		window.electronAPI.listProjectFiles = async () => ({
+			success: true, projects: [], entries: [{
+				path: "/projects/other.leadcut", name: "Other project", updatedAt: 1,
+				thumbnailPath: null, isCurrent: false, isInProjectsDirectory: true,
+			}],
+		});
+	});
+	await page.goto("/?windowType=editor");
+	const relink = page.getByRole("dialog", { name: "Missing project media" });
+	await relink.getByRole("button", { name: "Cancel", exact: true }).click({ timeout: 20_000 });
+	const dashboard = page.getByRole("dialog", { name: "Projects dashboard" });
+	await expect(dashboard.getByRole("button", { name: "Other project", exact: true })).toBeVisible();
+});
+
 test("relinks a required recording and explicitly removes a missing optional camera", async ({ page }) => {
 	test.setTimeout(90000);
 	await installDesktopBridge(page, "filmstrip.mp4");

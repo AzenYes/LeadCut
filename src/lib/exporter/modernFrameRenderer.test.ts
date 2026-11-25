@@ -32,11 +32,12 @@ vi.mock("pixi.js", () => ({
 		destroy = vi.fn(() => {
 			throw new TypeError("this._cancelResize is not a function");
 		});
-		init = vi.fn(async () => {
+		init = vi.fn(async (options: { preference: "webgpu" | "webgl" }) => {
 			const error = pixiInitializationErrorsMock.shift();
 			if (error) throw error;
+			this.renderer.name = options.preference;
 		});
-		renderer = { destroy: vi.fn() };
+		renderer = { name: "webgl", destroy: vi.fn() };
 		stage = { destroy: vi.fn() };
 
 		constructor() {
@@ -51,6 +52,15 @@ vi.mock("pixi.js", () => ({
 		removeChildren = vi.fn();
 	},
 	Graphics: class {},
+	NineSliceSprite: class {
+		texture: { destroy: ReturnType<typeof vi.fn> };
+		position = { set: vi.fn() };
+		destroy = vi.fn();
+
+		constructor(public options: { texture: { destroy: ReturnType<typeof vi.fn> } }) {
+			this.texture = options.texture;
+		}
+	},
 	Sprite: class {
 		visible = true;
 		x = 0;
@@ -59,6 +69,7 @@ vi.mock("pixi.js", () => ({
 		scale = { x: 1, y: 1, set: vi.fn() };
 		anchor = { x: 0.5, y: 0.5, set: vi.fn() };
 		position = { set: vi.fn() };
+		destroy = vi.fn();
 		texture: { destroy: ReturnType<typeof vi.fn> };
 
 		constructor(texture = { destroy: vi.fn() }) {
@@ -132,11 +143,17 @@ vi.mock("./annotationRenderer", () => ({
 }));
 
 import { renderAnnotations } from "./annotationRenderer";
+import { Texture } from "pixi.js";
 import { FrameRenderer } from "./modernFrameRenderer";
 
 function createMockContext() {
 	return {
 		clearRect: vi.fn(),
+		beginPath: vi.fn(),
+		moveTo: vi.fn(),
+		lineTo: vi.fn(),
+		closePath: vi.fn(),
+		fill: vi.fn(),
 		drawImage: vi.fn(),
 		fillRect: vi.fn(),
 		save: vi.fn(),
@@ -246,6 +263,28 @@ it("renders imported captions over a gap using sequence time instead of the sour
 });
 
 describe("ModernFrameRenderer Pixi lifecycle", () => {
+	it.each([
+		{ name: "filtered 4K scene", overrides: {}, antialias: false },
+		{ name: "smaller output", overrides: { width: 1920, height: 1080 }, antialias: true },
+		{ name: "unfiltered video", overrides: { zoomMotionBlur: 0 }, antialias: true },
+		{ name: "camera", overrides: { webcam: { enabled: true } }, antialias: true },
+		{ name: "separate video layer", overrides: { videoRegions: [{ id: "overlay" }] }, antialias: true },
+		{ name: "cursor", overrides: { showCursor: true, cursorTelemetry: [{}] }, antialias: true },
+		{ name: "chapters", overrides: { chapterProgress: { enabled: true } }, antialias: true },
+		{ name: "keystrokes", overrides: { keystrokes: { items: [{}] } }, antialias: true },
+		{ name: "static GPU overlays", overrides: { useGpuFramePipeline: true, webcam: { enabled: true }, chapterProgress: { enabled: true }, keystrokes: { items: [{}] }, videoRegions: [{ trackId: "camera" }], videoTracks: [{ id: "camera", kind: "webcam" }] }, antialias: false },
+		{ name: "GPU annotations", overrides: { useGpuFramePipeline: true, webcam: { enabled: true }, annotationRegions: [{ type: "blur" }] }, antialias: true },
+		{ name: "GPU camera with zoom", overrides: { useGpuFramePipeline: true, webcam: { enabled: true, reactToZoom: true }, zoomRegions: [{ id: "zoom" }] }, antialias: false },
+		{ name: "GPU camera with a graphics mask", overrides: { useGpuFramePipeline: true, webcam: { enabled: true, reactToZoom: true }, webcamUrl: "/camera.mp4", zoomRegions: [{ id: "zoom" }] }, antialias: true },
+		{ name: "GPU camera with zoom and captions", overrides: { useGpuFramePipeline: true, webcam: { enabled: true, reactToZoom: true }, zoomRegions: [{ id: "zoom" }], autoCaptions: [{}] }, antialias: true },
+		{ name: "GPU camera with rounded main video", overrides: { useGpuFramePipeline: true, webcam: { enabled: true }, borderRadius: 8 }, antialias: true },
+		{ name: "GPU B-roll", overrides: { useGpuFramePipeline: true, videoRegions: [{ kind: "video" }] }, antialias: true },
+	])("chooses output multisampling for $name", ({ overrides, antialias }) => {
+		const renderer = createRenderer() as any;
+		Object.assign(renderer.config, { width: 3840, height: 2160, zoomMotionBlur: 1, annotationRegions: [] }, overrides);
+		expect(renderer.shouldAntialiasWebGpuOutput()).toBe(antialias);
+	});
+
 	it("continues to the next backend when failed-init cleanup would throw", async () => {
 		pixiApplicationInstancesMock.length = 0;
 		pixiInitializationErrorsMock.length = 0;
@@ -334,6 +373,58 @@ describe("ModernFrameRenderer blur export path", () => {
 		expect(renderer.capturePixelsForNativeExport()).not.toBeNull();
 	});
 
+	it.each([
+		{ wallpaper: "#Fa3", blur: 0, textureWidth: 1, textureHeight: 1, edge: 0 },
+		{ wallpaper: "#26344a", blur: 4, textureWidth: 77, textureHeight: 77, edge: 38 },
+		{ wallpaper: "#Fa38", blur: 4, textureWidth: 1920, textureHeight: 1080, edge: 0 },
+	])("retains the correct export background dimensions and releases its texture ($wallpaper, $blur)", async ({
+		wallpaper, blur, textureWidth, textureHeight, edge,
+	}) => {
+		const renderer = createRenderer() as any;
+		renderer.config.wallpaper = wallpaper;
+		renderer.config.backgroundBlur = blur;
+		const addChild = vi.fn();
+		renderer.backgroundContainer = { addChild, removeChildren: vi.fn() };
+
+		await renderer.setupBackground();
+
+		expect(Texture.from).toHaveBeenLastCalledWith(expect.objectContaining({
+			width: textureWidth, height: textureHeight,
+		}));
+		const background = addChild.mock.calls[0][0];
+		if (edge) {
+			expect(background.options).toMatchObject({
+				width: 1920,
+				height: 1080,
+				leftWidth: edge,
+				rightWidth: edge,
+				topHeight: edge,
+				bottomHeight: edge,
+			});
+		}
+		renderer.resetBackgroundLayer();
+		expect(background.destroy).toHaveBeenCalledOnce();
+		expect(background.texture.destroy).toHaveBeenCalledExactlyOnceWith(true);
+	});
+
+	it("keeps shadow corners and offsets when stretching the center", () => {
+		const renderer = createRenderer() as any;
+		const [layer] = renderer.createShadowLayers({ addChild: vi.fn() }, [
+			{ offsetScale: 0, alphaScale: 0, blurScale: 0 },
+		]);
+		renderer.rasterizeShadowLayer(layer, {
+			x: 120.3, y: 60.4, width: 601.4, height: 500.6, radius: 40,
+			offsetY: 5.25, alpha: 0.5, blur: 10,
+		});
+
+		expect(layer.canvas).toMatchObject({ width: 197, height: 198 });
+		expect(layer.sprite).toMatchObject({
+			width: 654, height: 553, leftWidth: 98, rightWidth: 98, topHeight: 104, bottomHeight: 93,
+		});
+		expect(layer.sprite.position.set).toHaveBeenCalledWith(94.3, 34.4);
+		expect(layer.context.moveTo).toHaveBeenCalledWith(66, 31.25);
+	});
+
 	it("prefers decoder-backed sync for video wallpapers during export", async () => {
 		vi.clearAllMocks();
 		const renderer = new FrameRenderer({
@@ -402,6 +493,72 @@ describe("ModernFrameRenderer blur export path", () => {
 });
 
 describe("ModernFrameRenderer webcam frame cache", () => {
+	it.each([false, true])("uploads a held webcam frame once with crop enabled %s", async (cropped) => {
+		const renderer = createRenderer() as any;
+		if (cropped) {
+			renderer.config.webcam.cropRegion = { x: 0.1, y: 0.2, width: 0.7, height: 0.6 };
+		}
+		class MockVideoFrame {
+			displayWidth = 640;
+			displayHeight = 360;
+			close = vi.fn();
+		}
+		const previousVideoFrame = globalThis.VideoFrame;
+		Object.assign(globalThis, { VideoFrame: MockVideoFrame });
+		const first = new MockVideoFrame();
+		const second = new MockVideoFrame();
+		const getFrameAtTime = vi
+			.fn()
+			.mockResolvedValueOnce(first)
+			.mockResolvedValueOnce(first)
+			.mockResolvedValueOnce(cropped ? null : second)
+			.mockResolvedValueOnce(second);
+		renderer.webcamForwardFrameSource = { getFrameAtTime };
+		renderer.webcamContainer = { addChildAt: vi.fn() };
+		renderer.webcamRootContainer = { visible: false };
+		const renderWebcam = () => {
+			const frame = renderer.webcamDecodedFrame;
+			const { source, width, height } = renderer.resolveRenderableWebcamSource(
+				frame,
+				640,
+				360,
+				!!frame,
+			);
+			renderer.ensureWebcamSprite(source, width, height);
+		};
+
+		try {
+			await renderer.syncWebcamFrame(0);
+			renderWebcam();
+			const ctx = cropped ? renderer.webcamFrameCacheCtx : renderer.webcamVideoFrameStagingCtx;
+			const { update } = renderer.webcamTextureSource;
+			renderer.webcamRootContainer.visible = false;
+			await renderer.syncWebcamFrame(1 / 60);
+			renderWebcam();
+			expect(getFrameAtTime).toHaveBeenNthCalledWith(2, 1 / 60, first);
+			expect(renderer.lastSyncedWebcamTime).toBe(1 / 60);
+			expect(renderer.webcamRootContainer.visible).toBe(true);
+			expect(first.close).not.toHaveBeenCalled();
+			expect(ctx.drawImage).toHaveBeenCalledTimes(1);
+			expect(update).not.toHaveBeenCalled();
+			await renderer.syncWebcamFrame(2 / 60);
+			renderWebcam();
+			if (cropped) {
+				expect(renderer.webcamRenderMode).toBe("cached");
+				expect(ctx.drawImage).toHaveBeenCalledTimes(1);
+				expect(update).not.toHaveBeenCalled();
+				await renderer.syncWebcamFrame(3 / 60);
+				renderWebcam();
+				expect(renderer.webcamRenderMode).toBe("live");
+			}
+			expect(first.close).toHaveBeenCalledOnce();
+			expect(ctx.drawImage).toHaveBeenCalledTimes(2);
+			expect(update).toHaveBeenCalledOnce();
+		} finally {
+			Object.assign(globalThis, { VideoFrame: previousVideoFrame });
+		}
+	});
+
 	it("stages webcam video frames on WebGPU instead of using retained frame uploads", () => {
 		const renderer = createRenderer() as any;
 		renderer.rendererBackend = "webgpu";
@@ -832,6 +989,16 @@ describe("ModernFrameRenderer webcam export fallback", () => {
 });
 
 describe("ModernFrameRenderer frame sequencing", () => {
+	it("lays out an uncropped rectangle without an allocated video mask", () => {
+		const renderer = createRenderer() as any;
+		renderer.app = {};
+		renderer.videoSprite = { scale: { set: vi.fn() }, position: { set: vi.fn() } };
+		renderer.updateLayout();
+		expect(renderer.videoMaskGraphics).toBeNull();
+		expect(renderer.videoSprite.scale.set).toHaveBeenCalledWith(1);
+		expect(renderer.layoutCache.maskRect).toMatchObject({ x: 0, y: 0, width: 1920, height: 1080 });
+	});
+
 	it("resumes visual layers after a background gap", async () => {
 		const renderer = createRenderer();
 		const sceneCanvas = createMockCanvas();

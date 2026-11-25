@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAudioPreviewSync } from "./useAudioPreviewSync";
+import { createPlaybackClock } from "../videoPlayback/playbackClock";
 import { resolveMediaElementSource } from "@/lib/exporter/localMediaSource";
 
 const harness = vi.hoisted(() => ({
@@ -38,9 +39,10 @@ it("finishes an authored audio load when source discovery rerenders the same tra
 	vi.mocked(resolveMediaElementSource).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
 	const input = {
 		audioRegions: [{ id: "showcase", audioPath: "/showcase.m4a", startMs: 9650, endMs: 142027, volume: 1 }],
-		previewVolume: 1, isPlaying: false, currentTime: 0, timelineTime: 0, duration: 1400,
-		sourcePlaybackRate: 1, previewSourceAudioFallbackPaths: [] as string[], sourceAudioFallbackStartDelayMsByPath: {},
-		sourceAudioResourceVersion: 0, isCurrentClipMuted: false, getSourceTrackPreviewGain: () => 1, onSourceFallbackLoadError: vi.fn(),
+		previewVolume: 1, isPlaying: false, playbackClock: createPlaybackClock(), duration: 1400,
+		getSourcePlayback: () => ({ activeClipId: null, currentSourceTimeMs: 0, sourcePlaybackRate: 1, isCurrentClipMuted: false }),
+		previewSourceAudioFallbackPaths: [] as string[], sourceAudioFallbackStartDelayMsByPath: {},
+		sourceAudioResourceVersion: 0, getSourceTrackPreviewGain: () => 1, onSourceFallbackLoadError: vi.fn(),
 	};
 	useAudioPreviewSync(input);
 	const cleanup = harness.effects[0]();
@@ -181,18 +183,18 @@ describe("source preview playback ownership", () => {
 		);
 		// Execute mocked effects explicitly so the asynchronous load can finish between syncs.
 		const sourcePath = `/audio.${kind}.wav`;
+		const playbackClock = createPlaybackClock();
+		playbackClock.setTime(time);
 		useAudioPreviewSync({
 			audioRegions: [],
 			previewVolume: 1,
 			isPlaying: playing,
-			currentTime: time,
-			timelineTime: time,
+			playbackClock,
+			getSourcePlayback: (seconds) => ({ activeClipId: null, currentSourceTimeMs: seconds * 1000, sourcePlaybackRate: rate, isCurrentClipMuted: muted }),
 			duration: 10,
-			sourcePlaybackRate: rate,
 			previewSourceAudioFallbackPaths: [sourcePath],
 			sourceAudioFallbackStartDelayMsByPath: { [sourcePath]: delay },
 			sourceAudioResourceVersion: 0,
-			isCurrentClipMuted: muted,
 			getSourceTrackPreviewGain: () => 1,
 			onSourceFallbackLoadError: vi.fn(),
 		});

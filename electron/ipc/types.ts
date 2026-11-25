@@ -18,6 +18,8 @@ export type NativeMacRecordingOptions = {
 	microphoneLabel?: string;
 };
 
+export type NativeRecordingFinalization = { stage: "saving" } | { stage: "preparing"; savedPath?: string };
+
 export type WindowBounds = {
 	x: number;
 	y: number;

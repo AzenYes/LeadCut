@@ -55,7 +55,7 @@ function hasSameBaseLocation(candidate: URL, trustedBase: URL): boolean {
 	);
 }
 
-export function isTrustedCaptureDocumentUrl(
+export function isTrustedApplicationDocumentUrl(
 	candidateUrl: string,
 	trustedDocumentBaseUrls: readonly string[],
 ): boolean {
@@ -64,8 +64,7 @@ export function isTrustedCaptureDocumentUrl(
 		!candidate ||
 		!TRUSTED_RENDERER_PROTOCOLS.has(candidate.protocol) ||
 		candidate.username !== "" ||
-		candidate.password !== "" ||
-		!hasExactCaptureWindowQuery(candidate)
+		candidate.password !== ""
 	) {
 		return false;
 	}
@@ -78,6 +77,15 @@ export function isTrustedCaptureDocumentUrl(
 				hasSameBaseLocation(candidate, trustedBase),
 		);
 	});
+}
+
+export function isTrustedCaptureDocumentUrl(
+	candidateUrl: string,
+	trustedDocumentBaseUrls: readonly string[],
+): boolean {
+	const candidate = parseUrl(candidateUrl);
+	return Boolean(candidate && hasExactCaptureWindowQuery(candidate) &&
+		isTrustedApplicationDocumentUrl(candidateUrl, trustedDocumentBaseUrls));
 }
 
 function isSameDocument(firstUrl: string, secondUrl: string): boolean {

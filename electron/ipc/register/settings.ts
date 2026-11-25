@@ -1,5 +1,13 @@
+import { handleTrustedIpc, isTrustedIpcSender, onTrustedIpc } from "../../trustedIpc";
 import { readAppEnv } from "../../envCompat";
-import { CAPTION_PRESETS_STORAGE_KEY, EDITOR_PRESETS_STORAGE_KEY, KEYSTROKE_PRESETS_STORAGE_KEY, LOCALE_STORAGE_KEY } from "../../../src/lib/storageKeys";
+import {
+	ADVANCED_SECTIONS_STORAGE_KEY, CAPTION_PANEL_WIDTH_STORAGE_KEY, CAPTION_PAUSE_ON_TYPING_STORAGE_KEY,
+	CAPTION_PRESETS_STORAGE_KEY, CAPTION_QUALITY_SETTINGS_KEY, CAPTION_SKIP_RIPPLE_CONFIRM_STORAGE_KEY,
+	DURABLE_RENDERER_STORAGE_KEYS, EDITOR_LAYOUT_STORAGE_KEY, EDITOR_PREFERENCES_STORAGE_KEY,
+	EDITOR_PRESETS_STORAGE_KEY, KEYSTROKE_CAPTURE_MODE_SETTING_KEY, KEYSTROKE_PRESETS_STORAGE_KEY,
+	LOCALE_STORAGE_KEY, NVIDIA_CUDA_EXPORT_OPT_IN_SETTING_KEY, ONBOARDING_SEEN_STORAGE_KEY,
+	REVIEW_RATE_SETTING_KEY, THEME_STORAGE_KEY,
+} from "../../../src/lib/storageKeys";
 import { createCountdownController } from "../../countdownController";
 import { setNativeUiLocale } from "../../uiI18n";
 import { getDetachedPreviewWindow } from "../../navigationPolicy";
@@ -7,11 +15,11 @@ import { showExportDiagnosticsBundleDialog } from "../../diagnosticsBundle";
 import { appLog } from "../../logger";
 import { getRecordingShortcuts, saveRecordingShortcuts, setRecordingShortcutCapture } from "../../recordingShortcuts";
 import fs from "node:fs/promises";
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, type WebContents } from "electron";
 import { readAppSetting, writeAppSetting } from "../../appSettingsStore";
-import { hideCursor } from "../../cursorHider";
 import { createCountdownWindow, getHudOverlayWindow } from "../../windows";
 import { COUNTDOWN_SETTINGS_FILE, SHORTCUTS_FILE } from "../constants";
+import { configureLeadCutAgent } from "../settings/agentConnection";
 import {
 	recordingPreferencesStore,
 	type RecordingPreferencesPatch,
@@ -33,6 +41,46 @@ const BROWSER_MICROPHONE_PROFILES = new Set([
 	"raw",
 ]);
 
+const rendererSettingsSnapshotKeys = new Set([
+	...DURABLE_RENDERER_STORAGE_KEYS,
+	ADVANCED_SECTIONS_STORAGE_KEY, CAPTION_PANEL_WIDTH_STORAGE_KEY, CAPTION_PAUSE_ON_TYPING_STORAGE_KEY,
+	CAPTION_PRESETS_STORAGE_KEY, CAPTION_QUALITY_SETTINGS_KEY, CAPTION_SKIP_RIPPLE_CONFIRM_STORAGE_KEY,
+	EDITOR_LAYOUT_STORAGE_KEY, EDITOR_PREFERENCES_STORAGE_KEY, EDITOR_PRESETS_STORAGE_KEY,
+	KEYSTROKE_CAPTURE_MODE_SETTING_KEY, KEYSTROKE_PRESETS_STORAGE_KEY, LOCALE_STORAGE_KEY,
+	NVIDIA_CUDA_EXPORT_OPT_IN_SETTING_KEY, ONBOARDING_SEEN_STORAGE_KEY, REVIEW_RATE_SETTING_KEY, THEME_STORAGE_KEY,
+]);
+
+export type RendererSettingUpdate = { key: string; value: unknown; revision: number };
+export type RendererSettingsSnapshot = { entries: [string, unknown][]; revision: number };
+let rendererSettingsRevision = 0;
+
+function publishRendererSetting(key: string, value: unknown, sender: WebContents, localeChanged = false) {
+	if (!rendererSettingsSnapshotKeys.has(key)) return;
+	const update = { key, value, revision: ++rendererSettingsRevision };
+	for (const window of BrowserWindow.getAllWindows()) {
+		if (window.isDestroyed()) continue;
+		const contents = window.webContents;
+		if (contents === sender || contents.isDestroyed() ||
+			!isTrustedIpcSender({ sender: contents, senderFrame: contents.mainFrame })) continue;
+		contents.send("app-settings:changed", update);
+		if (localeChanged) contents.send("app-locale-changed", value);
+	}
+	return update;
+}
+
+function saveRendererSetting(sender: WebContents, key: unknown, value: unknown) {
+	try {
+		if (typeof key !== "string" || key.length === 0) return { success: false };
+		const localeChanged = key === LOCALE_STORAGE_KEY && typeof value === "string" && readAppSetting(key) !== value;
+		writeAppSetting(key, value, { flush: [CAPTION_PRESETS_STORAGE_KEY, EDITOR_PRESETS_STORAGE_KEY, KEYSTROKE_PRESETS_STORAGE_KEY].includes(key) });
+		if (localeChanged) setNativeUiLocale(value);
+		return { success: true, update: publishRendererSetting(key, value, sender, localeChanged) };
+	} catch (error) {
+		console.error("Failed to save app setting:", error);
+		return { success: false };
+	}
+}
+
 function getBrowserMicrophoneProfileFromEnv() {
 	const requested = readAppEnv("BROWSER_MIC_PROFILE")?.trim() || null;
 	const normalized = requested?.toLowerCase() ?? DEFAULT_BROWSER_MICROPHONE_PROFILE;
@@ -45,37 +93,50 @@ function getBrowserMicrophoneProfileFromEnv() {
 }
 
 export function registerSettingsHandlers() {
-	ipcMain.handle("get-recording-shortcuts", getRecordingShortcuts);
-	ipcMain.handle("set-recording-shortcuts", (_event, config: unknown) => saveRecordingShortcuts(config));
-	ipcMain.on("set-recording-shortcut-capture", (event, active: unknown) => {
+	handleTrustedIpc("patch-editor-preferences", (event, changes: unknown, flush?: unknown) => {
+		if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame ||
+			!changes || typeof changes !== "object" || Array.isArray(changes)) return { success: false };
+		const previous = readAppSetting(EDITOR_PREFERENCES_STORAGE_KEY);
+		const current = previous && typeof previous === "object" && !Array.isArray(previous) ? previous : {};
+		const value = { ...current, ...changes };
+		writeAppSetting(EDITOR_PREFERENCES_STORAGE_KEY, value, { flush: flush === true });
+		return { success: true, update: publishRendererSetting(EDITOR_PREFERENCES_STORAGE_KEY, value, event.sender) };
+	});
+	handleTrustedIpc("configure-leadcut-agent", (event, agent: unknown) => {
+		if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) return { success: false, error: "untrusted-frame" };
+		return configureLeadCutAgent(agent);
+	});
+	handleTrustedIpc("get-recording-shortcuts", getRecordingShortcuts);
+	handleTrustedIpc("set-recording-shortcuts", (_event, config: unknown) => saveRecordingShortcuts(config));
+	onTrustedIpc("set-recording-shortcut-capture", (event, active: unknown) => {
 		if (typeof active === "boolean") setRecordingShortcutCapture(event.sender, active);
 	});
-	ipcMain.on("app-log:write", (_event, level: unknown, scope: unknown, message: unknown, detail: unknown) => {
+	onTrustedIpc("app-log:write", (_event, level: unknown, scope: unknown, message: unknown, detail: unknown) => {
 		if ((level !== "info" && level !== "warn" && level !== "error") ||
 			typeof scope !== "string" || typeof message !== "string") return;
 		appLog(level, scope.slice(0, 100), message.slice(0, 8192),
 			typeof detail === "string" ? detail.slice(0, 8192) : undefined);
 	});
-	ipcMain.handle("export-diagnostics-bundle", event =>
+	handleTrustedIpc("export-diagnostics-bundle", event =>
 		showExportDiagnosticsBundleDialog(BrowserWindow.fromWebContents(event.sender)));
-	ipcMain.on("get-preview-display-bounds", event => {
+	onTrustedIpc("get-preview-display-bounds", event => {
 		event.returnValue = getScreen().getAllDisplays().map(display => display.workArea);
 	});
-	ipcMain.handle("set-detached-preview-fullscreen", (event, fullscreen: unknown) => {
+	handleTrustedIpc("set-detached-preview-fullscreen", (event, fullscreen: unknown) => {
 		const preview = getDetachedPreviewWindow(event.sender);
 		if (!preview || typeof fullscreen !== "boolean") return false;
 		preview.setFullScreen(fullscreen);
 		return true;
 	});
-	ipcMain.handle(
+	handleTrustedIpc(
 		"get-window-fullscreen",
 		(event) => BrowserWindow.fromWebContents(event.sender)?.isFullScreen() ?? false,
 	);
-	ipcMain.handle("app:getVersion", () => {
+	handleTrustedIpc("app:getVersion", () => {
 		return app.getVersion();
 	});
 
-	ipcMain.handle("get-window-chrome", (event) => {
+	handleTrustedIpc("get-window-chrome", (event) => {
 		const win = BrowserWindow.fromWebContents(event.sender);
 		return {
 			trafficLightsVisible:
@@ -86,11 +147,19 @@ export function registerSettingsHandlers() {
 		};
 	});
 
-	ipcMain.handle("get-platform", () => {
+	handleTrustedIpc("get-platform", () => {
 		return process.platform;
 	});
 
-	ipcMain.on("app-settings:get", (event, key: unknown) => {
+	onTrustedIpc("app-settings:snapshot", event => {
+		const snapshot: RendererSettingsSnapshot = {
+			entries: Array.from(rendererSettingsSnapshotKeys, key => [key, readAppSetting(key)]),
+			revision: rendererSettingsRevision,
+		};
+		event.returnValue = snapshot;
+	});
+
+	onTrustedIpc("app-settings:get", (event, key: unknown) => {
 		try {
 			if (typeof key !== "string" || key.length === 0) {
 				event.returnValue = { success: false, value: null };
@@ -107,43 +176,13 @@ export function registerSettingsHandlers() {
 		}
 	});
 
-	ipcMain.on("app-settings:set", (event, key: unknown, value: unknown) => {
-		try {
-			if (typeof key !== "string" || key.length === 0) {
-				event.returnValue = { success: false };
-				return;
-			}
-
-			const localeChanged = key === LOCALE_STORAGE_KEY && typeof value === "string" && readAppSetting(key) !== value;
-			writeAppSetting(key, value, { flush: [CAPTION_PRESETS_STORAGE_KEY, EDITOR_PRESETS_STORAGE_KEY, KEYSTROKE_PRESETS_STORAGE_KEY].includes(key) });
-			if (localeChanged) {
-				setNativeUiLocale(value);
-				for (const window of BrowserWindow.getAllWindows()) {
-					if (!window.isDestroyed() && window.webContents !== event.sender) {
-						window.webContents.send("app-locale-changed", value);
-					}
-				}
-			}
-			event.returnValue = { success: true };
-		} catch (error) {
-			console.error("Failed to save app setting:", error);
-			event.returnValue = { success: false };
-		}
+	onTrustedIpc("app-settings:set", (event, key: unknown, value: unknown) => {
+		event.returnValue = saveRendererSetting(event.sender, key, value);
 	});
+	handleTrustedIpc("app-settings:set-async", (event, key: unknown, value: unknown) =>
+		saveRendererSetting(event.sender, key, value));
 
-	// ---------------------------------------------------------------------------
-	// Cursor hiding for the browser-capture fallback.
-	// The IPC promise resolves only after the cursor hide attempt completes.
-	// ---------------------------------------------------------------------------
-	ipcMain.handle("hide-cursor", () => {
-		if (process.platform !== "win32") {
-			return { success: true };
-		}
-
-		return { success: hideCursor() };
-	});
-
-	ipcMain.handle("get-shortcuts", async () => {
+	handleTrustedIpc("get-shortcuts", async () => {
 		try {
 			const data = await fs.readFile(SHORTCUTS_FILE, "utf-8");
 			return parseJsonWithByteOrderMark(data);
@@ -152,7 +191,7 @@ export function registerSettingsHandlers() {
 		}
 	});
 
-	ipcMain.handle("save-shortcuts", async (_, shortcuts: unknown) => {
+	handleTrustedIpc("save-shortcuts", async (_, shortcuts: unknown) => {
 		try {
 			await fs.writeFile(SHORTCUTS_FILE, JSON.stringify(shortcuts, null, 2), "utf-8");
 			return { success: true };
@@ -165,7 +204,7 @@ export function registerSettingsHandlers() {
 	// ---------------------------------------------------------------------------
 	// Countdown timer before recording
 	// ---------------------------------------------------------------------------
-	ipcMain.handle("get-recording-preferences", async () => {
+	handleTrustedIpc("get-recording-preferences", async () => {
 		try {
 			const parsed = await recordingPreferencesStore.read();
 			return {
@@ -196,11 +235,11 @@ export function registerSettingsHandlers() {
 		}
 	});
 
-	ipcMain.handle("get-recording-audio-lab-config", () => {
+	handleTrustedIpc("get-recording-audio-lab-config", () => {
 		return getBrowserMicrophoneProfileFromEnv();
 	});
 
-	ipcMain.handle("set-recording-preferences", async (_, prefs: RecordingPreferencesPatch) => {
+	handleTrustedIpc("set-recording-preferences", async (_, prefs: RecordingPreferencesPatch) => {
 		try {
 			await recordingPreferencesStore.update(prefs);
 			return { success: true };
@@ -210,7 +249,7 @@ export function registerSettingsHandlers() {
 		}
 	});
 
-	ipcMain.handle("get-countdown-delay", async () => {
+	handleTrustedIpc("get-countdown-delay", async () => {
 		try {
 			const content = await fs.readFile(COUNTDOWN_SETTINGS_FILE, "utf-8");
 			const parsed = parseJsonWithByteOrderMark<{ delay?: number }>(content);
@@ -220,7 +259,7 @@ export function registerSettingsHandlers() {
 		}
 	});
 
-	ipcMain.handle("set-countdown-delay", async (_, delay: number) => {
+	handleTrustedIpc("set-countdown-delay", async (_, delay: number) => {
 		try {
 			await fs.writeFile(
 				COUNTDOWN_SETTINGS_FILE,
@@ -242,16 +281,16 @@ export function registerSettingsHandlers() {
 		if (window.webContents.isLoadingMainFrame()) window.close();
 		else { window.hide(); window.webContents.send("countdown-tick", null); }
 	});
-	ipcMain.handle("start-countdown", (event, seconds: number) => {
+	handleTrustedIpc("start-countdown", (event, seconds: number) => {
 		const caller = BrowserWindow.fromWebContents(event.sender);
 		const workArea = caller && caller !== getHudOverlayWindow()
 			? getScreen().getDisplayMatching(caller.getBounds()).workArea
 			: undefined;
 		return countdown.start(seconds, workArea);
 	});
-	ipcMain.handle("cancel-countdown", () => countdown.cancel());
+	handleTrustedIpc("cancel-countdown", () => countdown.cancel());
 
-	ipcMain.handle("get-active-countdown", () => {
+	handleTrustedIpc("get-active-countdown", () => {
 		return {
 			success: true,
 			seconds: countdownInProgress ? countdownRemaining : null,

@@ -94,7 +94,14 @@
 			"availableGenericTitle": "An update is available."
 		},
 		"preparing": "Preparing recording",
-		"preparingSubtitle": "Opening the editor in a moment"
+		"startingCapture": "Starting capture",
+		"recoveringCapture": "Recovering recording",
+		"stoppingCapture": "Stopping capture",
+		"savingCapture": "Saving recording",
+		"openingEditor": "Opening the editor",
+		"discardingCapture": "Discarding recording",
+		"savedAt": "Recording saved at {{path}}",
+		"revealSavedRecording": "Show recording in folder"
 	},
 	"sourceSelector": {
 		"loadingSources": "Loading sources...",

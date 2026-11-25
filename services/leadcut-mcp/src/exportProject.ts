@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readProjectSnapshot, reply } from "./mutation.js";
+import { stopProcessTree } from "./stopProcessTree.js";
 import { getProjectMediaReferences, relinkProjectMedia } from "./projectRelinkModel.js";
 import { resolveProjectMediaPath } from "./projectStore.js";
 
@@ -71,6 +72,7 @@ export async function exportProject(args: ExportArguments) {
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
 				...process.env,
+				ELECTRON_RUN_AS_NODE: undefined,
 				LEADCUT_EXPORT: "1",
 				LEADCUT_EXPORT_PROJECT: projectCopy,
 				LEADCUT_EXPORT_OUTPUT: temporaryOutput,
@@ -118,7 +120,7 @@ export async function exportProject(args: ExportArguments) {
 		if (child && !didExit) {
 			// Give Chromium a chance to finish writing the report and close its profile.
 			await Promise.race([exited, delay(600)]);
-			if (!didExit) child.kill();
+			if (!didExit) await stopProcessTree(child);
 			await Promise.race([exited, delay(1000)]);
 		}
 		await fs.rm(workspace, { recursive: true, force: true, maxRetries: 4, retryDelay: 150 }).catch(() => undefined);

@@ -1,6 +1,25 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { ExportRoutePlan, NativeStaticExportRoute } from "../src/lib/exporter/backendPolicy";
+import type { GifConversionRequest } from "./ipc/export/gif";
 import type { RecordingSessionData } from "./ipc/types";
+import type { ExportAudioAppendDisposition, ExportAudioAppendResult } from "./ipc/nativeVideoExport";
+import type { RendererSettingUpdate, RendererSettingsSnapshot } from "./ipc/register/settings";
 import type { RecordingShortcutAction, RecordingShortcutsConfig } from "../src/lib/recordingShortcuts";
+
+let rendererSettings: Map<string, { value: unknown; revision: number }> | undefined;
+
+function applyRendererSettingUpdate({ key, value, revision }: RendererSettingUpdate) {
+	const current = rendererSettings?.get(key);
+	// A queued update from another window can arrive after a newer synchronous write in this one.
+	if (current && current.revision < revision) rendererSettings?.set(key, { value, revision });
+}
+
+ipcRenderer.on("app-settings:changed", (_event, update: RendererSettingUpdate) => applyRendererSettingUpdate(update));
+
+function acceptRendererSettingWrite(result: { success?: boolean; update?: RendererSettingUpdate } | null) {
+	if (result?.update) applyRendererSettingUpdate(result.update);
+	return result?.success === true;
+}
 
 let rendererRecoveredPending = false;
 let rendererRecoveredListener: (() => void) | null = null;
@@ -79,6 +98,8 @@ type NativeStaticLayoutMetrics = NativeVideoAudioMuxMetrics & {
 	staticAssetExecMs?: number;
 	fallbackChunkCount: number;
 	videoOnlyBytes?: number;
+	exportRoutePlan?: ExportRoutePlan<NativeStaticExportRoute>;
+	exportRoute?: NativeStaticExportRoute;
 	chunks: NativeStaticLayoutChunkMetric[];
 };
 type NativeStaticLayoutProgress = {
@@ -250,6 +271,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	getAssetBasePath: async () => {
 		return await ipcRenderer.invoke("get-asset-base-path");
 	},
+	resolveNativeBundledImagePath: (asset: string): Promise<string | null> =>
+		ipcRenderer.invoke("resolve-native-bundled-image-path", asset),
 	listLocalFontFamilies: (refresh?: boolean): Promise<string[]> =>
 		ipcRenderer.invoke("list-local-font-families", refresh),
 	listAssetDirectory: (relativeDir: string) => {
@@ -342,6 +365,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		}>;
 		chunkDurationSec?: number;
 		experimentalWindowsGpuCompositor?: boolean;
+		measureGpuStages?: boolean;
 		experimentalNvidiaCudaExport?: boolean;
 		audioOptions?: {
 			audioMode?: "none" | "copy-source" | "trim-source" | "edited-track";
@@ -383,10 +407,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		frameRate: number;
 		bitrate: number;
 		encodingMode: "fast" | "balanced" | "quality";
-		inputMode?: "rawvideo" | "h264-stream";
+	inputMode?: "rawvideo" | "h264-stream" | "mp4-stream";
+		videoOnlyIntermediate?: boolean;
+		mixedAudio?: { durationSec: number; videoFrameCount: number };
+		sourceAudio?: import("./ipc/nativeVideoExport").NativeH264StreamSourceAudioOptions;
+		destinationPath?: string;
 	}) => {
 		return ipcRenderer.invoke("native-video-export-start", options);
 	},
+	nativeVideoExportWriteWav: (sessionId: string, chunk: Uint8Array | null): Promise<NativeVideoExportWriteResult> =>
+		ipcRenderer.invoke("native-video-export-write-wav", sessionId, chunk),
+	nativeVideoExportEndVideoInput: (sessionId: string): Promise<NativeVideoExportWriteResult> =>
+		ipcRenderer.invoke("native-video-export-end-video-input", sessionId),
 	nativeVideoExportWriteFrame: (sessionId: string, frameData: Uint8Array) => {
 		ensureNativeVideoExportWriteResultListener();
 
@@ -429,6 +461,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			audioSourceCodec?: string | null;
 			audioSourceSampleRate?: number;
 			outputDurationSec?: number;
+			outputVideoFrameCount?: number;
 			trimSegments?: Array<{ startMs: number; endMs: number }>;
 			editedTrackStrategy?: "filtergraph-fast-path" | "offline-render-fallback";
 			editedTrackSegments?: Array<{ startMs: number; endMs: number; speed: number }>;
@@ -477,6 +510,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			audioSourceCodec?: string | null;
 			audioSourceSampleRate?: number;
 			outputDurationSec?: number;
+			outputVideoFrameCount?: number;
 			trimSegments?: Array<{ startMs: number; endMs: number }>;
 			editedTrackStrategy?: "filtergraph-fast-path" | "offline-render-fallback";
 			editedTrackSegments?: Array<{ startMs: number; endMs: number; speed: number }>;
@@ -499,6 +533,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			audioSourceCodec?: string | null;
 			audioSourceSampleRate?: number;
 			outputDurationSec?: number;
+			outputVideoFrameCount?: number;
+			reuseVideoMp4?: boolean;
 			trimSegments?: Array<{ startMs: number; endMs: number }>;
 			editedTrackStrategy?: "filtergraph-fast-path" | "offline-render-fallback";
 			editedTrackSegments?: Array<{ startMs: number; endMs: number; speed: number }>;
@@ -508,9 +544,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	) => {
 		return ipcRenderer.invoke("mux-exported-video-audio-from-path", videoPath, options);
 	},
-	openExportStream: (options?: { extension?: string }) => {
+	openExportStream: (options?: { extension?: string; destinationPath?: string }) => {
 		return ipcRenderer.invoke("export-stream-open", options);
 	},
+	startExportAudioAppend: (videoPath: string, durationSec: number): Promise<NativeVideoExportWriteResult & { runId?: string }> =>
+		ipcRenderer.invoke("start-export-audio-append", videoPath, durationSec),
+	writeExportAudioAppend: (runId: string, chunk: Uint8Array): Promise<NativeVideoExportWriteResult> =>
+		ipcRenderer.invoke("write-export-audio-append", runId, chunk),
+	finishExportAudioAppend: (runId: string, disposition: ExportAudioAppendDisposition): Promise<ExportAudioAppendResult> =>
+		ipcRenderer.invoke("finish-export-audio-append", runId, disposition),
+	openExportAacStream: () => ipcRenderer.invoke("export-stream-open", { mode: "aac-from-wav" }),
 	writeExportStreamChunk: (streamId: string, position: number, chunk: Uint8Array) => {
 		return ipcRenderer.invoke("export-stream-write", streamId, position, chunk);
 	},
@@ -599,8 +642,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	) => {
 		return ipcRenderer.invoke("start-native-screen-recording", source, options);
 	},
-	stopNativeScreenRecording: () => {
-		return ipcRenderer.invoke("stop-native-screen-recording");
+	stopNativeScreenRecording: (discard?: boolean) => {
+		return ipcRenderer.invoke("stop-native-screen-recording", discard);
 	},
 	recoverNativeScreenRecording: () => {
 		return ipcRenderer.invoke("recover-native-screen-recording");
@@ -632,11 +675,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		ipcRenderer.invoke("webcam-finish", name, discard),
 	writeRecordingChunk: (name: string, data: ArrayBuffer, first: boolean) => ipcRenderer.invoke("recording-write", name, data, first),
 	finishRecordingChunks: (name: string, discard: boolean) => ipcRenderer.invoke("recording-finish", name, discard),
+	recoverBrowserRecording: () => ipcRenderer.invoke("recover-browser-recording"),
 	storeRecordedVideo: (videoData: ArrayBuffer, fileName: string) => {
 		return ipcRenderer.invoke("store-recorded-video", videoData, fileName);
 	},
+	prepareMicrophoneStream: (input: { startDelayMs: number; profile?: string }) =>
+		ipcRenderer.invoke("prepare-microphone-stream", input),
+	writeMicrophoneChunk: (streamId: string, bytes: ArrayBuffer) =>
+		ipcRenderer.invoke("write-microphone-chunk", streamId, bytes),
+	discardMicrophoneStream: (streamId: string) =>
+		ipcRenderer.invoke("discard-microphone-stream", streamId),
 	storeMicrophoneSidecar: (
-		audioData: ArrayBuffer,
+		streamId: string,
 		videoPath: string,
 		options?: {
 			startDelayMs?: number;
@@ -662,7 +712,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			}>;
 		},
 	) => {
-		return ipcRenderer.invoke("store-microphone-sidecar", audioData, videoPath, options);
+		return ipcRenderer.invoke("store-microphone-sidecar", streamId, videoPath, options);
 	},
 	getRecordedVideoPath: () => {
 		return ipcRenderer.invoke("get-recorded-video-path");
@@ -729,6 +779,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		ipcRenderer.on("recording-disk-low", listener);
 		return () => ipcRenderer.removeListener("recording-disk-low", listener);
 	},
+	onRecordingFinalization: (callback: (status: import("./ipc/types").NativeRecordingFinalization) => void) => {
+		const channel = "recording-finalization";
+		const listener = (_event: Electron.IpcRendererEvent, status: Parameters<typeof callback>[0]) => callback(status);
+		ipcRenderer.on(channel, listener);
+		return () => ipcRenderer.removeListener(channel, listener);
+	},
 	setCursorScale: (scale: number) => {
 		return ipcRenderer.invoke("set-cursor-scale", scale);
 	},
@@ -755,6 +811,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		) => callback(payload);
 		ipcRenderer.on("recording-state-changed", listener);
 		return () => ipcRenderer.removeListener("recording-state-changed", listener);
+	},
+	onRecordingAudioLost: (callback: (track: "mic" | "system") => void) => {
+		const listener = (_event: unknown, track: "mic" | "system") => callback(track);
+		ipcRenderer.on("recording-audio-lost", listener);
+		return () => ipcRenderer.removeListener("recording-audio-lost", listener);
 	},
 	onRecordingInterrupted: (callback: (state: { reason: string; message: string }) => void) => {
 		const listener = (
@@ -807,9 +868,19 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		return ipcRenderer.invoke("save-exported-video", videoData, fileName, captionSidecar);
 	},
 	chooseExportPath: (fileName: string) => ipcRenderer.invoke("choose-export-path", fileName),
+	captureExportPreview: (rect: { x: number; y: number; width: number; height: number }) =>
+		ipcRenderer.invoke("capture-export-preview", rect),
 	getExportDiskSpace: (outputPath: string) => ipcRenderer.invoke("get-export-disk-space", outputPath),
 	prepareExportAudioSource: (filePath: string) =>
 		ipcRenderer.invoke("prepare-export-audio-source", filePath),
+	prepareExportAudioPcm: (filePath: string, window?: { startSec: number; endSec: number }, useMemoryWindows?: boolean) =>
+		ipcRenderer.invoke("prepare-export-audio-pcm", filePath, window, useMemoryWindows),
+	openExportAudioPcmReader: () => ipcRenderer.invoke("open-export-audio-pcm-reader"),
+	closeExportAudioPcmReader: (readerId: string) => ipcRenderer.invoke("close-export-audio-pcm-reader", readerId),
+	readExportAudioPcmWindow: (filePath: string, window: { firstFrame: number; endFrame: number; channels: number; sampleRate: number }, readerId?: string) =>
+		ipcRenderer.invoke("read-export-audio-pcm-window", filePath, window, readerId),
+	cancelExportAudioPcm: () => ipcRenderer.invoke("cancel-export-audio-pcm"),
+	encodeExportAudioAac: (filePath: string): Promise<string | null> => ipcRenderer.invoke("encode-export-audio-aac", filePath),
 	writeExportedVideoToPath: (
 		videoData: ArrayBuffer,
 		outputPath: string,
@@ -847,6 +918,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	downloadWhisperSmallModel: () => {
 		return ipcRenderer.invoke("download-whisper-small-model");
 	},
+	cancelWhisperModelDownload: () => ipcRenderer.invoke("cancel-whisper-model-download"),
 	deleteWhisperSmallModel: () => {
 		return ipcRenderer.invoke("delete-whisper-small-model");
 	},
@@ -882,6 +954,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	}) => {
 		return ipcRenderer.invoke("generate-auto-captions", options);
 	},
+	cancelAutoCaptions: () => ipcRenderer.invoke("cancel-auto-captions"),
+	onAutoCaptionProgress: (callback: (progress: number) => void) => {
+		const listener = (_event: unknown, progress: number) => callback(progress);
+		ipcRenderer.on("auto-caption-progress", listener);
+		return () => ipcRenderer.removeListener("auto-caption-progress", listener);
+	},
 	setCurrentVideoPath: (
 		path: string,
 		options?: {
@@ -898,15 +976,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			timeOffsetMs?: number;
 			hideOverlayCursorByDefault?: boolean;
 		},
-		options?: { preserveProjectPath?: boolean },
+		options?: { preserveProjectPath?: boolean; background?: "camera" | "audio" },
 	) => {
 		return ipcRenderer.invoke("set-current-recording-session", session, options);
 	},
-	onRecordingSessionChanged: (callback: (session: RecordingSessionData | null) => void) => {
+	onRecordingSessionChanged: (callback: (session: RecordingSessionData | null, background?: "camera" | "audio") => void) => {
 		const listener = (
 			_event: Electron.IpcRendererEvent,
 			payload: RecordingSessionData | null,
-		) => callback(payload);
+			background?: "camera" | "audio",
+		) => callback(payload, background);
 		ipcRenderer.on("recording-session-changed", listener);
 		return () => ipcRenderer.removeListener("recording-session-changed", listener);
 	},
@@ -991,6 +1070,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	relinkProjectMedia: (projectPath: string, revision: string, mapping: import("../src/components/video-editor/projectRelink").MediaRelinkMapping) =>
 		ipcRenderer.invoke("relink-project-media", projectPath, revision, mapping),
 	releaseCurrentProject: () => ipcRenderer.invoke("release-current-project"),
+	setProjectAgentHandoff: (projectPath: string, handedOff: boolean) =>
+		ipcRenderer.invoke("set-project-agent-handoff", projectPath, handedOff),
 	listProjectVersions: () => ipcRenderer.invoke("list-project-versions"),
 	readProjectVersion: (versionPath: string) => ipcRenderer.invoke("read-project-version", versionPath),
 	restoreProjectVersion: (versionPath: string, expectedRevision?: string) =>
@@ -1013,8 +1094,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	listProjectFiles: () => {
 		return ipcRenderer.invoke("list-project-files");
 	},
-	openProjectFileAtPath: (filePath: string) => {
-		return ipcRenderer.invoke("open-project-file-at-path", filePath);
+	openProjectFileAtPath: (filePath: string, includeAgentHistory?: boolean) => {
+		return ipcRenderer.invoke("open-project-file-at-path", filePath, includeAgentHistory);
 	},
 	openProjectsDirectory: () => {
 		return ipcRenderer.invoke("open-projects-directory");
@@ -1161,12 +1242,23 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		return ipcRenderer.invoke("save-shortcuts", shortcuts);
 	},
 	getAppSetting: (key: string) => {
+		if (!rendererSettings) {
+			const snapshot = ipcRenderer.sendSync("app-settings:snapshot") as RendererSettingsSnapshot | null;
+			if (snapshot) {
+				const { entries, revision } = snapshot;
+				rendererSettings = new Map(entries.map(([key, value]) => [key, { value, revision }]));
+			}
+		}
+		const cached = rendererSettings?.get(key);
+		if (cached) return cached.value ?? null;
 		const result = ipcRenderer.sendSync("app-settings:get", key) as {
 			success?: boolean;
 			value?: unknown;
 		};
 		return result?.success ? (result.value ?? null) : null;
 	},
+	patchEditorPreferences: async (changes: Record<string, unknown>, flush?: boolean) =>
+		acceptRendererSettingWrite(await ipcRenderer.invoke("patch-editor-preferences", changes, flush)),
 	getPreviewDisplayBounds: () => ipcRenderer.sendSync("get-preview-display-bounds"),
 	writeAppLog: (level: "info" | "warn" | "error", scope: string, message: string, detail?: string) =>
 		ipcRenderer.send("app-log:write", level, scope, message, detail),
@@ -1188,12 +1280,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		ipcRenderer.on("detached-preview-fullscreen-changed", listener);
 		return () => ipcRenderer.removeListener("detached-preview-fullscreen-changed", listener);
 	},
-	setAppSetting: (key: string, value: unknown) => {
-		const result = ipcRenderer.sendSync("app-settings:set", key, value) as {
-			success?: boolean;
-		};
-		return result?.success === true;
-	},
+	setAppSetting: (key: string, value: unknown) =>
+		acceptRendererSettingWrite(ipcRenderer.sendSync("app-settings:set", key, value)),
+	setAppSettingAsync: async (key: string, value: unknown) =>
+		acceptRendererSettingWrite(await ipcRenderer.invoke("app-settings:set-async", key, value)),
 	onAppLocaleChanged: (callback: (locale: string) => void) => {
 		const listener = (_event: Electron.IpcRendererEvent, locale: string) => callback(locale);
 		ipcRenderer.on("app-locale-changed", listener);
@@ -1236,8 +1326,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		ipcRenderer.invoke("is-native-windows-capture-available"),
 	muxNativeWindowsRecording: (expectedDurationMs?: number) =>
 		ipcRenderer.invoke("mux-native-windows-recording", expectedDurationMs),
-	hideOsCursor: () => ipcRenderer.invoke("hide-cursor"),
 	getAppVersion: () => ipcRenderer.invoke("app:getVersion"),
+	convertExportToGif: (input: GifConversionRequest) =>
+		ipcRenderer.invoke("convert-export-to-gif", input),
+	cancelExportGif: (runId: string) => ipcRenderer.invoke("cancel-export-gif", runId),
+	configureLeadCutAgent: (agent: "codex" | "claude"): Promise<{ success: boolean; error?: string }> =>
+		ipcRenderer.invoke("configure-leadcut-agent", agent),
 	getRecordingPreferences: () => ipcRenderer.invoke("get-recording-preferences"),
 	getRecordingAudioLabConfig: () => ipcRenderer.invoke("get-recording-audio-lab-config"),
 	setRecordingPreferences: (prefs: {

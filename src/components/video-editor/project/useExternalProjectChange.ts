@@ -13,6 +13,8 @@ type Inputs = {
 	saveActions: ReturnType<typeof useProjectSaveActions>;
 	projectDisplayName: string;
 	hasUnsavedChanges: boolean;
+	agentHandoffBusy: boolean;
+	onAgentProjectReload: (path: string, project: unknown, history?: unknown[]) => void;
 };
 
 export function useExternalProjectChange(input: Inputs) {
@@ -42,11 +44,14 @@ export function useExternalProjectChange(input: Inputs) {
 			if (makeCopy && !(await state.openProjectSaveDialog(uiText("externalProjectCopyName", { name: state.projectDisplayName })))) return;
 			let loadedRevision: string | undefined;
 			await state.saveActions.withSavesSuspended(async () => {
-				const result = await window.electronAPI.openProjectFileAtPath(update.path);
+				const result = await window.electronAPI.openProjectFileAtPath(update.path, state.saveActions.agentReadOnly);
 				if (!result.success || !result.project || !(await state.applyLoadedProject(
 					result.project, result.path ?? update.path, result.revision, { preservePlayhead: true },
 				))) throw new Error(result.message || uiText("couldNotLoadProjectInvalidProjectFileFormat"));
 				loadedRevision = result.revision;
+				if (state.saveActions.agentReadOnly) {
+					state.onAgentProjectReload(result.path ?? update.path, result.project, result.agentReviewHistory);
+				}
 			});
 			setChange(pending => pending === update || pending?.diskRevision === loadedRevision ? null : pending);
 			setReloadFailed(false);
@@ -61,10 +66,11 @@ export function useExternalProjectChange(input: Inputs) {
 	}, [uiText]);
 
 	const activeChange = change?.path === input.project.currentProjectPath ? change : null;
+	const readOnlyVersionPreview = input.saveActions.previewReadOnly && !input.saveActions.agentReadOnly;
 	const conflictOpen = Boolean(activeChange && !resolving && !input.saveActions.previewReadOnly &&
 		(input.hasUnsavedChanges || reloadFailed || activeChange.diskRevision === null));
 	useEffect(() => {
-		if (resolving || !change || input.saveActions.previewReadOnly) return;
+		if (resolving || !change || readOnlyVersionPreview || input.agentHandoffBusy) return;
 		if (!activeChange) {
 			setChange(null);
 			return;
@@ -76,10 +82,11 @@ export function useExternalProjectChange(input: Inputs) {
 		if (!conflictOpen && !input.project.loading && !input.saveActions.saveFeedback.saving) {
 			void resolve(activeChange, false);
 		}
-	}, [activeChange, change, conflictOpen, input.project.currentProjectRevisionRef, input.project.loading, input.saveActions.previewReadOnly, input.saveActions.saveFeedback.saving, resolve, resolving]);
+	}, [activeChange, change, conflictOpen, input.agentHandoffBusy, input.project.currentProjectRevisionRef, input.project.loading, input.saveActions.saveFeedback.saving, readOnlyVersionPreview, resolve, resolving]);
 
 	return {
 		conflictOpen,
+		resolving,
 		loadDiskVersion: () => activeChange && resolve(activeChange, false),
 		saveCopy: () => activeChange && resolve(activeChange, true),
 	};

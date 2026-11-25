@@ -44,3 +44,92 @@ for (const backend of ["modern", "legacy"] as const) test(`independent webcam, B
 	expect(2 * Math.hypot(sin, cos) / frames).toBeGreaterThan(0.01);
 	fs.writeFileSync(testInfo.outputPath("verification.json"), JSON.stringify({ backend, duration: info.format.duration, blue, tail, camera, toneAmplitude: 2 * Math.hypot(sin, cos) / frames, metrics: output.metrics }, null, 2));
 });
+
+test("modern export preserves cover and contain across a different output aspect ratio", async ({ page }) => {
+	await installDesktopBridge(page, "broll-blue.mp4");
+	await page.goto("/?windowType=editor");
+	const pixels = await page.evaluate(async () => {
+		const { FrameRenderer } = await import("/src/lib/exporter/modernFrameRenderer.ts");
+		const region = {
+			trackId: "broll", sourcePath: `${location.origin}/tests/ui/fixtures/broll-blue.mp4`,
+			sourceDurationMs: 3000, sourceStartMs: 0, speed: 1, volume: 0,
+		};
+		const renderer = new FrameRenderer({
+			width: 180, height: 240, videoWidth: 320, videoHeight: 180, preferredRenderBackend: "webgl",
+			wallpaper: "#ff0000", showShadow: false, shadowIntensity: 0, backgroundBlur: 0, zoomRegions: [],
+			cropRegion: { x: 0, y: 0, width: 1, height: 1 }, showCursor: false,
+			videoTracks: [{ id: "broll", name: "B-roll", kind: "video" }],
+			videoRegions: [
+				{ ...region, id: "cover", startMs: 0, endMs: 1000, fit: "cover" },
+				{ ...region, id: "contain", startMs: 1000, endMs: 2000, fit: "contain" },
+			],
+		});
+		const readback = new OffscreenCanvas(180, 240).getContext("2d")!;
+		const samples = async (timestamp: number) => {
+			await renderer.renderFrame(null, timestamp);
+			readback.drawImage(renderer.getCanvas(), 0, 0);
+			return [[1, 1], [90, 120], [178, 238]].map(([x, y]) => Array.from(readback.getImageData(x, y, 1, 1).data));
+		};
+		try {
+			await renderer.initialize();
+			return { cover: await samples(500_000), contain: await samples(1_500_000) };
+		} finally {
+			renderer.destroy();
+		}
+	});
+	for (const [red, , blue] of [...pixels.cover, pixels.contain[1]]) {
+		expect(red).toBeLessThan(30);
+		expect(blue).toBeGreaterThan(200);
+	}
+	for (const [red, , blue] of [pixels.contain[0], pixels.contain[2]]) {
+		expect(red).toBeGreaterThan(200);
+		expect(blue).toBeLessThan(30);
+	}
+});
+
+for (const [frameRate, loop] of [[15, false], [30, true]] as const) test(`GIF preserves the sequence duration and loop setting at ${frameRate} fps`, async ({ page }, testInfo) => {
+	test.setTimeout(90_000);
+	await installDesktopBridge(page, "broll-blue.mp4");
+	await page.goto("/?windowType=editor");
+	const bytes = await page.evaluate(async ({ frameRate, loop }) => {
+		const { GifExporter } = await import("/src/lib/exporter/gifExporter.ts");
+		const root = `${location.origin}/tests/ui/fixtures/`;
+		const exporter = new GifExporter({
+			videoUrl: `${root}broll-blue.mp4`, width: 320, height: 180, frameRate, loop, sizePreset: "original",
+			wallpaper: "#008800", cropRegion: { x: 0, y: 0, width: 1, height: 1 }, padding: 0, zoomRegions: [],
+			showCursor: false, showShadow: false, shadowIntensity: 0, backgroundBlur: 0,
+			clipRegions: [{ id: "picture", startMs: 0, endMs: 1000, sourceStartMs: 0, speed: 1 }],
+			audioRegions: [{ id: "tail", audioPath: `${root}waveform.mp4`, startMs: 1000, endMs: 3000, volume: 1 }],
+		});
+		const result = await exporter.export();
+		if (!result.success || !result.blob) throw new Error(result.error || "GIF not exported");
+		return Array.from(new Uint8Array(await result.blob.arrayBuffer()));
+	}, { frameRate, loop });
+	const destination = testInfo.outputPath("audio-tail.gif");
+	const gif = Buffer.from(bytes);
+	expect(gif.at(-1)).toBe(0x3b);
+	fs.writeFileSync(destination, gif);
+	const ffprobe = path.resolve("node_modules/ffprobe-static/bin/win32/x64/ffprobe.exe");
+	const transcript = JSON.parse(execFileSync(ffprobe, [
+		"-v", "error", "-ignore_loop", "1", "-count_frames", "-show_entries", "stream=codec_type,nb_read_frames:packet=pts_time,duration_time", "-of", "json", destination,
+	], { encoding: "utf8", windowsHide: true }));
+	expect(transcript.streams).toEqual([{ codec_type: "video", nb_read_frames: String(3 * frameRate) }]);
+	const lastFrame = transcript.packets.at(-1);
+	expect(Number(lastFrame.pts_time) + Number(lastFrame.duration_time)).toBeCloseTo(3, 2);
+	const repeatExtension = gif.indexOf("NETSCAPE2.0");
+	if (loop) {
+		expect(repeatExtension).toBeGreaterThan(0);
+		expect([...gif.subarray(repeatExtension + 11, repeatExtension + 16)]).toEqual([3, 1, 0, 0, 0]);
+	} else {
+		expect(repeatExtension).toBe(-1);
+	}
+	const ffmpeg = path.resolve("node_modules/ffmpeg-static/ffmpeg.exe");
+	const firstPixel = (seconds: string) => execFileSync(ffmpeg, [
+		"-v", "error", "-ignore_loop", "1", "-ss", seconds, "-i", destination, "-frames:v", "1",
+		"-vf", "crop=2:2:160:90,scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+	], { windowsHide: true });
+	expect(firstPixel("0.5")[2]).toBeGreaterThan(200);
+	const tail = firstPixel("2.4");
+	expect(tail[1]).toBeGreaterThan(110);
+	expect(tail[2]).toBeLessThan(20);
+});

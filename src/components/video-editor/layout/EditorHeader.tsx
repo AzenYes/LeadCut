@@ -1,5 +1,5 @@
 import { Dropdown } from "@heroui/react";
-import { DotsThree } from "@/components/ui/icons";
+import { DotsThree, Gear } from "@/components/ui/icons";
 import { useUiText } from "@/i18n/useUiText";
 import { useShortcuts } from "@/contexts/ShortcutsContext";
 import { formatBinding } from "@/lib/shortcuts";
@@ -13,13 +13,13 @@ import {
 	ArrowClockwise as Redo2,
 	ArrowCounterClockwise as Undo2,
 } from "@/components/ui/icons";
-import type { CSSProperties, FormEvent, RefObject } from "react";
+import { type CSSProperties, type FormEvent, type RefObject, useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/button";
 import type { useI18n } from "@/contexts/I18nContext";
 import type { useExportDimensions } from "../export/useExportDimensions";
 import type { useExportSession } from "../export/useExportSession";
 import type { useExportSettings } from "../export/useExportSettings";
-import type { useExportStatusViewModel } from "../export/useExportStatusViewModel";
+import type { useEditorHistory } from "../hooks/useEditorHistory";
 import type { useVideoEditorPresets } from "../presets/useVideoEditorPresets";
 import type { useProjectState } from "../state/useProjectState";
 import { EditorExportMenu } from "./EditorExportMenu";
@@ -29,6 +29,9 @@ type Props = {
 	clipsOpen: boolean;
 	readOnly?: boolean;
 	onOpenVersionHistory: () => void;
+	onOpenApplicationSettings: () => void;
+	onHandOffToAgent?: () => void;
+	agentHandoffBusy?: boolean;
 	onToggleClips: () => void;
 	t: ReturnType<typeof useI18n>["t"];
 	headerLeftControlsPaddingClass: string;
@@ -39,8 +42,7 @@ type Props = {
 	hasUnsavedChanges: boolean;
 	saveFeedback: ReturnType<typeof useProjectSaveActions>["saveFeedback"];
 	handleSaveProject: () => Promise<boolean>;
-	canUndo: boolean;
-	canRedo: boolean;
+	historyFlags: ReturnType<typeof useEditorHistory>["flags"];
 	handleOpenProjectBrowser: () => void;
 	handleOpenProjectFile: () => Promise<void>;
 	handleSaveProjectAs: () => Promise<void>;
@@ -54,7 +56,6 @@ type Props = {
 	exportPreflight: Parameters<typeof EditorExportMenu>[0]["preflight"];
 	exportDimensions: ReturnType<typeof useExportDimensions>;
 	timelineDuration: number;
-	exportStatus: ReturnType<typeof useExportStatusViewModel>;
 	hasCaptionsForSidecar: boolean;
 	nvidiaCudaExportAvailable: boolean;
 	experimentalNvidiaCudaExport: boolean;
@@ -65,12 +66,12 @@ type Props = {
 	handleRetrySaveExport: () => void;
 	handleStartExportFromDropdown: () => void;
 	revealExportedFile: () => void;
-	exportMessage: string | null;
 };
 
 export function EditorHeader(props: Props) {
 	const text = useUiText();
 	const { shortcuts, isMac } = useShortcuts();
+	const { canUndo, canRedo } = useSyncExternalStore(props.historyFlags.subscribe, props.historyFlags.get);
 	const {
 		t,
 		headerLeftControlsPaddingClass,
@@ -78,8 +79,6 @@ export function EditorHeader(props: Props) {
 		projectBrowserTriggerRef,
 		projectNameInputRef,
 		projectDisplayName,
-		canUndo,
-		canRedo,
 		handleOpenProjectBrowser,
 		handleUndo,
 		handleRedo,
@@ -91,7 +90,6 @@ export function EditorHeader(props: Props) {
 		exportPreflight,
 		exportDimensions,
 		timelineDuration,
-		exportStatus,
 		hasCaptionsForSidecar,
 		nvidiaCudaExportAvailable,
 		experimentalNvidiaCudaExport,
@@ -102,7 +100,6 @@ export function EditorHeader(props: Props) {
 		handleRetrySaveExport,
 		handleStartExportFromDropdown,
 		revealExportedFile,
-		exportMessage,
 	} = props;
 	const {
 		isEditingProjectName,
@@ -214,6 +211,12 @@ export function EditorHeader(props: Props) {
 				</div>
 				{project.videoPath && <ProjectSaveStatus feedback={props.saveFeedback} dirty={props.hasUnsavedChanges}
 					onRetry={props.handleSaveProject} onSaveAs={props.handleSaveProjectAs} />}
+				{props.onHandOffToAgent && (
+					<Button variant="ghost" size="sm" className="shrink-0" disabled={props.agentHandoffBusy}
+						onClick={props.onHandOffToAgent}>
+						{t("common.interface.projectHandOffToAgent")}
+					</Button>
+				)}
 				<Separator orientation="vertical" className="mx-3 h-5 shrink-0 self-center" />
 				<Button
 					variant="secondary"
@@ -258,6 +261,12 @@ export function EditorHeader(props: Props) {
 					</Button>
 				</div>
 				<KeyboardShortcutsHelp />
+				<Button type="button" variant="ghost" size="icon"
+					aria-label={t("common.interface.applicationSettings")}
+					title={t("common.interface.applicationSettings")}
+					onClick={props.onOpenApplicationSettings}>
+					<Gear className="size-4" />
+				</Button>
 				<EditorPresetMenu t={t} presets={presets} />
 				<EditorExportMenu
 					t={t}
@@ -266,7 +275,6 @@ export function EditorHeader(props: Props) {
 					exportSession={exportSession}
 					preflight={exportPreflight}
 					exportDimensions={exportDimensions}
-					exportStatus={exportStatus}
 					hasCaptionsForSidecar={hasCaptionsForSidecar}
 					nvidiaCudaExportAvailable={nvidiaCudaExportAvailable}
 					experimentalNvidiaCudaExport={experimentalNvidiaCudaExport}
@@ -277,7 +285,6 @@ export function EditorHeader(props: Props) {
 					handleRetrySaveExport={handleRetrySaveExport}
 					handleStartExportFromDropdown={handleStartExportFromDropdown}
 					revealExportedFile={revealExportedFile}
-					exportMessage={exportMessage}
 					projectPath={project.currentProjectPath}
 					projectTitle={projectDisplayName}
 				/>

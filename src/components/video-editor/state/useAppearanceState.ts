@@ -1,9 +1,11 @@
 import { useState } from "react";
+import { createObservableValue } from "@/lib/observableValue";
 import type { EditorPreferences } from "../editorPreferences";
 import type {
 	CropRegion,
 	CursorClickEffectStyle,
 	CursorStyle,
+	PaddingSide,
 	WebcamOverlaySettings,
 	ZoomMotionBlurTuning,
 	ZoomTransitionEasing,
@@ -109,6 +111,7 @@ export function useAppearanceState(preferences: EditorPreferences) {
 	const [cursorSway, setCursorSway] = useState(preferences.cursorSway);
 	const [borderRadius, setBorderRadius] = useState(preferences.borderRadius);
 	const [padding, setPadding] = useState(preferences.padding);
+	const [paddingDraft] = useState(() => createObservableValue<{ side: PaddingSide; value: number } | null>(null));
 	const [cropRegion, setCropRegion] = useState<CropRegion>(DEFAULT_CROP_REGION);
 	const [webcam, setWebcam] = useState<WebcamOverlaySettings>(
 		preferences.webcam ?? DEFAULT_WEBCAM_OVERLAY,
@@ -193,6 +196,7 @@ export function useAppearanceState(preferences: EditorPreferences) {
 		borderRadius,
 		setBorderRadius,
 		padding,
+		paddingDraft,
 		setPadding,
 		cropRegion,
 		setCropRegion,

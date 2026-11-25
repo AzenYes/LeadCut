@@ -20,6 +20,7 @@ import {
 	cleanupAllExportStreams,
 	closeExportStream,
 	hasExportStream,
+	isDestinationStagedExportPath,
 	isOwnedExportPath,
 	openExportStream,
 	writeToExportStream,
@@ -98,6 +99,21 @@ describe("exportStream", () => {
 		expect(result.tempPath).toBeNull();
 		expect(result.bytesWritten).toBe(0);
 		expect(isOwnedExportPath(tempPath)).toBe(false);
+	});
+
+	it("cleans up private MP4 staging on the destination volume", async () => {
+		const destinationDirectory = await fs.mkdtemp(path.join(TMP_ROOT, "destination-"));
+		const { streamId, tempPath } = await openExportStream({ extension: "mp4" }, destinationDirectory);
+		const stagingDirectory = path.dirname(tempPath);
+		expect(path.dirname(stagingDirectory)).toBe(destinationDirectory);
+		expect(path.basename(stagingDirectory)).toMatch(/^\.leadcut-export-/);
+		expect(isDestinationStagedExportPath(tempPath)).toBe(true);
+		await writeToExportStream(streamId, 0, new Uint8Array([1, 2, 3]));
+
+		await closeExportStream(streamId, { abort: true });
+
+		expect(isOwnedExportPath(tempPath)).toBe(false);
+		await expect(fs.readdir(destinationDirectory)).resolves.toEqual([]);
 	});
 
 	it("tracks open temp paths in the owned-path registry until close", async () => {

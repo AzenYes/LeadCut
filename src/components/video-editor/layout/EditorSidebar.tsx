@@ -1,7 +1,9 @@
 import { useInspectorLayout } from "./useInspectorLayout";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useUiText } from "@/i18n/useUiText";
 import { loadAppSetting, saveAppSetting } from "@/lib/appSettings";
+import { ADVANCED_SECTIONS_STORAGE_KEY } from "@/lib/storageKeys";
 import { Camera, ClosedCaptioning, Cursor, Gear, FrameCorners, BookmarkSimple, Check, File, TextT, CaretDown, Keyboard, X } from "@/components/ui/icons";
 import {
 	ToggleButtonGroup,
@@ -12,16 +14,24 @@ import {
 	Label,
 } from "@heroui/react";
 import type { ComponentProps, ReactNode } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import type { useI18n } from "@/contexts/I18nContext";
 import ExtensionManager from "../ExtensionManager";
-import { SettingsPanel } from "../SettingsPanel";
+import type { SettingsPanel } from "../SettingsPanel";
 import type { EditorEffectSection } from "../types";
 
-const ADVANCED_SECTIONS_KEY = "leadcut.editor.advancedSections";
+const DeferredSettingsPanel = lazy(async () => ({ default: (await import("../SettingsPanel")).SettingsPanel }));
+
+export function EditorSettingsPanel(props: ComponentProps<typeof SettingsPanel>) {
+	return (
+		<Suspense fallback={<Skeleton className="mx-4 my-3 h-36" />}>
+			<DeferredSettingsPanel {...props} />
+		</Suspense>
+	);
+}
 
 function loadAdvancedSections(): Partial<Record<string, boolean>> {
-	const current = loadAppSetting<unknown>(ADVANCED_SECTIONS_KEY);
+	const current = loadAppSetting<unknown>(ADVANCED_SECTIONS_STORAGE_KEY);
 	return current && typeof current === "object" && !Array.isArray(current)
 		? Object.fromEntries(Object.entries(current).filter(([, value]) => typeof value === "boolean"))
 		: {};
@@ -29,6 +39,7 @@ function loadAdvancedSections(): Partial<Record<string, boolean>> {
 
 type Props = {
 	readOnly?: boolean;
+	deferPanels?: boolean;
 	panelContent?: ReactNode;
 	panelKey?: string;
 	t: ReturnType<typeof useI18n>["t"];
@@ -47,12 +58,18 @@ export function EditorSidebar({
 	panelContent,
 	panelKey,
 	readOnly,
+	deferPanels,
 }: Props) {
 	const text = useUiText();
 	const layout = useInspectorLayout(panelKey === "captionList");
 	const showSelectedTool = !panelContent || panelKey === "chapters" || panelKey === "keystrokes" || panelKey === "captionList" || panelKey === "review";
 	const asideRef = useRef<HTMLElement>(null);
 	const toggleRef = useRef<HTMLButtonElement>(null);
+	const [inspectorRequested, setInspectorRequested] = useState(false);
+	const loadPanels = !deferPanels || inspectorRequested;
+	useEffect(() => {
+		if (!deferPanels) setInspectorRequested(true);
+	}, [deferPanels]);
 	const closePanel = () => { layout.setOpen(false); toggleRef.current?.focus(); };
 	const selectionKey = [panelKey, settingsPanelProps.selectedAnnotationId, settingsPanelProps.selectedClipId, selectedCaptionId].join(":");
 	const previousSelection = useRef(selectionKey);
@@ -89,7 +106,7 @@ export function EditorSidebar({
 			{ id: "review" as const, label: t("common.interface.reviewTitle"), icon: Check },
 			{
 				id: "settings" as const,
-				label: t("settings.sections.settings", "Settings"),
+				label: t("settings.general.motion", "Motion"),
 				icon: Gear,
 			},
 		],
@@ -103,7 +120,10 @@ export function EditorSidebar({
 				className={`flex shrink-0 flex-col items-center gap-2 py-2.5 overflow-y-auto ${layout.preferences.labels && !layout.compact ? "w-28" : "w-16"}`}
 			>
 				<Button ref={toggleRef} variant="ghost" size="icon" aria-label={text(layout.open ? "inspectorCollapse" : "inspectorExpand")}
-					aria-expanded={layout.open} aria-controls="editor-inspector" onClick={() => layout.setOpen(!layout.open)}>
+					aria-expanded={layout.open} aria-controls="editor-inspector" onClick={() => {
+						if (!layout.open) setInspectorRequested(true);
+						layout.setOpen(!layout.open);
+					}}>
 					<CaretDown className={`size-4 ${layout.open ? "rotate-90" : "-rotate-90"}`} />
 				</Button>
 				<ToggleButtonGroup
@@ -124,8 +144,9 @@ export function EditorSidebar({
 								id={section.id}
 								variant="ghost"
 								isIconOnly={!layout.preferences.labels || layout.compact}
-								onPress={() => layout.setOpen(true)}
-								className={layout.preferences.labels && !layout.compact ? "w-24 justify-start gap-2" : ""}
+								onPress={() => { setInspectorRequested(true); layout.setOpen(true); }}
+								data-onboarding-target={section.id === "captions" ? "captions" : undefined}
+								className={`data-[onboarding-active]:ring-2 data-[onboarding-active]:ring-accent ${layout.preferences.labels && !layout.compact ? "w-24 justify-start gap-2" : ""}`}
 								aria-label={section.label}
 							>
 								<section.icon
@@ -159,7 +180,8 @@ export function EditorSidebar({
 					{panelContent ?? (
 						<>
 							<header className="flex min-h-14 shrink-0 items-center justify-between gap-3 px-5 py-3">
-								<Card.Title className="text-[14px]">
+								<div className="min-w-0">
+									<Card.Title className="text-[14px]">
 									{settingsPanelProps.selectedAnnotationId
 										? t("timeline.annotation.label", "Annotation")
 										: (sections.find((section) => section.id === activeSection)
@@ -169,7 +191,13 @@ export function EditorSidebar({
 												activeSection.charAt(0).toUpperCase() +
 													activeSection.slice(1),
 											))}
-								</Card.Title>
+									</Card.Title>
+									<p className="mt-0.5 text-xs text-muted-foreground">
+										{t(settingsPanelProps.selectedAnnotationId || ["zoom", "clip", "audio"].includes(activeSection)
+											? "common.interface.settingsScopeSelectedItem"
+											: "common.interface.settingsScopeProject")}
+									</p>
+								</div>
 								{hasAdvanced && (
 									<Switch
 										size="sm"
@@ -177,7 +205,7 @@ export function EditorSidebar({
 									onChange={(value) => {
 										const next = { ...advancedSections, [activeSection]: value };
 										setAdvancedSections(next);
-										saveAppSetting(ADVANCED_SECTIONS_KEY, next);
+										saveAppSetting(ADVANCED_SECTIONS_STORAGE_KEY, next);
 									}}
 										aria-label={t(
 											"settings.sections.advancedSettings",
@@ -195,10 +223,10 @@ export function EditorSidebar({
 									</Switch>
 								)}
 							</header>
-							{activeSection === "extensions" ? (
+							{!loadPanels ? <Skeleton className="mx-4 my-3 h-36" /> : activeSection === "extensions" ? (
 								<ExtensionManager />
 							) : (
-								<SettingsPanel {...settingsPanelProps} advanced={advanced} />
+								<EditorSettingsPanel {...settingsPanelProps} advanced={advanced} />
 							)}
 						</>
 					)}

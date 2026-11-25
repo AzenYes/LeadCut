@@ -1,4 +1,5 @@
 import type { useI18n } from "@/contexts/I18nContext";
+import { useSyncExternalStore } from "react";
 import { resolveExportStatusModel } from "../exportStatusModel";
 import type { useExportSession } from "./useExportSession";
 import type { useExportSettings } from "./useExportSettings";
@@ -10,9 +11,10 @@ type Input = {
 };
 
 export function useExportStatusViewModel({ t, session, settings }: Input) {
+	const progress = useSyncExternalStore(session.progress.subscribe, session.progress.get);
 	const status = resolveExportStatusModel({
 		isExporting: session.isExporting,
-		exportProgress: session.exportProgress,
+		exportProgress: progress,
 		exportFormat: settings.exportFormat,
 		exportPipelineModel: settings.exportPipelineModel,
 	});
@@ -21,7 +23,6 @@ export function useExportStatusViewModel({ t, session, settings }: Input) {
 				fps: status.renderSpeedFps,
 			})
 		: null;
-	const progress = session.exportProgress;
 	const exportPercentLabel = progress
 		? status.isExportPreparing
 			? t("editor.exportStatus.preparing", "Preparing export...")
@@ -54,5 +55,5 @@ export function useExportStatusViewModel({ t, session, settings }: Input) {
 							})
 		: t("editor.exportStatus.preparing", "Preparing export...");
 
-	return { ...status, exportRenderSpeedLabel, exportPercentLabel };
+	return { ...status, exportProgress: progress, exportRenderSpeedLabel, exportPercentLabel };
 }

@@ -10,6 +10,7 @@ import {
 	setWindowsCaptureStopRequested,
 	setWindowsNativeCaptureActive,
 	windowsCaptureOutputBuffer,
+	windowsCaptureProcess,
 	windowsCaptureStopRequested,
 	windowsCaptureTargetPath,
 	windowsNativeCaptureActive,
@@ -172,7 +173,23 @@ export function waitForWindowsCaptureStop(
 }
 
 export function attachWindowsCaptureLifecycle(proc: ChildProcessWithoutNullStreams) {
+	let pending = "";
+	let sourceClosed = false;
+	proc.stdout.setEncoding("utf8");
+	proc.stdout.on("data", (chunk: string) => {
+		const lines = (pending + chunk).split(/\r?\n/);
+		pending = (lines.pop() ?? "").slice(-256);
+		for (const line of lines) {
+			if (line === "EVENT source-closed") sourceClosed = true;
+			const match = /^EVENT audio-lost (mic|system)$/.exec(line);
+			if (!match || windowsCaptureProcess !== proc) continue;
+			for (const window of BrowserWindow.getAllWindows()) {
+				if (!window.isDestroyed()) window.webContents.send("recording-audio-lost", match[1]);
+			}
+		}
+	});
 	proc.once("close", () => {
+		if (windowsCaptureProcess !== proc) return;
 		const wasActive = windowsNativeCaptureActive;
 		setWindowsCaptureProcess(null);
 
@@ -194,7 +211,10 @@ export function attachWindowsCaptureLifecycle(proc: ChildProcessWithoutNullStrea
 			}
 		});
 
-		emitRecordingInterrupted("capture-stopped", uiText("recordingStoppedUnexpectedly"));
+		emitRecordingInterrupted(
+			sourceClosed ? "source-closed" : "capture-stopped",
+			uiText(sourceClosed ? "recordingSourceClosed" : "recordingStoppedUnexpectedly"),
+		);
 	});
 }
 

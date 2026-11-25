@@ -23,11 +23,14 @@ type IpcStreamSink = {
 	readonly tempPath: string;
 };
 
-async function openIpcExportStream(): Promise<IpcStreamSink> {
+async function openIpcExportStream(destinationPath?: string): Promise<IpcStreamSink> {
 	if (typeof window === "undefined" || !window.electronAPI?.openExportStream) {
 		throw new Error("openExportStream IPC is unavailable in this environment");
 	}
-	const result = await window.electronAPI.openExportStream({ extension: "mp4" });
+	const result = await window.electronAPI.openExportStream({
+		extension: "mp4",
+		...(destinationPath ? { destinationPath } : {}),
+	});
 	if (!result.success || !result.streamId || !result.tempPath) {
 		throw new Error(result.error || "Failed to open export stream");
 	}
@@ -62,7 +65,8 @@ async function closeIpcExportStream(
 	return { tempPath: result.tempPath, bytesWritten: result.bytesWritten ?? 0 };
 }
 
-export type MuxerTargetMode = "stream" | "buffer";
+export type MuxerTargetMode = "stream" | "buffer" | "pipe";
+type ExportPipeWriter = (data: Uint8Array) => Promise<void>;
 
 export type MuxerFinalizeResult =
 	| { mode: "stream"; tempFilePath: string; bytesWritten: number }
@@ -86,11 +90,24 @@ export class VideoMuxer {
 	private config: ExportConfig;
 	private mode: MuxerTargetMode;
 	private streamSink: IpcStreamSink | null = null;
+	private writeToPipe?: ExportPipeWriter;
+	private pipeError: Error | null = null;
 
-	constructor(config: ExportConfig, hasAudio = false, mode?: MuxerTargetMode) {
+	constructor(
+		config: ExportConfig,
+		hasAudio = false,
+		destination?: "stream" | "buffer" | ExportPipeWriter,
+		private readonly destinationPath?: string,
+		private readonly reservedVideoPackets?: number,
+	) {
 		this.config = config;
 		this.hasAudio = hasAudio;
-		this.mode = mode ?? (shouldUseStreamTarget() ? "stream" : "buffer");
+		if (typeof destination === "function") {
+			this.mode = "pipe";
+			this.writeToPipe = destination;
+		} else {
+			this.mode = destination ?? (shouldUseStreamTarget() ? "stream" : "buffer");
+		}
 	}
 
 	getTargetMode(): MuxerTargetMode {
@@ -98,8 +115,25 @@ export class VideoMuxer {
 	}
 
 	async initialize(): Promise<void> {
-		if (this.mode === "stream") {
-			const sink = await openIpcExportStream();
+		if (this.writeToPipe) {
+			const writeToPipe = this.writeToPipe;
+			let position = 0;
+			this.target = new StreamTarget(new WritableStream({
+				write: async (chunk) => {
+					if (this.pipeError) return;
+					try {
+						if (chunk.position !== position) throw new Error("MP4 pipe requires sequential writes");
+						await writeToPipe(chunk.data);
+						position += chunk.data.byteLength;
+					} catch (error) {
+						// StreamTarget does not await every write promise. Surface errors to
+						// the export loop and finalizer without rejecting an unobserved promise.
+						this.pipeError = error instanceof Error ? error : new Error(String(error));
+					}
+				},
+			}));
+		} else if (this.mode === "stream") {
+			const sink = await openIpcExportStream(this.destinationPath);
 			this.streamSink = sink;
 			const streamId = sink.streamId;
 			const writableStream = new WritableStream<{
@@ -122,9 +156,10 @@ export class VideoMuxer {
 			this.target = new BufferTarget();
 		}
 
+		const reserveMovie = this.mode === "stream" && this.reservedVideoPackets !== undefined;
 		this.output = new Output({
 			format: new Mp4OutputFormat({
-				fastStart: false,
+				fastStart: this.mode === "pipe" ? "fragmented" : reserveMovie ? "reserve" : false,
 			}),
 			target: this.target,
 		});
@@ -132,6 +167,7 @@ export class VideoMuxer {
 		this.videoSource = new EncodedVideoPacketSource("avc");
 		this.output.addVideoTrack(this.videoSource, {
 			frameRate: this.config.frameRate,
+			maximumPacketCount: reserveMovie ? this.reservedVideoPackets : undefined,
 		});
 
 		if (this.hasAudio) {
@@ -143,6 +179,7 @@ export class VideoMuxer {
 	}
 
 	async addVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): Promise<void> {
+		if (this.pipeError) throw this.pipeError;
 		if (!this.videoSource) {
 			throw new Error("Muxer not initialized");
 		}
@@ -161,6 +198,7 @@ export class VideoMuxer {
 	}
 
 	async finalize(): Promise<MuxerFinalizeResult> {
+		if (this.mode === "pipe") throw new Error("MP4 pipe must be finalized with finalizePipe");
 		if (!this.output || !this.target) {
 			throw new Error("Muxer not initialized");
 		}
@@ -189,6 +227,13 @@ export class VideoMuxer {
 			throw new Error("Failed to finalize output");
 		}
 		return { mode: "buffer", blob: new Blob([buffer], { type: "video/mp4" }) };
+	}
+
+	async finalizePipe(): Promise<void> {
+		if (this.mode !== "pipe" || !this.output) throw new Error("MP4 pipe not initialized");
+		if (this.pipeError) throw this.pipeError;
+		await this.output.finalize();
+		if (this.pipeError) throw this.pipeError;
 	}
 
 	async abortStream(): Promise<void> {

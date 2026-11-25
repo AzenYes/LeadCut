@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { ModernVideoExporter as ModernVideoExporterClass } from "./modernVideoExporter";
+import { GpuFramePipelineError } from "./webGpuNv12Readback";
 
 const mocks = vi.hoisted(() => {
 	const videoInfo = {
@@ -31,10 +32,12 @@ const mocks = vi.hoisted(() => {
 			blob: new Blob([], { type: "video/mp4" }),
 		})),
 		muxerInitialize: vi.fn(async () => {}),
+		muxerFinalizePipe: vi.fn(async () => {}),
 	};
 });
 
-vi.mock("./streamingDecoder", () => ({
+vi.mock("./streamingDecoder", async (importOriginal) => ({
+	...await importOriginal<typeof import("./streamingDecoder")>(),
 	StreamingVideoDecoder: vi.fn().mockImplementation(function () {
 		return {
 			cancel: mocks.streamingDecoderCancel,
@@ -50,6 +53,7 @@ vi.mock("./streamingDecoder", () => ({
 vi.mock("./modernFrameRenderer", () => ({
 	FrameRenderer: vi.fn().mockImplementation(function () {
 		return {
+			cancelPendingMedia: vi.fn(),
 			destroy: mocks.frameRendererDestroy,
 			getRendererBackend: mocks.frameRendererGetBackend,
 			initialize: mocks.frameRendererInitialize,
@@ -62,10 +66,24 @@ vi.mock("./muxer", () => ({
 		return {
 			destroy: mocks.muxerDestroy,
 			finalize: mocks.muxerFinalize,
+			finalizePipe: mocks.muxerFinalizePipe,
 			initialize: mocks.muxerInitialize,
 		};
 	}),
 }));
+
+function mockActiveNativeStream(exporter: object) {
+	const stream = exporter as {
+		tryStartNativeVideoExport: () => Promise<boolean>;
+		nativeExportSessionId: string;
+		nativeH264Encoder: Pick<VideoEncoder, "flush" | "close">;
+	};
+	return vi.spyOn(stream, "tryStartNativeVideoExport").mockImplementation(async () => {
+		stream.nativeExportSessionId = "native-stream";
+		stream.nativeH264Encoder = { flush: vi.fn(async () => {}), close: vi.fn() };
+		return true;
+	});
+}
 
 describe("ModernVideoExporter native fallback routing", () => {
 	let ModernVideoExporter: typeof ModernVideoExporterClass;
@@ -80,6 +98,45 @@ describe("ModernVideoExporter native fallback routing", () => {
 		vi.unstubAllGlobals();
 	});
 
+	it.each([true, false])("holds the first frame during GPU readback (canvas recovery: %s)", async (canRecover) => {
+		const exporter = new ModernVideoExporter({ useGpuFramePipeline: true } as never);
+		const readback = Promise.withResolvers<VideoFrame>();
+		const internal = exporter as unknown as {
+			encodeRenderedFrame: (timestamp: number, duration: number, index: number) => Promise<void>;
+			submitRenderedFrame: (timestamp: number, duration: number, index: number) => Promise<void>;
+			renderer: {
+				takeGpuOutputFrame: () => Promise<VideoFrame>;
+				recoverCanvasAfterGpuReadbackFailure: () => Promise<boolean>;
+			};
+		};
+		internal.renderer = {
+			takeGpuOutputFrame: () => readback.promise,
+			recoverCanvasAfterGpuReadbackFailure: vi.fn(async () => canRecover),
+		};
+		const submit = vi.spyOn(internal, "submitRenderedFrame").mockResolvedValue(undefined);
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const buffered = internal.encodeRenderedFrame(0, 16_667, 0);
+			const finished = vi.fn();
+			void buffered.then(finished, finished);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(finished).not.toHaveBeenCalled();
+			const error = new GpuFramePipelineError("GPU export frame readback failed");
+			readback.reject(error);
+			if (canRecover) {
+				await buffered;
+				expect(submit).toHaveBeenCalledExactlyOnceWith(0, 16_667, 0);
+			} else {
+				await expect(buffered).rejects.toBe(error);
+				expect(submit).not.toHaveBeenCalled();
+			}
+			expect(internal.renderer.recoverCanvasAfterGpuReadbackFailure).toHaveBeenCalledOnce();
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
 	it("removes failed native writes without creating an unhandled rejection", async () => {
 		const exporter = new ModernVideoExporter({} as never) as unknown as {
 			trackNativeWritePromise: (write: Promise<void>) => void;
@@ -91,10 +148,254 @@ describe("ModernVideoExporter native fallback routing", () => {
 		expect(exporter.nativeWritePromises.size).toBe(0);
 	});
 
+	it("cancels a pending WebCodecs flush before container finalization", async () => {
+		const flushing = Promise.withResolvers<void>();
+		const encoderFlush = Promise.withResolvers<void>();
+		const encoder = {
+			state: "configured",
+			flush: vi.fn(() => {
+				flushing.resolve();
+				return encoderFlush.promise;
+			}),
+			close: vi.fn(() => {
+				encoder.state = "closed";
+				encoderFlush.reject(new Error("Encoder closed"));
+			}),
+		};
+		const exporter = new ModernVideoExporter({
+			backendPreference: "webcodecs", width: 1920, height: 1080, frameRate: 30,
+			bitrate: 6_000_000, videoUrl: "file:///recording.mp4",
+		} as never);
+		const internal = exporter as unknown as {
+			initializeEncoder: () => Promise<unknown>;
+			encoder: typeof encoder;
+		};
+		vi.spyOn(internal, "initializeEncoder").mockImplementation(async () => {
+			internal.encoder = encoder;
+			return { hardwareAcceleration: "prefer-software" };
+		});
+
+		const result = exporter.export();
+		await flushing.promise;
+		exporter.cancel();
+
+		await expect(result).resolves.toMatchObject({ success: false, error: "Export cancelled" });
+		expect(encoder.close).toHaveBeenCalledOnce();
+		expect(mocks.muxerFinalize).not.toHaveBeenCalled();
+		expect(mocks.muxerDestroy).toHaveBeenCalledOnce();
+	});
+
+	it.each([false, true])("collects environment diagnostics only when an export fails (failure: %s)", async (fails) => {
+		const getAppVersion = vi.fn(async () => "0.1.2");
+		const getExportHardwareInfo = vi.fn(async () => ({ success: false }));
+		vi.stubGlobal("window", { electronAPI: { getAppVersion, getExportHardwareInfo } });
+		const exporter = new ModernVideoExporter({ backendPreference: "webcodecs", width: 1920,
+			height: 1080, frameRate: 30, bitrate: 6_000_000, videoUrl: "file:///recording.mp4" } as never);
+		const internal = exporter as unknown as { initializeEncoder: () => Promise<unknown> };
+		vi.spyOn(internal, "initializeEncoder").mockImplementation(async () => {
+			if (fails) throw new Error("Video encoding not supported");
+			return { hardwareAcceleration: "prefer-software" };
+		});
+		const result = await exporter.export();
+		expect(result.success).toBe(!fails);
+		expect(getAppVersion).toHaveBeenCalledTimes(fails ? 1 : 0);
+		expect(getExportHardwareInfo).toHaveBeenCalledTimes(fails ? 1 : 0);
+		if (fails) expect(result.error).toContain("LeadCut version: 0.1.2");
+	});
+
+	it("counts overlapping transport writes once and ignores stale write acknowledgements", async () => {
+		const first = Promise.withResolvers<{ success: boolean }>();
+		const second = Promise.withResolvers<{ success: boolean }>();
+		const abandoned = Promise.withResolvers<{ success: boolean }>();
+		vi.stubGlobal("window", { electronAPI: {
+			nativeVideoExportWriteFrames: vi.fn().mockReturnValueOnce(first.promise)
+				.mockReturnValueOnce(second.promise).mockReturnValueOnce(abandoned.promise),
+		} });
+		const exporter = new ModernVideoExporter({} as never) as unknown as {
+			nativeExportSessionId: string;
+			nativeWriteTimeMs: number;
+			peakNativeWriteInFlight: number;
+			writeNativeVideoChunks: (session: string, chunks: Uint8Array[]) => Promise<unknown>;
+			getNowMs: () => number;
+		};
+		exporter.nativeExportSessionId = "first";
+		let now = 10;
+		vi.spyOn(exporter, "getNowMs").mockImplementation(() => now);
+		const video = [new Uint8Array([1])];
+		const firstWrite = exporter.writeNativeVideoChunks("first", video);
+		now = 15;
+		const secondWrite = exporter.writeNativeVideoChunks("first", video);
+		now = 20;
+		first.resolve({ success: true });
+		await firstWrite;
+		now = 25;
+		second.resolve({ success: true });
+		await secondWrite;
+		expect(exporter.nativeWriteTimeMs).toBe(15);
+		expect(exporter.peakNativeWriteInFlight).toBe(2);
+		const abandonedWrite = exporter.writeNativeVideoChunks("first", video);
+		exporter.nativeExportSessionId = "retry";
+		now = 40;
+		abandoned.resolve({ success: true });
+		await abandonedWrite;
+		expect(exporter.nativeWriteTimeMs).toBe(15);
+	});
+
+	it("records both the planned route and the actual fallback on a normal export", async () => {
+		vi.stubGlobal("navigator", { platform: "Win32" });
+		const nativeVideoExportStart = vi.fn();
+		vi.stubGlobal("window", { electronAPI: { nativeVideoExportStart } });
+		vi.stubGlobal("VideoEncoder", { isConfigSupported: vi.fn(async () => ({ supported: false })) });
+		const onRouteChange = vi.fn();
+		const exporter = new ModernVideoExporter({
+			backendPreference: "auto", onRouteChange,
+			videoUrl: "file:///recording.mp4", wallpaper: "#000000",
+			width: 1920, height: 1080, frameRate: 30, bitrate: 8_000_000,
+		} as never);
+		const internal = exporter as unknown as { initializeEncoder: () => Promise<unknown> };
+		vi.spyOn(internal, "initializeEncoder").mockResolvedValue({ hardwareAcceleration: "prefer-software" });
+
+		const result = await exporter.export();
+
+		expect(result.success).toBe(true);
+		expect(result.metrics).toMatchObject({
+			exportRoute: "webcodecs",
+			exportRoutePlan: { primary: "breeze-stream", fallbacks: ["webcodecs"] },
+		});
+		expect(nativeVideoExportStart).not.toHaveBeenCalled();
+		expect(result.metrics?.routeChanges).toContainEqual({
+			reason: "native-encoder",
+			detail: "H.264 Annex B encoding is not supported at 1920x1080.",
+			restarted: false,
+		});
+		expect(onRouteChange).not.toHaveBeenCalledWith(expect.objectContaining({ reason: "native-encoder" }));
+	});
+
+	it("tries a failed Breeze startup only once and keeps the configured software encoder", async () => {
+		vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+		const exporter = new ModernVideoExporter({
+			videoUrl: "file:///recording.mp4", width: 1920, height: 1080, frameRate: 30,
+			bitrate: 8_000_000, wallpaper: "#000000", backendPreference: "auto",
+		} as never);
+		const internal = exporter as unknown as {
+			initializeEncoder: () => Promise<unknown>;
+			tryStartNativeVideoExport: () => Promise<boolean>;
+		};
+		const initialize = vi.spyOn(internal, "initializeEncoder").mockResolvedValue({ hardwareAcceleration: "prefer-software" });
+		const breeze = vi.spyOn(internal, "tryStartNativeVideoExport").mockRejectedValue(new Error("Breeze transport unavailable"));
+
+		const result = await exporter.export();
+
+		expect(initialize).toHaveBeenCalledOnce();
+		expect(breeze).toHaveBeenCalledOnce();
+		expect(result).toMatchObject({
+			success: true,
+			metrics: {
+				exportRoute: "webcodecs",
+				routeChanges: [{ reason: "native-encoder", detail: "Breeze transport unavailable", restarted: false }],
+			},
+		});
+	});
+
+	it.each([false, true])("uses the Linux audio streaming route only when needed (audio: %s)", async (hasAudio) => {
+		vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+		vi.stubGlobal("window", { electronAPI: {
+			nativeVideoExportWriteWav: vi.fn(),
+			nativeVideoExportEndVideoInput: vi.fn(),
+		} });
+		vi.stubGlobal("AudioEncoder", undefined);
+		mocks.streamingDecoderLoadMetadata.mockResolvedValueOnce({ ...mocks.videoInfo, hasAudio });
+		const exporter = new ModernVideoExporter({
+			backendPreference: "auto",
+			videoUrl: "file:///recording.mp4",
+			width: 1920,
+			height: 1080,
+			frameRate: 30,
+			bitrate: 8_000_000,
+			wallpaper: "#000000",
+		} as never);
+		const internal = exporter as unknown as {
+			initializeEncoder: () => Promise<unknown>;
+			finishNativeVideoExport: () => Promise<unknown>;
+		};
+		const start = mockActiveNativeStream(exporter);
+		const initialize = vi.spyOn(internal, "initializeEncoder").mockResolvedValue({ hardwareAcceleration: "prefer-software" });
+		vi.spyOn(internal, "finishNativeVideoExport").mockResolvedValue({ success: true, tempFilePath: "/tmp/recording.mp4" });
+
+		const result = await exporter.export();
+
+		expect(result.success).toBe(true);
+		expect(start).toHaveBeenCalledTimes(hasAudio ? 1 : 0);
+		expect(initialize).toHaveBeenCalledTimes(hasAudio ? 0 : 1);
+	});
+
+	it.each(["streamed", "unavailable", "pipe-failure", "disk-full", "auto-webcodecs"])("keeps WebCodecs selected when the audio mux is %s", async (mode) => {
+		vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+		vi.stubGlobal("AudioEncoder", undefined);
+		const start = vi.fn(async () => mode === "unavailable"
+			? { success: false, error: "Audio stream unavailable" }
+			: { success: true, sessionId: "audio-stream" });
+		vi.stubGlobal("window", { electronAPI: {
+			nativeVideoExportStart: start,
+			nativeVideoExportWriteFrames: vi.fn(),
+			nativeVideoExportWriteWav: vi.fn(),
+			nativeVideoExportEndVideoInput: vi.fn(),
+			nativeVideoExportCancel: vi.fn(async () => ({ success: true })),
+		} });
+		mocks.streamingDecoderLoadMetadata.mockResolvedValue({ ...mocks.videoInfo, hasAudio: true });
+		mocks.streamingDecoderGetEffectiveDuration.mockReturnValue(1);
+		if (mode === "pipe-failure" || mode === "disk-full") {
+			mocks.muxerFinalizePipe.mockRejectedValueOnce(new Error(mode === "disk-full" ? "ENOSPC" : "Pipe failed"));
+		}
+		const onRouteChange = vi.fn();
+		const exporter = new ModernVideoExporter({
+			backendPreference: mode === "auto-webcodecs" ? "auto" : "webcodecs", onRouteChange, measureFrameTiming: true,
+			videoUrl: "file:///recording.mp4", wallpaper: "#000000",
+			width: 1920, height: 1080, frameRate: 30, bitrate: 8_000_000,
+		} as never);
+		const internal = exporter as unknown as {
+			initializeEncoder: () => Promise<unknown>;
+			tryStartNativeVideoExport: () => Promise<boolean>;
+			finishNativeVideoExport: () => Promise<unknown>;
+			finalizeExportWithFfmpegAudio: () => Promise<unknown>;
+		};
+		const encode = vi.spyOn(internal, "initializeEncoder").mockResolvedValue({ hardwareAcceleration: "prefer-software" });
+		const breeze = vi.spyOn(internal, "tryStartNativeVideoExport").mockResolvedValue(false);
+		const streamFinish = vi.spyOn(internal, "finishNativeVideoExport").mockResolvedValue({ success: true, tempFilePath: "/tmp/streamed.mp4" });
+		const fileFinish = vi.spyOn(internal, "finalizeExportWithFfmpegAudio").mockResolvedValue({ success: true, tempFilePath: "/tmp/file.mp4" });
+		try {
+			const result = await exporter.export();
+			expect(start).toHaveBeenCalledTimes(1);
+			expect(start).toHaveBeenCalledWith(expect.objectContaining({ inputMode: "mp4-stream" }));
+			expect(breeze).toHaveBeenCalledTimes(mode === "auto-webcodecs" ? 1 : 0);
+			if (mode === "unavailable" || mode === "pipe-failure") {
+				const routeChange = {
+					reason: "audio-mux", restarted: mode === "pipe-failure",
+					detail: mode === "pipe-failure" ? expect.stringContaining("Reason: Pipe failed") : "Audio stream unavailable",
+				};
+				expect(onRouteChange).toHaveBeenCalledExactlyOnceWith(routeChange);
+				expect(result.metrics?.routeChanges).toEqual([onRouteChange.mock.calls[0][0]]);
+			} else {
+				expect(onRouteChange).not.toHaveBeenCalled();
+				expect(result.metrics?.routeChanges).toEqual([]);
+			}
+			expect(encode).toHaveBeenCalledTimes(mode === "pipe-failure" ? 2 : 1);
+			expect(streamFinish).toHaveBeenCalledTimes(mode === "streamed" || mode === "auto-webcodecs" ? 1 : 0);
+			expect(fileFinish).toHaveBeenCalledTimes(mode === "pipe-failure" || mode === "unavailable" ? 1 : 0);
+			expect(result.success).toBe(mode !== "disk-full");
+			if (mode === "disk-full") expect(result.error).toMatch(/ran out of disk space/i);
+		} finally {
+			mocks.streamingDecoderLoadMetadata.mockResolvedValue(mocks.videoInfo);
+			mocks.streamingDecoderGetEffectiveDuration.mockReturnValue(0);
+		}
+	});
+
 	it.each([
 		"returned",
 		"thrown",
 		"write",
+		"disk-full-result",
+		"disk-full-write",
 		"cancelled",
 		"both-fail",
 		"decode",
@@ -112,34 +413,36 @@ describe("ModernVideoExporter native fallback routing", () => {
 			export: () => Promise<{ success: boolean; error?: string }>;
 			cancel: () => void;
 			initializeEncoder: () => Promise<unknown>;
-			tryStartNativeVideoExport: () => Promise<boolean>;
 			finishNativeVideoExport: () => Promise<unknown>;
 			nativeEncoderError: Error | null;
 		};
 		const log = vi.spyOn(console, "error").mockImplementation(() => {});
-		const start = vi.spyOn(exporter, "tryStartNativeVideoExport").mockResolvedValue(true);
+		const start = mockActiveNativeStream(exporter);
 		const initialize = vi.spyOn(exporter, "initializeEncoder").mockImplementation(async () => {
 			if (failure === "both-fail") throw new Error("WebCodecs unavailable");
 			return { hardwareAcceleration: "prefer-hardware" };
 		});
 		vi.spyOn(exporter, "finishNativeVideoExport").mockImplementation(async () => {
+			if (failure === "disk-full-result") return { success: false, error: "No space left on device" };
 			if (failure === "cancelled") exporter.cancel();
 			if (failure === "thrown" || failure === "cancelled")
 				throw new Error("Native finish failed");
 			return { success: false, error: "Native finish failed" };
 		});
-		if (failure === "write" || failure === "decode") {
+		if (failure === "write" || failure === "decode" || failure === "disk-full-write") {
 			mocks.streamingDecoderDecodeAll.mockImplementationOnce(async () => {
 				const error = new Error(
-					failure === "write" ? "Native write failed" : "Source decode failed",
+					failure === "disk-full-write" ? "ENOSPC: output write failed"
+						: failure === "write" ? "Native write failed" : "Source decode failed",
 				);
-				if (failure === "write") exporter.nativeEncoderError = error;
+				if (failure !== "decode") exporter.nativeEncoderError = error;
 				throw error;
 			});
 		}
 		const result = await exporter.export();
 		expect(start).toHaveBeenCalledTimes(1);
-		const shouldRetry = failure !== "cancelled" && failure !== "decode";
+		const diskFull = failure.startsWith("disk-full");
+		const shouldRetry = failure !== "cancelled" && failure !== "decode" && !diskFull;
 		expect(initialize).toHaveBeenCalledTimes(shouldRetry ? 1 : 0);
 		expect(result.success).toBe(shouldRetry && failure !== "both-fail");
 		if (shouldRetry)
@@ -151,6 +454,7 @@ describe("ModernVideoExporter native fallback routing", () => {
 			expect(result.error).toContain("WebCodecs unavailable");
 		}
 		if (failure === "cancelled") expect(result.error).toBe("Export cancelled");
+		if (diskFull) expect(result.error).toMatch(/ran out of disk space/i);
 	});
 
 	it("falls back to WebCodecs instead of surfacing a native error when Breeze is unavailable", async () => {
@@ -228,7 +532,6 @@ describe("ModernVideoExporter native fallback routing", () => {
 			finishNativeVideoExport: () => Promise<unknown>;
 			loadNativeStaticLayoutVideoInfo: () => Promise<unknown>;
 			tryExportNativeStaticLayout: () => Promise<unknown>;
-			tryStartNativeVideoExport: () => Promise<boolean>;
 		};
 
 		const loadNativeStaticLayoutVideoInfo = vi.spyOn(
@@ -236,9 +539,7 @@ describe("ModernVideoExporter native fallback routing", () => {
 			"loadNativeStaticLayoutVideoInfo",
 		);
 		const tryExportNativeStaticLayout = vi.spyOn(exporter, "tryExportNativeStaticLayout");
-		const tryStartNativeVideoExport = vi
-			.spyOn(exporter, "tryStartNativeVideoExport")
-			.mockResolvedValue(true);
+		const tryStartNativeVideoExport = mockActiveNativeStream(exporter);
 		const finishNativeVideoExport = vi
 			.spyOn(exporter, "finishNativeVideoExport")
 			.mockResolvedValue(nativeResult);

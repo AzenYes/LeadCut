@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { loadAppSetting, saveAppSetting } from "@/lib/appSettings";
+import { CAPTION_QUALITY_SETTINGS_KEY } from "@/lib/storageKeys";
 import {
-	CAPTION_QUALITY_SETTINGS_KEY,
 	checkCaptions,
 	normalizeCaptionQualityRules,
 	type CaptionQualityRules,

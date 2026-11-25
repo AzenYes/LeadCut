@@ -91,6 +91,7 @@ const {
 	mockDemuxerGetMediaInfo,
 	mockDemuxerDestroy,
 	mockDemuxerGetDecoderConfig,
+	mockGenDecoderConfig,
 	mockDemuxerRead,
 } = vi.hoisted(() => ({
 	mockDemuxerLoad: vi.fn(),
@@ -111,6 +112,7 @@ const {
 	})),
 	mockDemuxerDestroy: vi.fn(),
 	mockDemuxerGetDecoderConfig: vi.fn(),
+	mockGenDecoderConfig: vi.fn(),
 	mockDemuxerRead: vi.fn(),
 }));
 
@@ -120,6 +122,7 @@ vi.mock("web-demuxer", () => ({
 		getMediaInfo = mockDemuxerGetMediaInfo;
 		destroy = mockDemuxerDestroy;
 		getDecoderConfig = mockDemuxerGetDecoderConfig;
+		genDecoderConfig = mockGenDecoderConfig;
 		read = mockDemuxerRead;
 	},
 }));
@@ -168,6 +171,112 @@ describe("StreamingVideoDecoder decode failures", () => {
 		vi.unstubAllGlobals();
 	});
 
+	it.each([false, true])("continues feeding before frame output (multiple video streams: %s)", async (multipleStreams) => {
+		const info = await mockDemuxerGetMediaInfo();
+		const cached = { codec: "avc1.640034", codedWidth: 1920, codedHeight: 1080, rotation: 90 };
+		mockGenDecoderConfig.mockClear();
+		mockDemuxerGetDecoderConfig.mockClear();
+		if (multipleStreams) {
+			mockDemuxerGetMediaInfo.mockResolvedValueOnce({ ...info, streams: [...info.streams, info.streams[0]] });
+		} else {
+			mockGenDecoderConfig.mockReturnValueOnce(cached);
+		}
+		mockDemuxerRead.mockImplementation(() => new ReadableStream({
+			start(controller) {
+				for (const timestamp of [0, 333_333, 666_667]) controller.enqueue({ timestamp });
+				controller.close();
+			},
+		}));
+		const submit = vi.fn();
+		const configure = vi.fn();
+		class ReorderingDecoder {
+			state: CodecState = "configured";
+			decodeQueueSize = 0;
+			ondequeue: (() => void) | null = null;
+			constructor(private callbacks: VideoDecoderInit) {}
+			configure(config: VideoDecoderConfig) { configure(config); }
+			decode(chunk: EncodedVideoChunk) {
+				submit(chunk.timestamp);
+				this.decodeQueueSize++;
+				setTimeout(() => {
+					this.decodeQueueSize--;
+					this.ondequeue?.();
+					if (chunk.timestamp === 666_667) {
+						this.callbacks.output({ timestamp: 0, close: vi.fn() } as unknown as VideoFrame);
+					}
+				}, 0);
+			}
+			async flush() {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			close() { this.state = "closed"; }
+		}
+		vi.stubGlobal("VideoDecoder", ReorderingDecoder);
+		const decoder = new StreamingVideoDecoder({ maxDecodeQueue: 1 });
+		await decoder.loadMetadata("/tmp/reordered-packets.mp4");
+		const onFrame = vi.fn(async () => {});
+		try {
+			await decoder.decodeAll(1, undefined, undefined, onFrame, [
+				{ id: "excerpt", startMs: 0, endMs: 1000, sourceStartMs: 0, speed: 1 },
+			]);
+			expect(submit.mock.calls).toEqual([[0], [333_333], [666_667]]);
+			expect(onFrame).toHaveBeenCalledOnce();
+			expect(mockDemuxerGetDecoderConfig).toHaveBeenCalledTimes(multipleStreams ? 1 : 0);
+			if (!multipleStreams) expect(configure).toHaveBeenCalledWith(cached);
+		} finally {
+			decoder.destroy();
+		}
+	}, 1500);
+
+	it.each(["source read", "decoder flush"])("cancels decode while waiting for %s", async (blockedOn) => {
+		let notifyWaiting: () => void;
+		const waiting = new Promise<void>((resolve) => { notifyWaiting = resolve; });
+		const cancelRead = vi.fn();
+		const closeDecoder = vi.fn();
+		mockDemuxerRead.mockImplementation(() => new ReadableStream({
+			start(controller) {
+				controller.enqueue({ timestamp: 0 });
+				if (blockedOn === "decoder flush") controller.close();
+			},
+			cancel: cancelRead,
+		}));
+		class WaitingDecoder {
+			state: CodecState = "configured";
+			decodeQueueSize = 0;
+			private rejectFlush?: (error: Error) => void;
+			configure() {}
+			decode() {
+				if (blockedOn === "source read") notifyWaiting();
+			}
+			flush() {
+				return new Promise<void>((_resolve, reject) => {
+					this.rejectFlush = reject;
+					notifyWaiting();
+				});
+			}
+			close() {
+				this.state = "closed";
+				closeDecoder();
+				this.rejectFlush?.(new DOMException("Decoder closed", "AbortError"));
+			}
+		}
+		vi.stubGlobal("VideoDecoder", WaitingDecoder);
+		const decoder = new StreamingVideoDecoder();
+		await decoder.loadMetadata("/tmp/stalled-source.mp4");
+		const onFrame = vi.fn(async () => {});
+		try {
+			const decode = decoder.decodeAll(30, undefined, undefined, onFrame);
+			await waiting;
+			decoder.cancel();
+			await decode;
+			if (blockedOn === "source read") expect(cancelRead).toHaveBeenCalledOnce();
+			expect(closeDecoder).toHaveBeenCalledOnce();
+			expect(onFrame).not.toHaveBeenCalled();
+		} finally {
+			decoder.destroy();
+		}
+	}, 1500);
+
 	it("cancels the source stream once the last clip has its frames", async () => {
 		const cancel = vi.fn();
 		mockDemuxerRead.mockImplementation(() => new ReadableStream({
@@ -197,6 +306,50 @@ describe("StreamingVideoDecoder decode failures", () => {
 		expect(onFrame).toHaveBeenCalledTimes(2);
 		expect(cancel).toHaveBeenCalledOnce();
 		decoder.destroy();
+	});
+
+	it("closes held and queued frames when rendering fails", async () => {
+		const cancel = vi.fn();
+		const closeDecoder = vi.fn();
+		const frameClosures: Array<ReturnType<typeof vi.fn>> = [];
+		mockDemuxerRead.mockClear();
+		mockDemuxerRead.mockImplementation(() => new ReadableStream({
+			start(controller) {
+				for (const timestamp of [0, 500_000, 1_000_000]) controller.enqueue({ timestamp });
+			},
+			cancel,
+		}));
+		class ReleasingDecoder {
+			state: CodecState = "configured";
+			decodeQueueSize = 0;
+			constructor(private callbacks: VideoDecoderInit) {}
+			configure() {}
+			decode(chunk: EncodedVideoChunk) {
+				const close = vi.fn();
+				frameClosures.push(close);
+				this.callbacks.output({ timestamp: chunk.timestamp, close } as unknown as VideoFrame);
+			}
+			async flush() {}
+			close() {
+				this.state = "closed";
+				closeDecoder();
+			}
+		}
+		vi.stubGlobal("VideoDecoder", ReleasingDecoder);
+		const decoder = new StreamingVideoDecoder();
+		await decoder.loadMetadata("/tmp/failed-renderer.mp4");
+		const renderFailure = new Error("[VIDEO_DECODE_ENCODING_ERROR] Renderer interrupted");
+		const onFrame = vi.fn(async () => { throw renderFailure; });
+		try {
+			await expect(decoder.decodeAll(2, undefined, undefined, onFrame)).rejects.toBe(renderFailure);
+			expect(mockDemuxerRead).toHaveBeenCalledOnce();
+			expect(cancel).toHaveBeenCalledOnce();
+			expect(closeDecoder).toHaveBeenCalledOnce();
+			expect(frameClosures).toHaveLength(3);
+			for (const close of frameClosures) expect(close).toHaveBeenCalledOnce();
+		} finally {
+			decoder.destroy();
+		}
 	});
 
 	it("does not emit frozen remaining frames after a decoder error", async () => {

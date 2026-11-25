@@ -3,8 +3,8 @@ import { ChangeReviewPanel } from "../ChangeReviewPanel";
 import { getCutReviewRange } from "../changeLogRestore";
 import { sortClipRegions } from "../types";
 import { CaptionOverviewPanel, type CaptionPanelMemory } from "../captionList/CaptionOverviewPanel";
-import { findActiveRowIndex } from "../captionList/captionListModel";
 import { useUiText } from "@/i18n/useUiText";
+import { findStartupPreviewVideo } from "@/lib/startupEditorPreview";
 import { OnboardingController } from "@/components/onboarding/OnboardingController";
 import { DashboardSettingsContext } from "../dashboard/DashboardSettings";
 import { useVideoSourceRecovery } from "../hooks/useVideoSourceRecovery";
@@ -12,19 +12,26 @@ import { useRecordingLibrary } from "../library/useRecordingLibrary";
 import { RecordingLibraryPanel } from "../library/RecordingLibraryPanel";
 import { RECORDING_DRAG_TYPE } from "@/types/recordingLibrary";
 import { Button } from "@/components/ui/button";
+import { BackgroundTaskStatus } from "@/components/ui/BackgroundTaskStatus";
 import { useCallback, useMemo, useEffect, useRef, useState, type ComponentProps } from "react";
-import { Toaster } from "@/components/ui/toast";
+import { toast, Toaster } from "@/components/ui/toast";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { useI18n } from "@/contexts/I18nContext";
 import type { useEditorExportController } from "../export/useEditorExportController";
+import { isModernMp4Export } from "../exportStatusModel";
 import { KeystrokeStylePanel } from "../keystrokes/KeystrokeStylePanel";
 import type { useExportDimensions } from "../export/useExportDimensions";
 import type { useExportSession } from "../export/useExportSession";
 import type { useExportSettings } from "../export/useExportSettings";
 import type { useTimelineEditingController } from "../hooks/useTimelineEditingController";
 import type { useVideoEditorPresets } from "../presets/useVideoEditorPresets";
+import { pickRecordingAppearanceDefaults } from "../presets/recordingAppearanceDefaults";
+import { saveEditorPreferences } from "../editorPreferences";
+import { ApplicationSettings } from "../ApplicationSettings";
+import { SettingsSections } from "../SettingsSections";
 import type { useEditorProjectController } from "../project/useEditorProjectController";
 import { VersionHistoryPanel, VersionPreviewBanner } from "../project/VersionHistoryPanel";
-import { SettingsPanel } from "../SettingsPanel";
+import type { SettingsPanel } from "../SettingsPanel";
 import type { useAppearanceState } from "../state/useAppearanceState";
 import type { useEditorUiState } from "../state/useEditorUiState";
 import type { useProjectState } from "../state/useProjectState";
@@ -63,6 +70,8 @@ type Props = {
 export function EditorShell(props: Props) {
 	const uiText = useUiText();
 	const [onboardingRequest, setOnboardingRequest] = useState(0);
+	const [applicationSettingsOpen, setApplicationSettingsOpen] = useState(false);
+	const [savingRecordingDefault, setSavingRecordingDefault] = useState(false);
 	const showOnboarding = useCallback(() => setOnboardingRequest((value) => value + 1), []);
 	const {
 		t,
@@ -101,6 +110,7 @@ export function EditorShell(props: Props) {
 		library.setOpen(false);
 	}, [ui.activeEffectSection, library.setOpen]);
 	const timelinePanelRef = useRef<HTMLDivElement>(null);
+	const timeAtClientXRef = useRef<((clientX: number) => number | undefined) | null>(null);
 	const wasImporting = useRef(false);
 	useEffect(() => {
 		if (wasImporting.current && !library.importing) timelinePanelRef.current?.focus();
@@ -149,24 +159,29 @@ export function EditorShell(props: Props) {
 	const returnToFullTimeline = () => setFocusedReviewProject(null);
 	const selectPreviewCaption = useCallback((id: string) =>
 		captionCommands.handleSelectCaption(id, undefined, { seek: false }), [captionCommands.handleSelectCaption]);
-	const { dialogActions, preflight, status: exportStatus, exportMessage } = exportController;
+	const { dialogActions, preflight } = exportController;
+	const captionTaskBusy = ui.isGeneratingCaptions || settingsPanelProps.isImportingCaptions || settingsPanelProps.isWorkingWithTranscript;
 	const dashboardSettingsContent = useMemo(
 		() => (
-			<SettingsPanel
-				{...settingsPanelProps}
+			<ApplicationSettings
 				onShowOnboarding={showOnboarding}
-				activeEffectSection="settings"
-				selectedAnnotationId={null}
-				selectedClipId={null}
-				advanced
+				onAutoZoomsChange={appearance.setAutoApplyFreshRecordingAutoZooms}
 			/>
 		),
-		[settingsPanelProps, showOnboarding],
+		[appearance.setAutoApplyFreshRecordingAutoZooms, showOnboarding],
 	);
+	const saveRecordingAppearance = async () => {
+		setSavingRecordingDefault(true);
+		const saved = await saveEditorPreferences(pickRecordingAppearanceDefaults(snapshot.currentPersistedEditorState), { flush: true });
+		setSavingRecordingDefault(false);
+		if (saved) toast.success(t("common.interface.recordingAppearanceDefaultSaved"));
+		else toast.error(t("common.interface.recordingAppearanceDefaultFailed"));
+	};
 	const onboarding = (
 		<OnboardingController
 			requestNonce={onboardingRequest}
 			ready={!project.loading}
+			canGuide={Boolean(project.videoPath) && !project.projectBrowserOpen && !saveActions.previewReadOnly}
 		/>
 	);
 	const editorDialogs = (
@@ -240,10 +255,32 @@ export function EditorShell(props: Props) {
 	return (
 		<div className="flex h-screen flex-col overflow-hidden bg-editor-bg text-foreground selection:bg-accent/20"
 			data-version-preview={saveActions.previewReadOnly || undefined}>
+			{saveActions.newerProjectReadOnly && (
+				<div role="status" className="flex items-center gap-3 border-b border-separator px-4 py-2 text-sm">
+					<span>{uiText("projectRequiresNewerLeadCut")}</span>
+					<Button variant="ghost" onClick={openActions.handleOpenProjectBrowser}>
+						{uiText("openProjects")}
+					</Button>
+				</div>
+			)}
+			{saveActions.agentReadOnly && (
+				<div role="status" className="flex items-center gap-3 border-b border-separator px-4 py-2 text-sm">
+					<span>{uiText("projectAgentEditing")}</span>
+					<Button variant="ghost" disabled={projectController.agentHandoffBusy || externalProjectChange.resolving}
+						onClick={() => void projectController.changeAgentHandoff(false)}>
+						{uiText("projectAgentResumeEditing")}
+					</Button>
+				</div>
+			)}
 			<EditorHeader
 				clipsOpen={library.open}
 				readOnly={saveActions.previewReadOnly}
+				onOpenApplicationSettings={() => setApplicationSettingsOpen(true)}
 				onOpenVersionHistory={() => void versionHistory.show()}
+				onHandOffToAgent={project.currentProjectPath && typeof window.electronAPI.setProjectAgentHandoff === "function"
+					? () => void projectController.changeAgentHandoff(true)
+					: undefined}
+				agentHandoffBusy={projectController.agentHandoffBusy || externalProjectChange.resolving}
 				onToggleClips={() => library.setOpen((open) => !open)}
 				t={t}
 				headerLeftControlsPaddingClass={headerLeftControlsPaddingClass}
@@ -254,8 +291,7 @@ export function EditorShell(props: Props) {
 				hasUnsavedChanges={hasUnsavedChanges}
 				saveFeedback={saveActions.saveFeedback}
 				handleSaveProject={saveActions.handleSaveProject}
-				canUndo={history.canUndo}
-				canRedo={history.canRedo}
+				historyFlags={history.flags}
 				handleOpenProjectBrowser={openActions.handleOpenProjectBrowser}
 				handleOpenProjectFile={openActions.handleOpenProjectFile}
 				handleSaveProjectAs={saveActions.handleSaveProjectAs}
@@ -269,7 +305,6 @@ export function EditorShell(props: Props) {
 				exportPreflight={preflight}
 				exportDimensions={exportDimensions}
 				timelineDuration={projection.timelineDuration}
-				exportStatus={exportStatus}
 				hasCaptionsForSidecar={hasCaptionsForSidecar}
 				nvidiaCudaExportAvailable={nvidiaCudaExportAvailable}
 				experimentalNvidiaCudaExport={experimentalNvidiaCudaExport}
@@ -280,9 +315,28 @@ export function EditorShell(props: Props) {
 				handleRetrySaveExport={dialogActions.handleRetrySaveExport}
 				handleStartExportFromDropdown={dialogActions.handleStartExportFromDropdown}
 				revealExportedFile={dialogActions.revealExportedFile}
-				exportMessage={exportMessage}
 			/>
 			<VersionPreviewBanner history={versionHistory} />
+			{(settingsPanelProps.whisperModelDownloadStatus === "downloading" || ui.isGeneratingCaptions) && (
+				<div className="grid gap-2 border-b border-separator bg-background px-4 py-2 sm:grid-cols-2">
+					{settingsPanelProps.whisperModelDownloadStatus === "downloading" && (
+						<BackgroundTaskStatus title={uiText("downloadingCaptionModel")}
+							progress={settingsPanelProps.whisperModelDownloadProgress ?? 0}
+							detail={`${Math.round(settingsPanelProps.whisperModelDownloadProgress ?? 0)}%`}
+							action={settingsPanelProps.onCancelWhisperModelDownload && (
+								<Button size="sm" variant="outline" onClick={settingsPanelProps.onCancelWhisperModelDownload}>{uiText("cancel")}</Button>
+							)} />
+					)}
+					{ui.isGeneratingCaptions && (
+						<BackgroundTaskStatus title={uiText("captionRecognitionRunning")}
+							progress={settingsPanelProps.captionGenerationProgress ?? 0}
+							detail={`${Math.round(settingsPanelProps.captionGenerationProgress ?? 0)}%`}
+							action={settingsPanelProps.onCancelAutoCaptions && (
+								<Button size="sm" variant="outline" onClick={settingsPanelProps.onCancelAutoCaptions}>{uiText("cancel")}</Button>
+							)} />
+					)}
+				</div>
+			)}
 			<div
 				className="relative flex min-h-0 flex-1 flex-col"
 				onPointerDownCapture={(event) => {
@@ -306,21 +360,11 @@ export function EditorShell(props: Props) {
 						"[data-timeline-panel]",
 					);
 					let index: number | undefined;
-					if (timelinePanel) {
-						const clips = [
-							...timelinePanel.querySelectorAll<HTMLElement>(
-								'[data-timeline-item][data-variant="clip"]',
-							),
-						].sort((a, b) => Number(a.dataset.startMs) - Number(b.dataset.startMs));
-						const next = clips.find((clip) => {
-							const rect = clip.getBoundingClientRect();
-							return event.clientX < rect.left + rect.width / 2;
-						});
-						const anchor = next ?? clips[clips.length - 1];
-						if (anchor) {
-							const position = sortClipRegions(timeline.clipRegions).findIndex(clip => clip.id === anchor.dataset.regionId);
-							if (position >= 0) index = position + (next ? 0 : 1);
-						}
+					const dropTime = timelinePanel ? timeAtClientXRef.current?.(event.clientX) : undefined;
+					if (dropTime !== undefined) {
+						const clips = sortClipRegions(timeline.clipRegions);
+						const next = clips.findIndex(({ startMs, endMs }) => dropTime < (startMs + endMs) / 2);
+						index = next < 0 ? clips.length : next;
 					}
 					let paths: unknown;
 					try {
@@ -337,22 +381,44 @@ export function EditorShell(props: Props) {
 			>
 				<div className="relative z-10 flex min-h-0 flex-1 pt-3">
 					<EditorSidebar
+						deferPanels={Boolean(project.videoPath) && !ui.isPreviewReady}
 						selectedCaptionId={timeline.selectedCaptionId}
 						readOnly={saveActions.previewReadOnly}
 						panelKey={library.open ? "library" : ui.activeEffectSection}
 						panelContent={
 							library.open ? <RecordingLibraryPanel library={library} /> :
-								ui.activeEffectSection === "chapters" ? <ChapterProgressPanel value={timeline.chapterProgress} onChange={timeline.setChapterProgress} sequence={timeline} currentTimeMs={ui.currentTime * 1000} onSeek={editing.playback.handleTimelineSeek} /> :
+								ui.activeEffectSection === "chapters" ? <ChapterProgressPanel value={timeline.chapterProgress} onChange={timeline.setChapterProgress} sequence={timeline} getCurrentTime={ui.playbackClock.getTime} onSeek={editing.playback.handleTimelineSeek} /> :
 								ui.activeEffectSection === "keystrokes" ? <KeystrokeStylePanel settings={timeline.keystrokeOverlay} onChange={timeline.setKeystrokeOverlay} recording={timeline.recordedKeystrokes} /> :
 								ui.activeEffectSection === "captionList" ? (
 									<CaptionOverviewPanel
+										emptyActions={project.videoPath && !saveActions.previewReadOnly && (
+											<>
+												<Button type="button" size="sm" variant="secondary" disabled={captionTaskBusy}
+													onClick={() => {
+														ui.setActiveEffectSection("captions");
+														if (ui.whisperModelPath) settingsPanelProps.onGenerateAutoCaptions?.();
+													}}>
+													{t(ui.whisperModelPath ? "settings.captions.generateFull" : "common.interface.setupCaptionRecognition")}
+												</Button>
+												<Button type="button" size="sm" variant="outline" disabled={captionTaskBusy}
+													onClick={settingsPanelProps.onImportSrtCaptions}>
+													{t(settingsPanelProps.isImportingCaptions ? "settings.captions.importingSrt" : "settings.captions.importSrt")}
+												</Button>
+												{project.currentProjectPath && timelineDurationMs > 0 && typeof window.electronAPI.setProjectAgentHandoff === "function" && (
+													<Button type="button" size="sm" variant="ghost" disabled={captionTaskBusy || projectController.agentHandoffBusy}
+														onClick={() => void projectController.changeAgentHandoff(true)}>
+														{t("common.interface.projectHandOffToAgent")}
+													</Button>
+												)}
+											</>
+										)}
 										rows={projection.effectiveCaptionRegions}
 										appearance={timeline.autoCaptionSettings}
 										durationMs={projection.timelineDuration * 1000}
 										cues={timeline.autoCaptions}
 										clips={timeline.clipRegions}
 										getPlayheadTime={getCaptionPlayheadTime}
-										activeIndex={findActiveRowIndex(projection.effectiveCaptionRegions, projection.timelinePlayheadTime * 1000)}
+										playbackClock={ui.playbackClock}
 										isPlaying={ui.isPlaying}
 										selectedCueId={timeline.selectedCaptionId}
 										onSelect={captionCommands.handleSelectCaption}
@@ -370,6 +436,8 @@ export function EditorShell(props: Props) {
 									<ChangeReviewPanel
 										key={reviewProjectKey}
 										review={review}
+										recentAgentCutIds={projectController.recentAgentCutIds}
+										agentEdits={projectController.agentEdits}
 										project={{
 											name: snapshot.projectDisplayName, path: project.currentProjectPath,
 											id: project.lastSavedSnapshot?.projectId ?? null, sourcePath: snapshot.currentSourcePath,
@@ -401,7 +469,8 @@ export function EditorShell(props: Props) {
 						}}
 						settingsPanelProps={{
 							...settingsPanelProps,
-							onShowOnboarding: showOnboarding,
+							onSaveRecordingDefault: project.videoPath ? () => void saveRecordingAppearance() : undefined,
+							savingRecordingDefault,
 						}}
 					/>
 					<EditorPreviewPanel
@@ -414,11 +483,12 @@ export function EditorShell(props: Props) {
 						previewAspectRatioValue={previewAspectRatioValue}
 						videoPlaybackRef={ui.videoPlaybackRef}
 						timelineRef={ui.timelineRef}
-						currentTime={ui.currentTime}
+						playbackClock={ui.playbackClock}
 						isPlaying={ui.isPlaying}
 						previewVolume={ui.previewVolume}
 						setPreviewVolume={ui.setPreviewVolume}
-						suspendRendering={exportStatus.shouldSuspendPreviewRendering}
+						suspendRendering={exportSession.isExporting && isModernMp4Export(exportSettings.exportFormat, exportSettings.exportPipelineModel)}
+						exportPreview={exportSession.preview}
 						appearance={appearance}
 						timeline={timeline}
 						audio={audio}
@@ -436,12 +506,14 @@ export function EditorShell(props: Props) {
 						setDuration={ui.setDuration}
 						isPreviewReady={ui.isPreviewReady}
 						setIsPreviewReady={ui.setIsPreviewReady}
-						setCurrentTime={ui.setCurrentTime}
 						setIsPlaying={ui.setIsPlaying}
 						setError={handlePreviewError}
 					/>
 				</div>
 				<EditorTimelinePanel
+					deferInitialTracks={Boolean(!ui.isPreviewReady && project.videoPath && findStartupPreviewVideo(project.videoPath))}
+					onBrowseClips={() => library.setOpen(true)}
+					onOpenMedia={() => void openActions.handleImportMediaOrProject()}
 					readOnly={saveActions.previewReadOnly}
 					changeMarkers={review.markers}
 					focusRange={reviewFocusRange}
@@ -449,6 +521,7 @@ export function EditorShell(props: Props) {
 					sequenceTools={editing.sequenceTools}
 					videoCommands={editing.videoCommands}
 					panelRef={timelinePanelRef}
+					timeAtClientXRef={timeAtClientXRef}
 					timelineRef={ui.timelineRef}
 					timeline={timeline}
 					projection={projection}
@@ -466,7 +539,7 @@ export function EditorShell(props: Props) {
 					autoSuggestZoomsTrigger={ui.autoSuggestZoomsTrigger}
 					handleAutoSuggestZoomsConsumed={handleAutoSuggestZoomsConsumed}
 					disableSuggestedZooms={!appearance.autoApplyFreshRecordingAutoZooms}
-					currentTime={ui.currentTime}
+					playbackClock={ui.playbackClock}
 					handleSelectAnnotation={handleSelectAnnotation}
 				/>
 			</div>
@@ -495,6 +568,23 @@ export function EditorShell(props: Props) {
 			)}
 
 			{editorDialogs}
+			{applicationSettingsOpen && (
+				<Dialog open onOpenChange={setApplicationSettingsOpen}>
+					<DialogContent aria-label={t("common.interface.applicationSettings")}>
+						<DialogHeader>
+							<DialogTitle>{t("common.interface.applicationSettings")}</DialogTitle>
+							<DialogDescription>{t("common.interface.settingsScopeApplication")}</DialogDescription>
+						</DialogHeader>
+						<SettingsSections categories={["general", "motion"]}>
+							<ApplicationSettings
+								onShowOnboarding={() => { setApplicationSettingsOpen(false); showOnboarding(); }}
+								onAutoZoomsChange={appearance.setAutoApplyFreshRecordingAutoZooms}
+								beforeOpenShortcuts={() => setApplicationSettingsOpen(false)}
+							/>
+						</SettingsSections>
+					</DialogContent>
+				</Dialog>
+			)}
 			{onboarding}
 			<CropEditorDialog
 				open={ui.showCropModal}

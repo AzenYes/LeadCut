@@ -1,4 +1,4 @@
-import type { WebDemuxer } from "web-demuxer";
+import { AVSeekFlag, type WebDemuxer } from "web-demuxer";
 import type { SpeedRegion, TrimRegion } from "@/components/video-editor/types";
 import { getEffectiveVideoStreamDurationSeconds } from "@/lib/mediaTiming";
 import {
@@ -26,8 +26,10 @@ type OnFrameCallback = (
 
 interface StreamingDecodeContext {
 	demuxer: WebDemuxer;
+	readonly videoDecoderConfig?: VideoDecoderConfig;
 	decoder: VideoDecoder | null;
 	readonly cancelled: boolean;
+	readonly signal: AbortSignal;
 	readonly metadata: DecodedVideoInfo;
 	pendingFrames: VideoFrame[];
 	readonly maxDecodeQueue: number;
@@ -47,24 +49,46 @@ export async function decodeVideoStream(
 	segmentsOverride?: VideoSegment[],
 ): Promise<void> {
 	let emittedFrames = 0;
+	let renderFailed = false;
+	const renderFrame: OnFrameCallback = async (...args) => {
+		try {
+			await onFrame(...args);
+		} catch (error) {
+			renderFailed = true;
+			throw error;
+		}
+	};
+	const startSec = segmentsOverride?.[0]?.startSec ?? 0;
+	let readStartSec = startSec >= 4 ? startSec - 2 : 0;
+	const decode = () => decodeVideoStreamAttempt(
+		context,
+		targetFrameRate,
+		trimRegions,
+		speedRegions,
+		async (...args) => {
+			await renderFrame(...args);
+			emittedFrames++;
+		},
+		segmentsOverride,
+		false,
+		readStartSec,
+	);
 	try {
-		await decodeVideoStreamAttempt(
-			context,
-			targetFrameRate,
-			trimRegions,
-			speedRegions,
-			async (...args) => {
-				await onFrame(...args);
-				emittedFrames++;
-			},
-			segmentsOverride,
-		);
+		try {
+			await decode();
+		} catch (error) {
+			if (!readStartSec || emittedFrames || renderFailed || context.cancelled || context.decoder !== null) throw error;
+			console.warn("[StreamingVideoDecoder] Keyframe seek failed; decoding from the source start", error);
+			readStartSec = 0;
+			await decode();
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		const codec = context.metadata.codec.toLowerCase();
 		// Only retry failures that completed the decode-error cleanup. Configuration
 		// and renderer/encoder callback failures must propagate without replay.
 		if (
+			renderFailed ||
 			context.cancelled ||
 			context.decoder !== null ||
 			codec.includes("av01") ||
@@ -88,12 +112,14 @@ export async function decodeVideoStream(
 				speedRegions,
 				async (...args) => {
 					if (replayedFrames++ < emittedFrames) return;
-					await onFrame(...args);
+					await renderFrame(...args);
 				},
 				segmentsOverride,
 				true,
+				readStartSec,
 			);
 		} catch (softwareError) {
+			if (renderFailed) throw softwareError;
 			const softwareMessage =
 				softwareError instanceof Error ? softwareError.message : String(softwareError);
 			if (!/^\[VIDEO_(?:DECODE|DECODER|CODEC)_/.test(softwareMessage)) throw softwareError;
@@ -111,12 +137,15 @@ async function decodeVideoStreamAttempt(
 	onFrame: OnFrameCallback,
 	segmentsOverride?: VideoSegment[],
 	forceSoftwareDecode = false,
+	readStartSec = 0,
 ): Promise<void> {
 	if (!context.demuxer || !context.metadata) {
 		throw new Error("Must call loadMetadata() before decodeAll()");
 	}
+	if (context.cancelled) return;
 
-	const decoderConfig = await context.demuxer.getDecoderConfig("video");
+	const decoderConfig = context.videoDecoderConfig ?? await context.demuxer.getDecoderConfig("video");
+	if (context.cancelled) return;
 	const codec = context.metadata.codec.toLowerCase();
 	const shouldPreferSoftwareDecode =
 		forceSoftwareDecode || codec.includes("av01") || codec.includes("av1");
@@ -221,6 +250,7 @@ async function decodeVideoStreamAttempt(
 			notifyBackpressureProgress();
 		},
 	});
+	context.decoder.ondequeue = notifyBackpressureProgress;
 	try {
 		context.decoder.configure(preferredDecoderConfig);
 	} catch (error) {
@@ -249,7 +279,7 @@ async function decodeVideoStreamAttempt(
 		});
 	};
 
-	// One forward stream through the whole file.
+	// Read from a preceding keyframe for late source in-points.
 	// Pass explicit range because some containers are truncated when no end is provided.
 	const readEndSec =
 		Math.max(
@@ -257,8 +287,21 @@ async function decodeVideoStreamAttempt(
 			(context.metadata.streamDuration ?? context.metadata.duration) +
 				(context.metadata.streamStartTime ?? context.metadata.mediaStartTime ?? 0),
 		) + 0.5;
-	const reader = context.demuxer.read("video", 0, readEndSec).getReader();
+	const reader = (readStartSec > 0
+		? context.demuxer.read("video", readStartSec + (context.metadata.mediaStartTime ?? 0), readEndSec, AVSeekFlag.AVSEEK_FLAG_BACKWARD)
+		: context.demuxer.read("video", 0, readEndSec)).getReader();
 	let stopFeeding = false;
+	const stopDecode = () => {
+		if (stopFeeding) return;
+		stopFeeding = true;
+		notifyBackpressureProgress();
+		void reader.cancel().catch(() => undefined);
+		frameResolve?.(null);
+		frameResolve = null;
+		// Closing also rejects any pending flush so the feeder can finish.
+		if (context.decoder?.state === "configured") context.decoder.close();
+	};
+	context.signal.addEventListener("abort", stopDecode, { once: true });
 
 	// Feed chunks to decoder in background with backpressure
 	const feedPromise = (async () => {
@@ -356,133 +399,127 @@ async function decodeVideoStreamAttempt(
 		return true;
 	};
 
-	while (!context.cancelled && segmentIdx < segments.length) {
-		const frame = await getNextFrame();
-		if (!frame) break;
-
-		if (firstDecodedFrameTimestampUs === null) {
-			firstDecodedFrameTimestampUs = frame.timestamp;
-			decodedFrameTimelineOffsetUs = getDecodedFrameTimelineOffsetUs(
-				firstDecodedFrameTimestampUs,
-				context.metadata,
-			);
-		}
-
-		const normalizedFrameTimeSec = Math.max(
-			0,
-			(frame.timestamp - firstDecodedFrameTimestampUs + decodedFrameTimelineOffsetUs) /
-				1_000_000,
-		);
-		const frameTimeSec: number =
-			lastDecodedFrameSec === null
-				? normalizedFrameTimeSec
-				: Math.max(lastDecodedFrameSec, normalizedFrameTimeSec);
-		lastDecodedFrameSec = frameTimeSec;
-
-		// Finalize completed segments before handling this frame.
-		while (
-			segmentIdx < segments.length &&
-			frameTimeSec >= segments[segmentIdx].endSec - epsilonSec
-		) {
-			const segment = segments[segmentIdx];
-			while (!context.cancelled && (await emitHeldFrameForTarget(segment))) {
-				// Keep emitting remaining output frames for this segment from the last known frame.
-			}
-
-			segmentIdx++;
-			segmentFrameIndex = 0;
-		}
-
-		if (segmentIdx >= segments.length) {
-			frame.close();
-			continue;
-		}
-
-		const currentSegment = segments[segmentIdx];
-
-		// Keep the nearest pre-roll frame for cuts between source frames.
-		if (frameTimeSec < currentSegment.startSec - epsilonSec) {
-			heldFrame?.close();
-			heldFrame = frame;
-			heldFrameSec = frameTimeSec;
-			continue;
-		}
-
-		if (!heldFrame) {
-			heldFrame = frame;
-			heldFrameSec = frameTimeSec;
-			continue;
-		}
-
-		// Any target timestamp before this midpoint is closer to heldFrame than current frame.
-		const handoffBoundarySec = (heldFrameSec + frameTimeSec) / 2;
-		while (!context.cancelled) {
-			const segmentFrameCount = segmentOutputFrameCounts[segmentIdx];
-			if (segmentFrameIndex >= segmentFrameCount) {
-				break;
-			}
-
-			const sourceTimeSec = segmentSourceTime(
-				currentSegment,
-				segmentFrameIndex,
-				targetFrameRate,
-			);
-			if (sourceTimeSec > handoffBoundarySec) {
-				break;
-			}
-
-			await emitHeldFrameForTarget(currentSegment);
-		}
-
-		heldFrame.close();
-		heldFrame = frame;
-		heldFrameSec = frameTimeSec;
-	}
-
-	// Flush remaining output frames for the last decoded frame.
-	if (!decodeError && heldFrame && segmentIdx < segments.length) {
+	let unheldFrame: VideoFrame | null = null;
+	try {
 		while (!context.cancelled && segmentIdx < segments.length) {
-			const segment = segments[segmentIdx];
-			if (heldFrameSec < segment.startSec - epsilonSec) {
-				break;
+			const frame = await getNextFrame();
+			unheldFrame = frame;
+			if (!frame || context.cancelled) break;
+
+			if (firstDecodedFrameTimestampUs === null) {
+				firstDecodedFrameTimestampUs = frame.timestamp;
+				decodedFrameTimelineOffsetUs = getDecodedFrameTimelineOffsetUs(
+					firstDecodedFrameTimestampUs,
+					context.metadata,
+				);
+				if (readStartSec > 0 && decodedFrameTimelineOffsetUs / 1_000_000 > segments[0].startSec + epsilonSec) {
+					recordFirstDecodeError(new Error("Keyframe seek did not reach the requested source in-point."));
+					break;
+				}
 			}
 
-			while (!context.cancelled && (await emitHeldFrameForTarget(segment))) {
-				// Keep emitting output frames for the active segment.
-			}
+			const normalizedFrameTimeSec = Math.max(
+				0,
+				(frame.timestamp - firstDecodedFrameTimestampUs + decodedFrameTimelineOffsetUs) /
+					1_000_000,
+			);
+			const frameTimeSec: number =
+				lastDecodedFrameSec === null
+					? normalizedFrameTimeSec
+					: Math.max(lastDecodedFrameSec, normalizedFrameTimeSec);
+			lastDecodedFrameSec = frameTimeSec;
 
-			segmentIdx++;
-			segmentFrameIndex = 0;
-			if (
+			// Finalize completed segments before handling this frame.
+			while (
 				segmentIdx < segments.length &&
-				heldFrameSec < segments[segmentIdx].startSec - epsilonSec
+				frameTimeSec >= segments[segmentIdx].endSec - epsilonSec
 			) {
-				break;
+				const segment = segments[segmentIdx];
+				while (!context.cancelled && (await emitHeldFrameForTarget(segment))) {
+					// Keep emitting remaining output frames for this segment from the last known frame.
+				}
+
+				segmentIdx++;
+				segmentFrameIndex = 0;
+			}
+
+			if (segmentIdx >= segments.length) break;
+
+			const currentSegment = segments[segmentIdx];
+
+			// Keep the nearest pre-roll frame for cuts between source frames.
+			if (!heldFrame || frameTimeSec < currentSegment.startSec - epsilonSec) {
+				heldFrame?.close();
+				heldFrame = frame;
+				unheldFrame = null;
+				heldFrameSec = frameTimeSec;
+				continue;
+			}
+
+			// Any target timestamp before this midpoint is closer to heldFrame than current frame.
+			const handoffBoundarySec = (heldFrameSec + frameTimeSec) / 2;
+			while (!context.cancelled) {
+				const segmentFrameCount = segmentOutputFrameCounts[segmentIdx];
+				if (segmentFrameIndex >= segmentFrameCount) {
+					break;
+				}
+
+				const sourceTimeSec = segmentSourceTime(
+					currentSegment,
+					segmentFrameIndex,
+					targetFrameRate,
+				);
+				if (sourceTimeSec > handoffBoundarySec) {
+					break;
+				}
+
+				await emitHeldFrameForTarget(currentSegment);
+			}
+
+			heldFrame.close();
+			heldFrame = frame;
+			unheldFrame = null;
+			heldFrameSec = frameTimeSec;
+		}
+
+		// Flush remaining output frames for the last decoded frame.
+		if (!decodeError && heldFrame && segmentIdx < segments.length) {
+			while (!context.cancelled && segmentIdx < segments.length) {
+				const segment = segments[segmentIdx];
+				if (heldFrameSec < segment.startSec - epsilonSec) {
+					break;
+				}
+
+				while (!context.cancelled && (await emitHeldFrameForTarget(segment))) {
+					// Keep emitting output frames for the active segment.
+				}
+
+				segmentIdx++;
+				segmentFrameIndex = 0;
+				if (
+					segmentIdx < segments.length &&
+					heldFrameSec < segments[segmentIdx].startSec - epsilonSec
+				) {
+					break;
+				}
 			}
 		}
-		heldFrame.close();
-		heldFrame = null;
-	} else if (heldFrame) {
-		heldFrame.close();
-		heldFrame = null;
+	} finally {
+		context.signal.removeEventListener("abort", stopDecode);
+		stopDecode();
+		unheldFrame?.close();
+		heldFrame?.close();
+		await feedPromise;
+		for (const frame of pendingFrames) frame.close();
+		pendingFrames.length = 0;
+		context.decoder = null;
 	}
-
-	// Any remaining packets are outside this run's timeline. Cancel the pending
-	// read and wake a feeder waiting on decoder or frame-queue capacity.
-	stopFeeding = true;
-	notifyBackpressureProgress();
-	void reader.cancel().catch(() => undefined);
-	await feedPromise;
-	for (const f of pendingFrames) f.close();
-	pendingFrames.length = 0;
-
-	if (context.decoder?.state === "configured") {
-		context.decoder.close();
-	}
-	context.decoder = null;
 
 	if (decodeError) {
 		throw decodeError;
+	}
+	if (readStartSec > 0 && !context.cancelled && firstDecodedFrameTimestampUs === null && expectedOutputFrames > 0) {
+		throw buildVideoDecodeFailure(new Error("Keyframe seek returned no video frames."), getDecoderFailureContext());
 	}
 
 	const requiredEndSec = segments.length > 0 ? segments[segments.length - 1].endSec : 0;

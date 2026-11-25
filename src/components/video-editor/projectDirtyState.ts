@@ -42,10 +42,14 @@ function areDeepEqual(left: unknown, right: unknown): boolean {
 	return true;
 }
 
+const comparableProjectCache = new WeakMap<EditorProjectData, EditorProjectData>();
+
 function comparableProjectState(project: EditorProjectData | null) {
 	if (!project?.editor || typeof project.editor !== "object") {
 		return project;
 	}
+	const cached = comparableProjectCache.get(project);
+	if (cached) return cached;
 
 	const editor = stripProjectUserPreferences(project.editor) as Record<string, unknown>;
 	// Playback bootstraps these internally. Current saves only persist the clips.
@@ -61,25 +65,18 @@ function comparableProjectState(project: EditorProjectData | null) {
 		if (explicit.length) editor.defaultSourceAudioTrackSettings = Object.fromEntries(explicit);
 		else delete editor.defaultSourceAudioTrackSettings;
 	}
-	const webcam = editor.webcam;
-	if (!isComparableObject(webcam)) {
-		return { ...project, editor };
+	if (isComparableObject(editor.webcam)) {
+		const {
+			enabled: _enabled,
+			sourcePath: _sourcePath,
+			timeOffsetMs: _timeOffsetMs,
+			...persistentWebcamFields
+		} = editor.webcam;
+		editor.webcam = persistentWebcamFields;
 	}
-
-	const {
-		enabled: _enabled,
-		sourcePath: _sourcePath,
-		timeOffsetMs: _timeOffsetMs,
-		...persistentWebcamFields
-	} = webcam;
-
-	return {
-		...project,
-		editor: {
-			...editor,
-			webcam: persistentWebcamFields,
-		},
-	};
+	const normalized = { ...project, editor };
+	comparableProjectCache.set(project, normalized);
+	return normalized;
 }
 
 export function hasUnsavedProjectChanges(

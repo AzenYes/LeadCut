@@ -1,3 +1,4 @@
+import { handleTrustedIpc } from "../../trustedIpc";
 import { uiText } from "../../uiI18n";
 import { logSubprocessStderr } from "../../logger";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -10,12 +11,10 @@ import {
 	BrowserWindow,
 	desktopCapturer,
 	dialog,
-	ipcMain,
 	shell,
 	systemPreferences,
 } from "electron";
 import { getHudCaptureExcludedProcessIds } from "../../../src/lib/hudCaptureProtection";
-import { showCursor } from "../../cursorHider";
 import { getHudOverlayCaptureProtectionEnabled, beginHudCaptureProtection, getHudOverlayWindow } from "../../windows";
 import { ALLOW_OWN_WINDOW_CAPTURE } from "../constants";
 import { startWindowBoundsCapture, stopWindowBoundsCapture } from "../cursor/bounds";
@@ -47,10 +46,8 @@ import {
 } from "../paths/binaries";
 import { rememberApprovedLocalReadPath, resolveApprovedLocalMediaPath } from "../project/manager";
 import { prepareSeekableMedia } from "../project/seekableMedia";
-import {
-	getBrowserMicSidecarFilters,
-	shouldKeepRecordingAudioSidecars,
-} from "../recording/audioFilters";
+import { shouldKeepRecordingAudioSidecars } from "../recording/audioFilters";
+import { convertBrowserMicrophone, createBrowserMicrophoneStreams } from "../recording/browserMicrophone";
 import {
 	getCompanionAudioFallbackInfo,
 	getFileSizeIfPresent,
@@ -95,7 +92,7 @@ import { resolveRecordedVideoStoragePath } from "../recording/storagePath";
 import { addRecordingMarkerAndNotify } from "../recording/events";
 import { getCurrentMarkerCount, isRecordingMarkerKind, readRecordingMarkers, resetRecordingMarkers } from "../recording/markers";
 import { persistRecordingSidecars } from "../recording/sidecars";
-import { createBrowserRecordingStreamStore } from "../recording/browserStream";
+import { createBrowserRecordingStreamStore, finalizeWebcamRecording, findBrowserRecordingPartial, recoverBrowserRecordingPartial } from "../recording/browserStream";
 import { discardKeystrokes, readKeystrokes, releaseHeldKeystrokes, startKeystrokeCapture, trimKeystrokesAfter } from "../cursor/keystrokes";
 import { appLog } from "../../logger";
 import {
@@ -161,6 +158,7 @@ import {
 	windowsCaptureOutputBuffer,
 	windowsCapturePaused,
 	windowsCaptureProcess,
+	windowsCaptureStopRequested,
 	windowsCaptureTargetPath,
 	windowsMicAudioPath,
 	windowsNativeCaptureActive,
@@ -168,7 +166,7 @@ import {
 	windowsPendingVideoPath,
 	windowsSystemAudioPath,
 } from "../state";
-import type { CursorTelemetryPoint, NativeMacRecordingOptions, SelectedSource } from "../types";
+import type { CursorTelemetryPoint, NativeMacRecordingOptions, NativeRecordingFinalization, SelectedSource } from "../types";
 import {
 	getMacPrivacySettingsUrl,
 	getRecordingsDir,
@@ -435,6 +433,8 @@ export function registerRecordingHandlers(
 	onRecordingStateChange?: (recording: boolean, sourceName: string) => void,
 ) {
 	let activeRecoveryStartedAt: number | null = null;
+	const browserMicrophones = createBrowserMicrophoneStreams();
+	const microphoneOwners = new Set<number>();
 	let diskCheckTimer: ReturnType<typeof setInterval> | null = null;
 	const stopDiskChecks = () => {
 		if (diskCheckTimer) clearInterval(diskCheckTimer);
@@ -475,16 +475,16 @@ export function registerRecordingHandlers(
 		});
 		if (activeRecoveryStartedAt === startedAt) activeRecoveryStartedAt = null;
 	};
-	ipcMain.handle("get-recording-disk-status", () => getRecordingDiskStatus().catch(() => null));
-	ipcMain.handle("get-interrupted-recording", () => getInterruptedRecording());
-	ipcMain.handle("recover-interrupted-recording", (_event, startedAt: number) =>
+	handleTrustedIpc("get-recording-disk-status", () => getRecordingDiskStatus().catch(() => null));
+	handleTrustedIpc("get-interrupted-recording", () => getInterruptedRecording());
+	handleTrustedIpc("recover-interrupted-recording", (_event, startedAt: number) =>
 		Number.isSafeInteger(startedAt) ? recoverInterruptedRecording(startedAt) : { success: false },
 	);
-	ipcMain.handle("discard-interrupted-recording", (_event, startedAt: number) =>
+	handleTrustedIpc("discard-interrupted-recording", (_event, startedAt: number) =>
 		Number.isSafeInteger(startedAt) ? discardInterruptedRecording(startedAt) : { success: false },
 	);
 
-	ipcMain.handle(
+	handleTrustedIpc(
 		"start-native-screen-recording",
 		async (_, source: SelectedSource, options?: NativeMacRecordingOptions) => {
 			// Protect the HUD at the capture boundary, before the renderer publishes recording state.
@@ -495,6 +495,9 @@ export function registerRecordingHandlers(
 
 			// Windows native capture path
 			if (process.platform === "win32") {
+				if (windowsNativeCaptureActive || windowsCaptureStopRequested) {
+					return { success: false, message: uiText("failedToStartNativeWindowsCapture") };
+				}
 				const windowsCaptureAvailable = await isNativeWindowsCaptureAvailable();
 				if (!windowsCaptureAvailable) {
 					return {
@@ -531,10 +534,8 @@ export function registerRecordingHandlers(
 					const recordingsDir = await getRecordingsDir();
 					const timestamp = Date.now();
 					const outputPath = path.join(recordingsDir, `recording-${timestamp}.mp4`);
-					tempVideoPath = path.join(
-						app.getPath("temp"),
-						`leadcut-native-${timestamp}.mp4`,
-					);
+					const temporaryStem = path.join(recordingsDir, `.leadcut-native-${timestamp}`);
+					tempVideoPath = `${temporaryStem}.mp4`;
 
 					let captureOutput = "";
 					let systemAudioPath: string | null = null;
@@ -595,10 +596,7 @@ export function registerRecordingHandlers(
 							recordingsDir,
 							`recording-${timestamp}.system.wav`,
 						);
-						tempSystemAudioPath = path.join(
-							app.getPath("temp"),
-							`leadcut-native-${timestamp}.system.wav`,
-						);
+						tempSystemAudioPath = `${temporaryStem}.system.wav`;
 						config.captureSystemAudio = true;
 						config.audioOutputPath = tempSystemAudioPath;
 						setWindowsSystemAudioPath(systemAudioPath);
@@ -608,10 +606,7 @@ export function registerRecordingHandlers(
 
 					if (options?.capturesMicrophone && !browserMicFallbackRequested) {
 						microphonePath = path.join(recordingsDir, `recording-${timestamp}.mic.wav`);
-						tempMicPath = path.join(
-							app.getPath("temp"),
-							`leadcut-native-${timestamp}.mic.wav`,
-						);
+						tempMicPath = `${temporaryStem}.mic.wav`;
 						config.captureMic = true;
 						config.micOutputPath = tempMicPath;
 						if (options.microphoneDeviceId) {
@@ -659,12 +654,12 @@ export function registerRecordingHandlers(
 
 					wcProc.stdout.on("data", (chunk: Buffer) => {
 						const msg = chunk.toString();
-						captureOutput += msg;
+						captureOutput = (captureOutput + msg).slice(-64 * 1024);
 						setWindowsCaptureOutputBuffer(captureOutput);
 					});
 					wcProc.stderr.on("data", (chunk: Buffer) => {
 						const msg = chunk.toString();
-						captureOutput += msg;
+						captureOutput = (captureOutput + msg).slice(-64 * 1024);
 						setWindowsCaptureOutputBuffer(captureOutput);
 					});
 
@@ -1040,12 +1035,23 @@ export function registerRecordingHandlers(
 		},
 	);
 
-	ipcMain.handle("stop-native-screen-recording", async () => {
+	handleTrustedIpc("stop-native-screen-recording", async (event, discard?: unknown) => {
 		const start = Date.now();
+		const reportFinalization = (status: NativeRecordingFinalization) => {
+			if (discard !== true && !event.sender.isDestroyed()) {
+				event.sender.send("recording-finalization", status);
+			}
+		};
+		const reportStagedVideo = async (filePath: string) => {
+			if (discard === true) return;
+			const info = await fs.stat(filePath).catch(() => null);
+			reportFinalization({ stage: "preparing", savedPath: info?.isFile() && info.size > 0 ? filePath : undefined });
+		};
 		console.log("[PERF:MAIN] Handler: stop-native-screen-recording: STARTED");
 		try {
 			// Windows native capture stop path
 			if (process.platform === "win32" && windowsNativeCaptureActive) {
+				if (windowsCaptureStopRequested) return { success: false, message: uiText("failedToStopNativeWindowsCapture") };
 				let stagedTempVideoPath: string | null = null;
 				let stagedTempSystemAudioPath: string | null = null;
 				let stagedTempMicAudioPath: string | null = null;
@@ -1063,7 +1069,26 @@ export function registerRecordingHandlers(
 					proc.stdin.write("stop\n");
 					const tempVideoPath = await waitForWindowsCaptureStop(proc);
 					stagedTempVideoPath = tempVideoPath;
+					if (discard === true && activeRecoveryStartedAt !== null) {
+						const result = await discardInterruptedRecording(activeRecoveryStartedAt, proc);
+						if (result.success) {
+							activeRecoveryStartedAt = null;
+							setWindowsCaptureProcess(null);
+							setWindowsNativeCaptureActive(false);
+							setNativeScreenRecordingActive(false);
+							setWindowsCaptureTargetPath(null);
+							setWindowsCaptureStopRequested(false);
+							setWindowsCapturePaused(false);
+							setWindowsOrphanedMicAudioPath(null);
+							setWindowsSystemAudioPath(null);
+							setWindowsMicAudioPath(null);
+							setWindowsPendingVideoPath(null);
+							await cleanupWindowsOrphanedMicAudioPath(preferredOrphanedMicAudioPath);
+							return { success: true };
+						}
+					}
 					const finalVideoPath = preferredVideoPath ?? tempVideoPath;
+					reportFinalization({ stage: "saving" });
 
 					const audio = [];
 					if (windowsSystemAudioPath && tempVideoPath.endsWith(".mp4")) {
@@ -1080,9 +1105,11 @@ export function registerRecordingHandlers(
 						finalVideo: finalVideoPath,
 						audio,
 						onVideoStaged: async () => {
-							if (activeRecoveryStartedAt === null || tempVideoPath === finalVideoPath) return;
-							await updateRecordingJournal(activeRecoveryStartedAt, { tempVideoPath: finalVideoPath })
-								.catch(error => console.warn("Could not update recording recovery path:", error));
+							if (activeRecoveryStartedAt !== null && tempVideoPath !== finalVideoPath) {
+								await updateRecordingJournal(activeRecoveryStartedAt, { tempVideoPath: finalVideoPath })
+									.catch(error => console.warn("Could not update recording recovery path:", error));
+							}
+							await reportStagedVideo(finalVideoPath);
 						},
 					});
 					await prepareSeekableMedia(finalVideoPath, { replaceOriginal: true });
@@ -1121,7 +1148,9 @@ export function registerRecordingHandlers(
 					// Persist recording sidecars before the editor opens the new source.
 					snapshotCursorTelemetryForPersistence();
 					await persistRecordingSidecars(finalVideoPath);
-					await clearCompletedWindowsRecording();
+					if (!browserMicrophones.hasRecording(activeRecoveryStartedAt)) {
+						await clearCompletedWindowsRecording();
+					}
 
 					return { success: true, path: finalVideoPath };
 				} catch (error) {
@@ -1268,9 +1297,11 @@ export function registerRecordingHandlers(
 				setNativeCapturePaused(false);
 
 				const finalVideoPath = preferredVideoPath ?? tempVideoPath;
+				reportFinalization({ stage: "saving" });
 				if (tempVideoPath !== finalVideoPath) {
 					await moveFileWithOverwrite(tempVideoPath, finalVideoPath);
 				}
+				await reportStagedVideo(finalVideoPath);
 
 				if (preferredSystemAudioPath || preferredMicrophonePath) {
 					console.log(
@@ -1375,7 +1406,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("recover-native-screen-recording", async () => {
+	handleTrustedIpc("recover-native-screen-recording", async () => {
 		if (process.platform === "win32") {
 			if (activeRecoveryStartedAt === null) {
 				return { success: false, message: uiText("recordingStoppedUnexpectedly") };
@@ -1410,7 +1441,7 @@ export function registerRecordingHandlers(
 		};
 	});
 
-	ipcMain.handle("pause-native-screen-recording", async () => {
+	handleTrustedIpc("pause-native-screen-recording", async () => {
 		if (process.platform === "win32") {
 			if (!windowsNativeCaptureActive || !windowsCaptureProcess) {
 				return { success: false, message: uiText("noNativeWindowsScreenRecordingIsActive") };
@@ -1466,7 +1497,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("resume-native-screen-recording", async () => {
+	handleTrustedIpc("resume-native-screen-recording", async () => {
 		if (process.platform === "win32") {
 			if (!windowsNativeCaptureActive || !windowsCaptureProcess) {
 				return { success: false, message: uiText("noNativeWindowsScreenRecordingIsActive") };
@@ -1522,7 +1553,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("get-system-cursor-assets", async () => {
+	handleTrustedIpc("get-system-cursor-assets", async () => {
 		try {
 			return { success: true, cursors: await getSystemCursorAssets() };
 		} catch (error) {
@@ -1531,33 +1562,33 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("is-native-windows-capture-available", async () => {
+	handleTrustedIpc("is-native-windows-capture-available", async () => {
 		return { available: await isNativeWindowsCaptureAvailable() };
 	});
 
-	ipcMain.handle("get-last-native-capture-diagnostics", async () => {
+	handleTrustedIpc("get-last-native-capture-diagnostics", async () => {
 		return { success: true, diagnostics: lastNativeCaptureDiagnostics };
 	});
 
-	ipcMain.handle("get-video-audio-fallback-paths", async (_event, videoPath: string) => {
-		if (!videoPath) {
-			return { success: true, paths: [], startDelayMsByPath: {} };
+	handleTrustedIpc("get-video-audio-fallback-paths", async (_event, videoPath: string) => {
+		const empty = { paths: [], sidecarPaths: [], startDelayMsByPath: {} };
+		if (typeof videoPath !== "string" || !videoPath) {
+			return { success: true, ...empty };
 		}
 
 		try {
-			const { paths, startDelayMsByPath } = await getCompanionAudioFallbackInfo(videoPath);
-			await Promise.all([
-				rememberApprovedLocalReadPath(videoPath),
-				...paths.map((fallbackPath) => rememberApprovedLocalReadPath(fallbackPath)),
-			]);
-			return { success: true, paths, startDelayMsByPath };
+			const source = await resolveApprovedLocalMediaPath(videoPath);
+			if (!source) return { success: true, ...empty };
+			const audio = await getCompanionAudioFallbackInfo(source);
+			await Promise.all(audio.sidecarPaths.map(sidecarPath => rememberApprovedLocalReadPath(sidecarPath)));
+			return { success: true, ...audio };
 		} catch (error) {
 			console.error("Failed to resolve companion audio fallback paths:", error);
-			return { success: false, paths: [], startDelayMsByPath: {}, error: String(error) };
+			return { success: false, ...empty, error: String(error) };
 		}
 	});
 
-	ipcMain.handle("mux-native-windows-recording", async (_event, expectedDurationMs?: number) => {
+	handleTrustedIpc("mux-native-windows-recording", async (_event, expectedDurationMs?: number) => {
 		const start = Date.now();
 		console.log("[PERF:MAIN] Handler: mux-native-windows-recording: STARTED");
 		try {
@@ -1671,7 +1702,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("start-ffmpeg-recording", async (_, source: SelectedSource) => {
+	handleTrustedIpc("start-ffmpeg-recording", async (_, source: SelectedSource) => {
 		if (ffmpegCaptureProcess) {
 			return { success: false, message: uiText("anFFmpegRecordingIsAlreadyActive") };
 		}
@@ -1713,7 +1744,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("stop-ffmpeg-recording", async () => {
+	handleTrustedIpc("stop-ffmpeg-recording", async () => {
 		if (!ffmpegScreenRecordingActive) {
 			return { success: false, message: uiText("noFFmpegRecordingIsActive") };
 		}
@@ -1751,11 +1782,39 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle(
+	handleTrustedIpc("prepare-microphone-stream", async ({ sender }, input: { startDelayMs: number; profile?: string }) => {
+		const videoPath = windowsNativeCaptureActive ? windowsCaptureTargetPath : nativeCaptureTargetPath;
+		if (!videoPath || !Number.isFinite(input?.startDelayMs) || input.startDelayMs < 0) {
+			throw new Error("No active native capture for microphone recording.");
+		}
+		const startedAt = process.platform === "win32" ? activeRecoveryStartedAt : null;
+		if (startedAt !== null) {
+			await updateRecordingJournal(startedAt, {
+				browserMicrophone: { startDelayMs: input.startDelayMs, profile: input.profile },
+			});
+		}
+		if (!microphoneOwners.has(sender.id)) {
+			const owner = sender.id;
+			microphoneOwners.add(owner);
+			sender.once("destroyed", () => {
+				microphoneOwners.delete(owner);
+				browserMicrophones.releaseOwner(owner);
+			});
+		}
+		return browserMicrophones.create(sender.id, videoPath, startedAt);
+	});
+	handleTrustedIpc("write-microphone-chunk", ({ sender }, streamId: string, bytes: ArrayBuffer) =>
+		browserMicrophones.append(sender.id, streamId, bytes));
+	handleTrustedIpc("discard-microphone-stream", async ({ sender }, streamId: string) => {
+		const stream = await browserMicrophones.finish(sender.id, streamId);
+		if (stream.hasData) await fs.rm(stream.partial, { force: true });
+	});
+
+	handleTrustedIpc(
 		"store-microphone-sidecar",
 		async (
-			_,
-			audioData: ArrayBuffer,
+			{ sender },
+			streamId: string,
 			videoPath: string,
 			options?: {
 				startDelayMs?: number;
@@ -1772,42 +1831,21 @@ export function registerRecordingHandlers(
 			const baseName = videoPath.replace(/\.[^.]+$/, "");
 			const sidecarPath = `${baseName}.mic.wav`;
 			const sourceWebmPath = `${baseName}.mic.source.webm`;
-			const tempWebmPath = `${sourceWebmPath}.tmp`;
 
 			try {
-				await fs.writeFile(tempWebmPath, Buffer.from(audioData));
-				await execFileAsync(
-					getFfmpegBinaryPath(),
-					[
-						"-y",
-						"-hide_banner",
-						"-nostdin",
-						"-nostats",
-						"-i",
-						tempWebmPath,
-						"-vn",
-						"-ac",
-						"1",
-						"-ar",
-						"48000",
-						"-af",
-						[
-							...getBrowserMicSidecarFilters(options?.browserMicrophoneProfile),
-							"aresample=async=1:first_pts=0",
-						].join(","),
-						"-c:a",
-						"pcm_s16le",
-						sidecarPath,
-					],
-					{ timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
-				);
+				const stream = await browserMicrophones.finish(sender.id, streamId, videoPath);
+				if (!(await fs.stat(stream.partial).catch(() => null))) {
+					if (stream.recordingId !== null && activeRecoveryStartedAt === stream.recordingId) {
+						await clearCompletedWindowsRecording();
+					}
+					return { success: true };
+				}
+				const sourceBytes = (await fs.stat(stream.partial)).size;
+				await convertBrowserMicrophone(stream.partial, sidecarPath, options?.browserMicrophoneProfile);
 				if (shouldKeepRecordingAudioSidecars()) {
-					await fs.rename(tempWebmPath, sourceWebmPath).catch(async () => {
-						await fs.copyFile(tempWebmPath, sourceWebmPath);
-						await fs.rm(tempWebmPath, { force: true });
-					});
+					await fs.rename(stream.partial, sourceWebmPath);
 				} else {
-					await fs.rm(tempWebmPath, { force: true });
+					await fs.rm(stream.partial, { force: true });
 				}
 				const startDelayMs = options?.startDelayMs;
 				const mediaTrackSettings = pickPrimitiveRecord(options?.mediaTrackSettings);
@@ -1880,7 +1918,7 @@ export function registerRecordingHandlers(
 					outputPath: videoPath,
 					microphonePath: sidecarPath,
 					details: {
-						sourceBytes: audioData.byteLength,
+						sourceBytes,
 						sourceWebmPath: shouldKeepRecordingAudioSidecars() ? sourceWebmPath : null,
 						metadata,
 					},
@@ -1890,12 +1928,11 @@ export function registerRecordingHandlers(
 						diagnosticsError,
 					);
 				});
+				if (stream.recordingId !== null && activeRecoveryStartedAt === stream.recordingId) {
+					await clearCompletedWindowsRecording();
+				}
 				return { success: true, path: sidecarPath };
 			} catch (error) {
-				await Promise.all([
-					fs.rm(tempWebmPath, { force: true }).catch(() => undefined),
-					fs.rm(sidecarPath, { force: true }).catch(() => undefined),
-				]);
 				console.error("Failed to store microphone sidecar:", error);
 				return { success: false, error: String(error) };
 			}
@@ -1904,7 +1941,7 @@ export function registerRecordingHandlers(
 
 	// Pin the directory at first write, including if preferences change during capture.
 	const webcamFiles = new Map<string, string>();
-	ipcMain.handle("webcam-write", async ({ sender }, name: string, data: ArrayBuffer, first: boolean) => {
+	handleTrustedIpc("webcam-write", async ({ sender }, name: string, data: ArrayBuffer, first: boolean) => {
 		if (!/^recording-\d+-webcam\.(mp4|webm)$/.test(name) || !data.byteLength || data.byteLength > 4 * 1024 * 1024) {
 			throw new Error("Invalid webcam chunk");
 		}
@@ -1919,7 +1956,7 @@ export function registerRecordingHandlers(
 			await fs.appendFile(file + ".partial", Buffer.from(data));
 		}
 	});
-	ipcMain.handle("webcam-finish", async ({ sender }, name: string, discard: boolean) => {
+	handleTrustedIpc("webcam-finish", async ({ sender }, name: string, discard: boolean) => {
 		const key = `${sender.id}:${name}`;
 		const file = webcamFiles.get(key);
 		if (!file) throw new Error("Unknown webcam recording");
@@ -1929,17 +1966,12 @@ export function registerRecordingHandlers(
 			await fs.unlink(partial);
 			return null;
 		}
-		// Remux on disk to give both WebM and fragmented MP4 a seekable index.
-		await execFileAsync(getFfmpegBinaryPath(), ["-nostdin", "-v", "error", "-n", "-i", partial,
-			"-map", "0:v:0", "-c", "copy", file], { windowsHide: true });
-		await validateRecordedVideo(file);
-		await fs.unlink(partial).catch((error) => console.warn("Could not remove webcam partial", error));
-		return file;
+		return finalizeWebcamRecording(file);
 	});
 
 	const browserStreams = createBrowserRecordingStreamStore();
 	const browserStreamOwners = new Set<number>();
-	ipcMain.handle("recording-write", ({ sender }, name: string, data: ArrayBuffer, first: boolean) => {
+	handleTrustedIpc("recording-write", ({ sender }, name: string, data: ArrayBuffer, first: boolean) => {
 		if (!browserStreamOwners.has(sender.id)) {
 			const owner = sender.id;
 			browserStreamOwners.add(owner);
@@ -1950,10 +1982,15 @@ export function registerRecordingHandlers(
 		}
 		return browserStreams.append(sender.id, name, data, first);
 	});
-	ipcMain.handle("recording-finish", ({ sender }, name: string, discard: boolean) =>
+	handleTrustedIpc("recording-finish", ({ sender }, name: string, discard: boolean) =>
 		browserStreams.finish(sender.id, name, discard));
+	handleTrustedIpc("recover-browser-recording", async () => {
+		if (browserStreams.hasActiveStreams() || nativeScreenRecordingActive || windowsNativeCaptureActive || ffmpegScreenRecordingActive) return { success: false };
+		const partial = await findBrowserRecordingPartial();
+		return partial ? recoverBrowserRecordingPartial(partial) : { success: false };
+	});
 
-	ipcMain.handle("store-recorded-video", async (_, videoData: ArrayBuffer, fileName: unknown) => {
+	handleTrustedIpc("store-recorded-video", async (_, videoData: ArrayBuffer, fileName: unknown) => {
 		try {
 			const recordingsDir = await getRecordingsDir();
 			const videoPath = resolveRecordedVideoStoragePath(recordingsDir, fileName);
@@ -1969,7 +2006,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("get-recorded-video-path", async () => {
+	handleTrustedIpc("get-recorded-video-path", async () => {
 		try {
 			const recordingsDir = await getRecordingsDir();
 			const entries = await fs.readdir(recordingsDir, { withFileTypes: true });
@@ -2016,7 +2053,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("set-recording-state", async (_, recording: boolean, discarded?: boolean) => {
+	handleTrustedIpc("set-recording-state", async (_, recording: boolean, discarded?: boolean) => {
 		if (recording) {
 			resetRecordingMarkers();
 			startDiskChecks();
@@ -2058,7 +2095,6 @@ export function registerRecordingHandlers(
 			stopInteractionCapture();
 			stopWindowBoundsCapture();
 			stopNativeCursorMonitor();
-			showCursor();
 			setLinuxCursorScreenPoint(null);
 			resetCursorCaptureClock();
 			snapshotCursorTelemetryForPersistence();
@@ -2088,7 +2124,7 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("get-recording-state", event => {
+	handleTrustedIpc("get-recording-state", event => {
 		if (getHudOverlayWindow()?.webContents !== event.sender) return null;
 		const backend = windowsNativeCaptureActive ? "native-windows"
 			: nativeScreenRecordingActive || ffmpegScreenRecordingActive ? "native-mac"
@@ -2103,14 +2139,14 @@ export function registerRecordingHandlers(
 		};
 	});
 
-	ipcMain.handle("add-recording-marker", (event, kind: unknown) => {
+	handleTrustedIpc("add-recording-marker", (event, kind: unknown) => {
 		const hud = getHudOverlayWindow();
 		if (!hud || event.sender !== hud.webContents || !isRecordingMarkerKind(kind)) {
 			return { success: false };
 		}
 		return addRecordingMarkerAndNotify(kind, hud);
 	});
-	ipcMain.handle("get-recording-markers", async (_event, videoPath?: string) => {
+	handleTrustedIpc("get-recording-markers", async (_event, videoPath?: string) => {
 		try {
 			const target = normalizeVideoSourcePath(videoPath ?? currentVideoPath);
 			const approved = target ? await resolveApprovedLocalMediaPath(target) : null;
@@ -2121,12 +2157,12 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("pause-cursor-capture", (_, pausedAtMs?: unknown) => {
+	handleTrustedIpc("pause-cursor-capture", (_, pausedAtMs?: unknown) => {
 		pauseCursorCaptureAtBoundary(normalizeRendererTimestampMs(pausedAtMs));
 		trimKeystrokesAfter(getCursorCaptureElapsedMs());
 		return { success: true };
 	});
-	ipcMain.handle("get-recording-keystrokes", async (_event, videoPath?: string) => {
+	handleTrustedIpc("get-recording-keystrokes", async (_event, videoPath?: string) => {
 		try {
 			const target = normalizeVideoSourcePath(videoPath ?? currentVideoPath);
 			const approved = target ? await resolveApprovedLocalMediaPath(target) : null;
@@ -2137,20 +2173,22 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle("resume-cursor-capture", (_, resumedAtMs?: unknown) => {
+	handleTrustedIpc("resume-cursor-capture", (_, resumedAtMs?: unknown) => {
 		resumeCursorCapture(normalizeRendererTimestampMs(resumedAtMs));
 		sampleCursorPoint();
 		return { success: true };
 	});
 
-	ipcMain.handle("get-cursor-telemetry", async (_, videoPath?: string) => {
+	handleTrustedIpc("get-cursor-telemetry", async (_, videoPath?: string) => {
 		const targetVideoPath = normalizeVideoSourcePath(videoPath ?? currentVideoPath);
-		if (!targetVideoPath) {
+		const approvedPath = targetVideoPath ? await resolveApprovedLocalMediaPath(targetVideoPath) : null;
+		if (!approvedPath) {
 			return { success: true, samples: [] };
 		}
 
-		const telemetryPath = getTelemetryPathForVideo(targetVideoPath);
+		const telemetryPath = getTelemetryPathForVideo(approvedPath);
 		try {
+			if (!(await fs.lstat(telemetryPath)).isFile()) return { success: true, samples: [] };
 			const content = await fs.readFile(telemetryPath, "utf-8");
 			const parsed = parseJsonWithByteOrderMark<unknown>(content);
 			const samples = normalizeCursorTelemetrySamples(parsed);
@@ -2171,21 +2209,28 @@ export function registerRecordingHandlers(
 		}
 	});
 
-	ipcMain.handle(
+	handleTrustedIpc(
 		"set-cursor-telemetry",
 		async (_, videoPath: string | undefined, samples: CursorTelemetryPoint[]) => {
 			const targetVideoPath = normalizeVideoSourcePath(videoPath ?? currentVideoPath);
-			if (!targetVideoPath) {
+			const approvedPath = targetVideoPath ? await resolveApprovedLocalMediaPath(targetVideoPath) : null;
+			if (!approvedPath) {
 				return {
 					success: false,
 					samples: [],
 					message: uiText("noVideoPathAvailableForCursorTelemetry"),
-					error: "Missing video path",
+					error: "Missing or unapproved video path",
 				};
 			}
 
 			try {
-				const normalizedSamples = await writeCursorTelemetry(targetVideoPath, samples);
+				const telemetryPath = getTelemetryPathForVideo(approvedPath);
+				const current = await fs.lstat(telemetryPath).catch(error => {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					return null;
+				});
+				if (current && !current.isFile()) throw new Error("Cursor telemetry must be a regular file");
+				const normalizedSamples = await writeCursorTelemetry(approvedPath, samples);
 				return { success: true, samples: normalizedSamples };
 			} catch (error) {
 				console.error("Failed to save cursor telemetry:", error);

@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { Graphics, Sprite } from "pixi.js";
+import { describe, expect, it, vi } from "vitest";
 
 import { ADVANCED_VERTICAL_PADDING_MAX } from "../types";
-import { computePaddedLayout, scalePreviewBorderRadius } from "./layoutUtils";
+import { computePaddedLayout, layoutVideoContent, scalePreviewBorderRadius } from "./layoutUtils";
 
 const BASE_LAYOUT_PARAMS = {
 	width: 1000,
@@ -66,5 +67,50 @@ describe("scalePreviewBorderRadius", () => {
 		expect(scalePreviewBorderRadius(0, 540, 16)).toBe(0);
 		expect(scalePreviewBorderRadius(960, 0, 16)).toBe(0);
 		expect(scalePreviewBorderRadius(960, 540, -8)).toBe(0);
+	});
+});
+
+describe("preview mask layout", () => {
+	function createLayout(width: number, height: number) {
+		const maskGraphics = new Graphics();
+		const container = { clientWidth: width, clientHeight: height };
+		const canvas = { width, height, style: {} };
+		const params = {
+			container: container as HTMLDivElement,
+			app: { canvas, renderer: { resolution: 1, resize: vi.fn() } } as unknown as Parameters<typeof layoutVideoContent>[0]["app"],
+			videoSprite: new Sprite(),
+			videoElement: { videoWidth: 1920, videoHeight: 1080 } as HTMLVideoElement,
+			maskGraphics,
+		};
+		return { container, params, maskGraphics, clear: vi.spyOn(maskGraphics, "clear") };
+	}
+
+	it("transforms the existing geometry when padding changes its scale and position", () => {
+		const { params, maskGraphics, clear } = createLayout(960, 540);
+		const initial = layoutVideoContent({ ...params, borderRadius: 20 })!;
+		const padded = layoutVideoContent({
+			...params, borderRadius: 20,
+			padding: { left: 40, right: 10, top: 15, bottom: 25, linked: false },
+		})!;
+
+		expect(clear).toHaveBeenCalledTimes(1);
+		expect(maskGraphics.scale.x).toBeCloseTo(padded.baseScale / initial.baseScale, 10);
+		expect(maskGraphics.scale.y).toBe(maskGraphics.scale.x);
+		expect(maskGraphics.position.x).toBe(padded.maskRect.x);
+		expect(maskGraphics.position.y).toBe(padded.maskRect.y);
+	});
+
+	it("rebuilds when rounding begins or the source crop changes", () => {
+		const { container, params, maskGraphics, clear } = createLayout(64, 36);
+		layoutVideoContent({ ...params, borderRadius: 1 });
+		container.clientWidth = 192;
+		container.clientHeight = 108;
+		layoutVideoContent({ ...params, borderRadius: 1 });
+		expect(clear).toHaveBeenCalledTimes(2);
+
+		layoutVideoContent({ ...params, borderRadius: 1, cropRegion: { x: 0.1, y: 0, width: 0.8, height: 1 } });
+		expect(clear).toHaveBeenCalledTimes(3);
+		expect(maskGraphics.scale.x).toBe(1);
+		expect(maskGraphics.scale.y).toBe(1);
 	});
 });

@@ -1,10 +1,11 @@
+import { handleTrustedIpc } from "../../trustedIpc";
 import { uiText } from "../../uiI18n";
 import { APP_NAME } from "../../appIdentity";
 import { appLog } from "../../logger";
 import { createRecordingEditorNavigation } from "../../recordingEditorNavigation";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { app, BrowserWindow, desktopCapturer, ipcMain, systemPreferences } from "electron";
+import { app, BrowserWindow, desktopCapturer, systemPreferences } from "electron";
 import {
 	setHudRecordingPreparationActive,
 	createHudOverlayWindow,
@@ -138,7 +139,7 @@ export function registerSourceHandlers({
 	getSourceSelectorWindow: () => BrowserWindow | null;
 }) {
 	const recordingNavigation = createRecordingEditorNavigation(createEditorWindow);
-	ipcMain.handle("get-sources", async (event, opts) => {
+	handleTrustedIpc("get-sources", async (event, opts) => {
 		const cacheKey = JSON.stringify({
 			types: opts?.types,
 			thumbnailSize: opts?.thumbnailSize,
@@ -398,7 +399,7 @@ export function registerSourceHandlers({
 		}
 	});
 
-	ipcMain.handle("select-source", async (_, source: SelectedSource) => {
+	handleTrustedIpc("select-source", async (_, source: SelectedSource) => {
 		if (source.id?.startsWith("window:")) {
 			await bringSelectedWindowForward(source);
 		}
@@ -413,7 +414,7 @@ export function registerSourceHandlers({
 		return selectedSource;
 	});
 
-	ipcMain.handle("show-source-highlight", async (_, source: SelectedSource) => {
+	handleTrustedIpc("show-source-highlight", async (_, source: SelectedSource) => {
 		try {
 			const isWindow = source.id?.startsWith("window:");
 
@@ -588,11 +589,11 @@ body{background:transparent;overflow:hidden;width:100vw;height:100vh}
 		}
 	});
 
-	ipcMain.handle("get-selected-source", () => {
+	handleTrustedIpc("get-selected-source", () => {
 		return selectedSource;
 	});
 
-	ipcMain.handle("open-source-selector", () => {
+	handleTrustedIpc("open-source-selector", () => {
 		const sourceSelectorWin = getSourceSelectorWindow();
 		if (sourceSelectorWin) {
 			sourceSelectorWin.focus();
@@ -600,7 +601,7 @@ body{background:transparent;overflow:hidden;width:100vw;height:100vh}
 		}
 		createSourceSelectorWindow();
 	});
-	ipcMain.handle("show-recording-hud", (event) => {
+	handleTrustedIpc("show-recording-hud", (event) => {
 		setHudRecordingPreparationActive(true);
 		recordingNavigation.setReturnWindow(BrowserWindow.fromWebContents(event.sender));
 		const hud = getHudOverlayWindow();
@@ -611,11 +612,11 @@ body{background:transparent;overflow:hidden;width:100vw;height:100vh}
 			createHudOverlayWindow();
 		}
 	});
-	ipcMain.handle("show-project-dashboard", () => {
+	handleTrustedIpc("show-project-dashboard", () => {
 		setHudRecordingPreparationActive(false);
 		recordingNavigation.open(false);
 	});
-	ipcMain.handle("switch-to-editor", () => {
+	handleTrustedIpc("switch-to-editor", () => {
 		setHudRecordingPreparationActive(false);
 		console.log("[switch-to-editor] Opening editor window");
 		const sourceSelectorWin = getSourceSelectorWindow();

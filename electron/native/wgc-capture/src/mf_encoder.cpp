@@ -191,6 +191,14 @@ bool MFEncoder::writeFrame(ID3D11Texture2D* texture, int64_t timestampHns) {
 
     if (!initialized_ || !sinkWriter_) return false;
 
+    int64_t normalizedTimestampHns = 0;
+    normalizeWriteTimestampHnsLocked(timestampHns, normalizedTimestampHns);
+    const int64_t frameDurationHns = 10000000LL / fps_;
+    // MF's fragmented MP4 sink expects nonoverlapping samples. WGC's jitter can
+    // otherwise place a new fixed-duration sample before the previous one ends.
+    const int64_t sampleTimeHns = ((normalizedTimestampHns + frameDurationHns / 2) / frameDurationHns) * frameDurationHns;
+    if (sampleTimeHns <= lastSampleTimeHns_) return true;
+
     D3D11_TEXTURE2D_DESC sourceDesc = {};
     texture->GetDesc(&sourceDesc);
 
@@ -238,17 +246,14 @@ bool MFEncoder::writeFrame(ID3D11Texture2D* texture, int64_t timestampHns) {
 
     // WGC may stop delivering frames while the scene is static; keep the MP4
     // timeline continuous by repeating the previous frame before writing a new one.
-    int64_t normalizedTimestampHns = 0;
-    normalizeWriteTimestampHnsLocked(timestampHns, normalizedTimestampHns);
-
-    if (!lastFrameBuffer_.empty() && !extendLastFrameToLocked(normalizedTimestampHns)) {
+    if (!lastFrameBuffer_.empty() && !extendLastFrameToLocked(sampleTimeHns)) {
         return false;
     }
 
-    bool wroteSample = writeNv12SampleLocked(nv12Buffer_, normalizedTimestampHns);
+    bool wroteSample = writeNv12SampleLocked(nv12Buffer_, sampleTimeHns);
     if (wroteSample) {
         lastFrameBuffer_ = nv12Buffer_;
-        lastSampleTimeHns_ = normalizedTimestampHns;
+        lastSampleTimeHns_ = sampleTimeHns;
     }
     return wroteSample;
 }

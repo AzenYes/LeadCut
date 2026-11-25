@@ -9,7 +9,7 @@ const baseOptions = {
 	},
 	settings: {},
 	exportPipelineModel: "modern" as const,
-	exportBackendPreference: "breeze" as const,
+	exportBackendPreference: "auto" as const,
 	experimentalNvidiaCudaExport: false,
 	nvidiaCudaExportAvailable: false,
 };
@@ -41,6 +41,18 @@ describe("resolveMp4ExportRouting", () => {
 			useExperimentalNativeExport: false,
 			useExperimentalNvidiaCudaExport: false,
 			backendPreference: "webcodecs",
+		});
+	});
+
+	it("uses the configured editor route outside smoke mode", () => {
+		expect(resolveMp4ExportRouting({ ...baseOptions, exportBackendPreference: "breeze" })).toMatchObject({
+			backendPreference: "breeze", useExperimentalNativeExport: true,
+		});
+		expect(resolveMp4ExportRouting({
+			...baseOptions, exportBackendPreference: "breeze", settings: { backendPreference: "webcodecs" },
+			experimentalNvidiaCudaExport: true, nvidiaCudaExportAvailable: true,
+		})).toMatchObject({
+			backendPreference: "webcodecs", useExperimentalNativeExport: false, useExperimentalNvidiaCudaExport: false,
 		});
 	});
 

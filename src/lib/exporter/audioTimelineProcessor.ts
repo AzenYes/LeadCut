@@ -1,7 +1,7 @@
 import type { SpeedRegion } from "@/components/video-editor/types";
 import { normalizeSourceAudioDeletedRanges } from "@/components/video-editor/audio/sourceAudioEdits";
 import { AudioProcessorBase } from "./audioProcessorBase";
-import { resolveSourceTrackGain, type TimelineSlice, type TrimLikeRegion } from "./audioProcessorShared";
+import { type OfflineAudioInput, resolveSourceTrackGain, type TimelineSlice, type TrimLikeRegion } from "./audioProcessorShared";
 
 export class AudioTimelineProcessor extends AudioProcessorBase {
 	protected buildTimelineSlices(
@@ -74,9 +74,9 @@ export class AudioTimelineProcessor extends AudioProcessorBase {
 	// Each non-trimmed segment creates an AudioBufferSourceNode with the appropriate
 	// playbackRate for speed regions. When chunkOutputStartSec/chunkDurationSec are
 	// provided, only sources overlapping the chunk window are scheduled.
-	protected scheduleBufferThroughTimeline(
+	protected async scheduleBufferThroughTimeline(
 		ctx: OfflineAudioContext,
-		buffer: AudioBuffer,
+		buffer: OfflineAudioInput,
 		slices: TimelineSlice[],
 		sourceStartDelaySec: number,
 		gain = 1,
@@ -84,7 +84,7 @@ export class AudioTimelineProcessor extends AudioProcessorBase {
 		chunkDurationSec = Number.POSITIVE_INFINITY,
 		mutedOutputRangesSec: Array<{ startSec: number; endSec: number }> = [],
 		trackId: "mic" | "system" | "mixed" | "embedded" = "embedded",
-	): void {
+	): Promise<void> {
 		let outputOffsetSec = 0;
 
 		for (const slice of slices) {
@@ -202,10 +202,13 @@ export class AudioTimelineProcessor extends AudioProcessorBase {
 				const localStartSec = audibleRange.startSec - chunkOutputStartSec;
 				const sourceDurationSec = audibleDurationSec * slice.speed;
 
+				const window = "readWindow" in buffer
+					? await buffer.readWindow(ctx, sourceOffsetSec, sourceDurationSec, 0.1 * slice.speed)
+					: { buffer, offsetSec: sourceOffsetSec };
 				const stretchedBuffer = this.stretchAudioBuffer(
-					buffer,
+					window.buffer,
 					slice.speed,
-					sourceOffsetSec,
+					window.offsetSec,
 					sourceDurationSec,
 					audibleDurationSec,
 					ctx,

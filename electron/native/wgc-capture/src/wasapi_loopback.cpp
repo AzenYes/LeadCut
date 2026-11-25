@@ -268,8 +268,9 @@ bool WasapiCapture::initializeCommon() {
 bool WasapiCapture::start() {
     if (capturing_) return true;
 
-    outputFile_ = CreateFileA(
-        outputPath_.c_str(), GENERIC_WRITE, 0, nullptr,
+    const std::wstring outputPath = utf8ToWide(outputPath_);
+    outputFile_ = CreateFileW(
+        outputPath.c_str(), GENERIC_WRITE, 0, nullptr,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     if (outputFile_ == INVALID_HANDLE_VALUE) {
@@ -301,6 +302,7 @@ bool WasapiCapture::start() {
     }
 
     capturing_ = true;
+    failed_ = false;
     paused_ = false;
     thread_ = std::thread(&WasapiCapture::captureThread, this);
     return true;
@@ -318,7 +320,10 @@ bool WasapiCapture::resume() {
     const int64_t resumedQpcHns = queryPerformanceCounterHns();
     const int64_t pauseStartQpcHns = pauseStartQpcHns_.load();
     HRESULT hr = audioClient_ ? audioClient_->Start() : E_FAIL;
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        failed_ = true;
+        return false;
+    }
     if (pauseStartQpcHns > 0 && resumedQpcHns > pauseStartQpcHns) {
         accumulatedPausedQpcHns_.fetch_add(resumedQpcHns - pauseStartQpcHns);
     }
@@ -328,13 +333,17 @@ bool WasapiCapture::resume() {
     return true;
 }
 
-void WasapiCapture::stop() {
+void WasapiCapture::stop(uint64_t minimumDurationMs) {
     if (!capturing_) return;
     capturing_ = false;
     if (thread_.joinable()) thread_.join();
     if (audioClient_) audioClient_->Stop();
 
     if (outputFile_ != INVALID_HANDLE_VALUE) {
+        const uint64_t expectedFrames = minimumDurationMs * sampleRate() / 1000;
+        if (expectedFrames > framesWritten_) {
+            writeSilenceFrames(expectedFrames - framesWritten_, channelCount());
+        }
         SetFilePointer(outputFile_, 0, nullptr, FILE_BEGIN);
         const uint64_t dataBytes = totalDataBytes_.load();
         const DWORD wavDataBytes =
@@ -483,7 +492,7 @@ void WasapiCapture::captureThread() {
     DWORD sleepMs = static_cast<DWORD>((static_cast<double>(bufferFrameCount_) / mixFormat_->nSamplesPerSec) * 500.0);
     if (sleepMs < 5) sleepMs = 5;
 
-    while (capturing_) {
+    while (capturing_ && !failed_) {
         if (paused_) {
             Sleep(10);
             continue;
@@ -494,6 +503,7 @@ void WasapiCapture::captureThread() {
         UINT32 packetLength = 0;
         HRESULT hr = captureClient_->GetNextPacketSize(&packetLength);
         if (FAILED(hr)) {
+            failed_ = true;
             std::cerr << "WASAPI: GetNextPacketSize failed hr=0x" << std::hex << hr << std::dec << std::endl;
             break;
         }
@@ -512,6 +522,7 @@ void WasapiCapture::captureThread() {
                 &devicePosition,
                 &qpcPosition);
             if (FAILED(hr)) {
+                failed_ = true;
                 std::cerr << "WASAPI: GetBuffer failed hr=0x" << std::hex << hr << std::dec << std::endl;
                 break;
             }
@@ -586,6 +597,7 @@ void WasapiCapture::captureThread() {
                 captureClient_->ReleaseBuffer(numFrames);
                 hr = captureClient_->GetNextPacketSize(&packetLength);
                 if (FAILED(hr)) {
+                    failed_ = true;
                     std::cerr << "WASAPI: GetNextPacketSize failed hr=0x" << std::hex << hr << std::dec << std::endl;
                     break;
                 }
@@ -653,6 +665,7 @@ void WasapiCapture::captureThread() {
 
             hr = captureClient_->GetNextPacketSize(&packetLength);
             if (FAILED(hr)) {
+                failed_ = true;
                 std::cerr << "WASAPI: GetNextPacketSize failed hr=0x" << std::hex << hr << std::dec << std::endl;
                 break;
             }

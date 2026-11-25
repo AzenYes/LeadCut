@@ -15,7 +15,9 @@ export interface VideoSegment {
 	outputEndSec?: number;
 }
 
-/** One forward decode pass per source-order run; timeline gaps need no decoding. */
+const MAX_SEQUENTIAL_SOURCE_GAP_SECONDS = 8;
+
+/** Keep adjacent clips in one forward pass and skip large unused source gaps. */
 export function buildClipDecodeRuns(clips: ClipRegion[]): VideoSegment[][] {
 	const runs: VideoSegment[][] = [];
 	for (const clip of sortClipRegions(clips)) {
@@ -27,7 +29,8 @@ export function buildClipDecodeRuns(clips: ClipRegion[]): VideoSegment[][] {
 			outputEndSec: clip.endMs / 1000,
 		};
 		const run = runs[runs.length - 1];
-		if (run && segment.startSec >= run[run.length - 1].endSec) run.push(segment);
+		const sourceGap = run ? segment.startSec - run[run.length - 1].endSec : Infinity;
+		if (run && sourceGap >= 0 && sourceGap < MAX_SEQUENTIAL_SOURCE_GAP_SECONDS) run.push(segment);
 		else runs.push([segment]);
 	}
 	return runs;

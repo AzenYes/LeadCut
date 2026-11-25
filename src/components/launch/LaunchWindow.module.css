@@ -121,6 +121,19 @@
 	font-weight: 600;
 }
 
+.savedRecording {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	max-width: 240px;
+	text-align: start;
+	cursor: pointer;
+}
+
+.savedRecording:hover {
+	color: var(--accent);
+}
+
 @keyframes finalizingSpin {
 	from {
 		transform: rotate(0deg);

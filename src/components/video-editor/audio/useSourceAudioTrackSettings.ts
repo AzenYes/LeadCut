@@ -7,7 +7,6 @@ import type {
 
 interface UseSourceAudioTrackSettingsParams {
 	selectedClipId: string | null;
-	activeClipId: string | null;
 	sourceAudioTrackSettingsByClip: Record<string, SourceAudioTrackSettings>;
 	setSourceAudioTrackSettingsByClip: React.Dispatch<
 		React.SetStateAction<Record<string, SourceAudioTrackSettings>>
@@ -20,7 +19,6 @@ interface UseSourceAudioTrackSettingsParams {
 
 export interface UseSourceAudioTrackSettingsResult {
 	sourceAudioTrackMeta: SourceAudioTrackMeta;
-	activeSourceAudioTrackSettings: SourceAudioTrackSettings;
 	selectedClipSourceAudioTrackSettings: SourceAudioTrackSettings;
 	getSourceAudioTrackSettingsForClip: (clipId: string | null) => SourceAudioTrackSettings;
 	onSourceAudioTracksMetaChange: (tracks: SourceAudioTrackMeta) => void;
@@ -44,23 +42,12 @@ function isSameTrackMeta(left: SourceAudioTrackMeta, right: SourceAudioTrackMeta
 
 export function useSourceAudioTrackSettings({
 	selectedClipId,
-	activeClipId,
 	sourceAudioTrackSettingsByClip,
 	setSourceAudioTrackSettingsByClip,
 	defaultSourceAudioTrackSettings,
 	setDefaultSourceAudioTrackSettings,
 }: UseSourceAudioTrackSettingsParams): UseSourceAudioTrackSettingsResult {
 	const [sourceAudioTrackMeta, setSourceAudioTrackMeta] = useState<SourceAudioTrackMeta>([]);
-
-	const activeSourceAudioTrackSettings = useMemo(() => {
-		if (!activeClipId) {
-			return defaultSourceAudioTrackSettings;
-		}
-		return {
-			...defaultSourceAudioTrackSettings,
-			...(sourceAudioTrackSettingsByClip[activeClipId] ?? {}),
-		};
-	}, [activeClipId, defaultSourceAudioTrackSettings, sourceAudioTrackSettingsByClip]);
 
 	const selectedClipSourceAudioTrackSettings = useMemo(() => {
 		if (!selectedClipId) {
@@ -194,7 +181,6 @@ export function useSourceAudioTrackSettings({
 	return {
 		onSourceAudioRangeDelete,
 		sourceAudioTrackMeta,
-		activeSourceAudioTrackSettings,
 		selectedClipSourceAudioTrackSettings,
 		getSourceAudioTrackSettingsForClip,
 		onSourceAudioTracksMetaChange,

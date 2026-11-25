@@ -162,6 +162,7 @@ export function fromCaptionCues(
 
 export function parseExternalTranscript(contents: string) {
 	const data = record(JSON.parse(contents.replace(/^\uFEFF/, "")));
+	if (data?.version === 1 && data.timeBasis === "source" && data.engine === "whisper.cpp") return normalizeTranscript(data);
 	if (data?.backend === "qwen3-asr") return fromQwenJson(data);
 	if (data && data.backend === undefined) return fromFasterWhisperJson(data);
 	return null;

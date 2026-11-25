@@ -56,6 +56,7 @@ export function registerIpcHandlers(
 	_getMainWindow: () => BrowserWindow | null,
 	getSourceSelectorWindow: () => BrowserWindow | null,
 	onRecordingStateChange?: (recording: boolean, sourceName: string) => void,
+	takeStartupProject?: (senderId: number) => string | undefined,
 ) {
 	registerSourceHandlers({
 		createEditorWindow,
@@ -67,7 +68,7 @@ export function registerIpcHandlers(
 	registerAssetHandlers();
 	registerExportHandlers();
 	registerCaptionHandlers();
-	registerProjectHandlers();
+	registerProjectHandlers(takeStartupProject);
 	registerSettingsHandlers();
 	registerWaveformHandlers();
 }

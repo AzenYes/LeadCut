@@ -5,6 +5,7 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 
 test('chapter draft, confirmation, seek, rename, save/reopen and undo',async({page})=>{
+ test.setTimeout(45_000);
  await installDesktopBridge(page,'waveform.mp4');
  await installDesktopBridgeOverrides(page,()=>{
   Object.assign(window, { queryLocalFonts: async () => [{ family: 'Arial' }, { family: 'Times New Roman' }] });
@@ -96,9 +97,19 @@ test('GIF includes the shared chapter overlay',async({page},info)=>{
  expect(frame[(530*960+10)*3]).toBeGreaterThan(100);expect(frame[(530*960+900)*3]).toBeLessThan(45);
 });
 
-for(const pipeline of ['modern','legacy'] as const)test(`${pipeline} real MP4 renders chapter overlay above output`,async({page},info)=>{
+for (const { pipeline, renderBackend } of [
+ { pipeline: "modern", renderBackend: "webgl" },
+ { pipeline: "modern", renderBackend: "webgpu" },
+ { pipeline: "legacy", renderBackend: "webgl" },
+] as const) test(`${pipeline} ${renderBackend} real MP4 renders chapter overlay above output`, async ({page},info) => {
  test.setTimeout(120000);await installDesktopBridge(page);await page.goto('/?windowType=editor');
- const bytes=await page.evaluate(async(pipeline)=>{
+ if (renderBackend === "webgpu") {
+  const available = await page.evaluate(async () => {
+   try { return Boolean(await navigator.gpu?.requestAdapter()); } catch { return false; }
+  });
+  test.skip(!available, "WebGPU adapter unavailable");
+ }
+ const bytes=await page.evaluate(async({pipeline, renderBackend})=>{
   const {ModernVideoExporter}=await import('/src/lib/exporter/modernVideoExporter.ts');const {VideoExporter}=await import('/src/lib/exporter/videoExporter.ts');
   const {emptyChapterProgress,confirmChapterProgress}=await import('/src/components/video-editor/chapterProgress.ts');
   const clipRegions=[{id:'s',startMs:0,endMs:1000,sourceStartMs:0,speed:1}];
@@ -109,9 +120,12 @@ for(const pipeline of ['modern','legacy'] as const)test(`${pipeline} real MP4 re
    style:{...draft.style, fontFamily:'"Times New Roman"', playedColor:'#f00000', unplayedColor:'#00e000', playedTextColor:'#ffff00', unplayedTextColor:'#ff00ff'},
   },{clipRegions});
   const Exporter=pipeline==='modern'?ModernVideoExporter:VideoExporter;
-  const exporter=new Exporter({width:1920,height:1080,frameRate:10,bitrate:5000000,codec:'avc1.640028',backendPreference:'webcodecs',preferredRenderBackend:'webgl',videoUrl:`${location.origin}/tests/ui/fixtures/broll-blue.mp4`,wallpaper:'#0000ff',showShadow:false,shadowIntensity:0,backgroundBlur:0,cropRegion:{x:0,y:0,width:1,height:1},padding:0,zoomRegions:[],showCursor:false,clipRegions,chapterProgress});
-  const result=await exporter.export();if(!result.success||!result.blob)throw new Error(result.error??'no export');return Array.from(new Uint8Array(await result.blob.arrayBuffer()));
- },pipeline);
+  const exporter=new Exporter({width:1920,height:1080,frameRate:10,bitrate:5000000,codec:'avc1.640028',backendPreference:'webcodecs',preferredRenderBackend:renderBackend,videoUrl:`${location.origin}/tests/ui/fixtures/broll-blue.mp4`,wallpaper:'#0000ff',showShadow:false,shadowIntensity:0,backgroundBlur:0,cropRegion:{x:0,y:0,width:1,height:1},padding:0,zoomRegions:[],showCursor:false,clipRegions,chapterProgress});
+  const result=await exporter.export();
+  if(!result.success||!result.blob)throw new Error(result.error??'no export');
+  if(renderBackend==="webgpu"&&result.metrics?.renderBackend!=="webgpu")throw new Error("WebGPU overlay path did not run");
+  return Array.from(new Uint8Array(await result.blob.arrayBuffer()));
+ },{pipeline,renderBackend});
  const file=info.outputPath(`${pipeline}-chapters.mp4`);fs.writeFileSync(file,Buffer.from(bytes));
  const frame=execFileSync(path.resolve('node_modules/ffmpeg-static/ffmpeg.exe'),['-v','error','-ss','0.5','-i',file,'-frames:v','1','-f','rawvideo','-pix_fmt','rgb24','-'],{windowsHide:true,maxBuffer:1920*1080*3+1024});
  const rgb=(x:number,y:number)=>Array.from(frame.subarray((y*1920+x)*3,(y*1920+x)*3+3));
@@ -124,4 +138,43 @@ for(const pipeline of ['modern','legacy'] as const)test(`${pipeline} real MP4 re
  expect(titlePixels(480).some(([r,g,b]) => r > 200 && g > 200 && b < 80)).toBe(true);
  expect(titlePixels(1440).some(([r,g,b]) => r > 200 && g < 80 && b > 200)).toBe(true);
  expect(rgb(10,1040)[0]).toBeLessThan(35);
+});
+
+test("Pixi can use different texture limits in the preview and export", async ({ page }) => {
+	await installDesktopBridge(page, "broll-blue.mp4");
+	await page.goto("/?windowType=editor");
+	const layouts = await page.evaluate(async () => {
+		const { inspectPixiTextureLimits } = await import("/tests/ui/fixtures/pixiTextureLimits.ts");
+		return inspectPixiTextureLimits();
+	});
+	expect(layouts).toEqual([
+		{ bindings: 32, resources: 64 },
+		{ bindings: 16, resources: 32 },
+		{ bindings: 32, resources: 64 },
+	]);
+});
+
+test("modern export reports WebGL when Pixi falls back after a failed WebGPU capability probe", async ({ page }) => {
+	test.setTimeout(60_000);
+	await installDesktopBridge(page);
+	await page.addInitScript(() => {
+		Object.defineProperty(navigator, "gpu", { value: { requestAdapter: async () => null } });
+	});
+	await page.goto("/?windowType=editor");
+	const result = await page.evaluate(async () => {
+		const { ModernVideoExporter } = await import("/src/lib/exporter/modernVideoExporter.ts");
+		const exporter = new ModernVideoExporter({
+			width: 640, height: 360, frameRate: 10, bitrate: 1_000_000, codec: "avc1.640028",
+			backendPreference: "webcodecs", preferredRenderBackend: "webgpu",
+			videoUrl: `${location.origin}/tests/ui/fixtures/broll-blue.mp4`, wallpaper: "#0000ff",
+			showShadow: false, shadowIntensity: 0, backgroundBlur: 0, padding: 0, zoomRegions: [], showCursor: false,
+			cropRegion: { x: 0, y: 0, width: 1, height: 1 },
+			clipRegions: [{ id: "clip", startMs: 0, endMs: 1000, sourceStartMs: 0, speed: 1 }],
+		});
+		const exportResult = await exporter.export();
+		return { success: exportResult.success, bytes: exportResult.blob?.size, backend: exportResult.metrics?.renderBackend };
+	});
+	expect(result.success).toBe(true);
+	expect(result.bytes).toBeGreaterThan(0);
+	expect(result.backend).toBe("webgl");
 });

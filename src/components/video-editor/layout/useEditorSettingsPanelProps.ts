@@ -1,4 +1,4 @@
-import type { ComponentProps, Dispatch, SetStateAction } from "react";
+import { useCallback, type ComponentProps, type Dispatch, type SetStateAction } from "react";
 import type { AspectRatio } from "@/utils/aspectRatioUtils";
 import { useClipAudioReset } from "../audio/useClipAudioReset";
 import type { useAutoCaptionController } from "../captions/useAutoCaptionController";
@@ -7,10 +7,11 @@ import type { useAudioRegionCommands } from "../hooks/useAudioRegionCommands";
 import type { useCaptionCommands } from "../hooks/useCaptionCommands";
 import type { useClipRegionCommands } from "../hooks/useClipRegionCommands";
 import type { useZoomRegionCommands } from "../hooks/useZoomRegionCommands";
-import { SettingsPanel } from "../SettingsPanel";
+import type { SettingsPanel } from "../SettingsPanel";
 import type { useAppearanceState } from "../state/useAppearanceState";
 import type { useTimelineState } from "../state/useTimelineState";
 import { type EditorEffectSection, mapTimelineTimeToSourceTime } from "../types";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 
 type Input = {
 	activeEffectSection: EditorEffectSection;
@@ -24,7 +25,7 @@ type Input = {
 	autoCaptionController: ReturnType<typeof useAutoCaptionController>;
 	effectiveShowCursor: boolean;
 	handleShowCursorChange: (show: boolean) => void;
-	currentTime: number;
+	playbackClock: PlaybackClock;
 	isPlaying: boolean;
 	aspectRatio: AspectRatio;
 	setAspectRatio: Dispatch<SetStateAction<AspectRatio>>;
@@ -52,7 +53,7 @@ export function useEditorSettingsPanelProps(input: Input): ComponentProps<typeof
 		autoCaptionController,
 		effectiveShowCursor,
 		handleShowCursorChange,
-		currentTime,
+		playbackClock,
 		isPlaying,
 		aspectRatio,
 		setAspectRatio,
@@ -110,8 +111,6 @@ export function useEditorSettingsPanelProps(input: Input): ComponentProps<typeof
 		onShadowChange: appearance.setShadowIntensity,
 		backgroundBlur: appearance.backgroundBlur,
 		onBackgroundBlurChange: appearance.setBackgroundBlur,
-		autoApplyFreshRecordingAutoZooms: appearance.autoApplyFreshRecordingAutoZooms,
-		onAutoApplyFreshRecordingAutoZoomsChange: appearance.setAutoApplyFreshRecordingAutoZooms,
 		connectZooms: appearance.connectZooms,
 		onConnectZoomsChange: appearance.setConnectZooms,
 		zoomInDurationMs: appearance.zoomInDurationMs,
@@ -174,14 +173,16 @@ export function useEditorSettingsPanelProps(input: Input): ComponentProps<typeof
 		onBorderRadiusChange: appearance.setBorderRadius,
 		webcam: appearance.webcam,
 		webcamPreviewSrc: appearance.webcam.sourcePath ? appearance.resolvedWebcamVideoUrl : null,
-		webcamPreviewCurrentTime:
-			mapTimelineTimeToSourceTime(currentTime * 1000, timeline.clipRegions) / 1000,
+		webcamPreviewClock: playbackClock,
+		webcamPreviewTimeFromTimeline: useCallback((seconds: number) =>
+			mapTimelineTimeToSourceTime(seconds * 1000, timeline.clipRegions) / 1000, [timeline.clipRegions]),
 		webcamPreviewPlaying: isPlaying,
 		onWebcamChange: appearance.setWebcam,
 		onUploadWebcam: handleUploadWebcam,
 		onClearWebcam: handleClearWebcam,
 		padding: appearance.padding,
 		onPaddingChange: appearance.setPadding,
+		paddingDraft: appearance.paddingDraft,
 		cropRegion: appearance.cropRegion,
 		onCropChange: appearance.setCropRegion,
 		aspectRatio,
@@ -190,6 +191,7 @@ export function useEditorSettingsPanelProps(input: Input): ComponentProps<typeof
 		annotationRegions: timeline.annotationRegions,
 		autoCaptions: timeline.autoCaptions,
 		autoCaptionSettings: timeline.autoCaptionSettings,
+		captionFontSizeDraft: timeline.captionFontSizeDraft,
 		whisperExecutablePath,
 		whisperModelPath,
 		whisperModelDownloadStatus,
@@ -202,11 +204,14 @@ export function useEditorSettingsPanelProps(input: Input): ComponentProps<typeof
 		onPickWhisperExecutable: autoCaptionController.handlePickWhisperExecutable,
 		onPickWhisperModel: autoCaptionController.handlePickWhisperModel,
 		onGenerateAutoCaptions: autoCaptionController.handleGenerateAutoCaptions,
+		onCancelAutoCaptions: autoCaptionController.handleCancelAutoCaptions,
+		captionGenerationProgress: autoCaptionController.captionGenerationProgress,
 		onImportSrtCaptions: autoCaptionController.handleImportSrtCaptions,
 		onImportTranscript: autoCaptionController.handleImportTranscript,
 		onRebuildCaptionsFromTranscript: autoCaptionController.handleRebuildCaptionsFromTranscript,
 		onClearAutoCaptions: captionCommands.handleClearAutoCaptions,
 		onDownloadWhisperSmallModel: autoCaptionController.handleDownloadWhisperSmallModel,
+		onCancelWhisperModelDownload: autoCaptionController.handleCancelWhisperModelDownload,
 		onDeleteWhisperSmallModel: autoCaptionController.handleDeleteWhisperSmallModel,
 		nativeCaptureUnavailableSession: sessionNativeCaptureUnavailable,
 		onOpenNativeCaptureUnavailableModal: () => setNativeCaptureUnavailableModalOpen(true),

@@ -1,8 +1,9 @@
 import { TIMELINE_HEIGHT_STORAGE_KEY } from "@/lib/storageKeys";
 import type { Range, Span } from "dnd-timeline";
 import { readRendererSetting, writeRendererSetting } from "@/lib/durableRendererSettings";
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import { useI18n } from "@/contexts/I18nContext";
+import { Button } from "@/components/ui/button";
 import { useShortcuts } from "@/contexts/ShortcutsContext";
 import { formatBinding } from "@/lib/shortcuts";
 import type { ChangeReviewMarkers } from "../changeLogRestore";
@@ -19,14 +20,19 @@ import type { useEditorPlaybackControls } from "../hooks/useEditorPlaybackContro
 import type { useTimelineProjection } from "../hooks/useTimelineProjection";
 import type { useZoomRegionCommands } from "../hooks/useZoomRegionCommands";
 import type { useTimelineState } from "../state/useTimelineState";
-import TimelineEditor, { type TimelineEditorHandle } from "../timeline/TimelineEditor";
+import TimelineEditor, { type TimelineEditorHandle, type TimelineEditorProps } from "../timeline/TimelineEditor";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 
 type Props = {
+	deferInitialTracks?: boolean;
 	readOnly?: boolean;
+	onBrowseClips: () => void;
+	onOpenMedia: () => void;
 	changeMarkers: ChangeReviewMarkers;
 	focusRange: Range | null;
 	onReturnToFullTimeline: () => void;
 	panelRef?: RefObject<HTMLDivElement | null>;
+	timeAtClientXRef?: TimelineEditorProps["timeAtClientXRef"];
 	timelineRef: RefObject<TimelineEditorHandle | null>;
 	timeline: ReturnType<typeof useTimelineState>;
 	projection: ReturnType<typeof useTimelineProjection>;
@@ -46,7 +52,7 @@ type Props = {
 	autoSuggestZoomsTrigger: number;
 	handleAutoSuggestZoomsConsumed: () => void;
 	disableSuggestedZooms: boolean;
-	currentTime: number;
+	playbackClock: PlaybackClock;
 	handleSelectAnnotation: (id: string | null) => void;
 };
 
@@ -54,16 +60,26 @@ const clampHeight = (value: number) => Math.max(180, Math.min(window.innerHeight
 
 export function EditorTimelinePanel(props: Props) {
 	const { t } = useI18n();
+	const [tracksMounted, setTracksMounted] = useState(() => !props.deferInitialTracks);
+	useEffect(() => {
+		if (tracksMounted || props.deferInitialTracks) return;
+		const frame = requestAnimationFrame(() => setTracksMounted(true));
+		return () => cancelAnimationFrame(frame);
+	}, [props.deferInitialTracks, tracksMounted]);
 	const { shortcuts, isMac } = useShortcuts();
 	const [height, setHeight] = useState(() => {
 		const saved = Number(readRendererSetting(TIMELINE_HEIGHT_STORAGE_KEY));
 		return clampHeight(saved > 0 ? saved : 260);
 	});
-	const resizeStart = useRef<{ y: number; height: number } | null>(null);
-	const [timeDraft, setTimeDraft] = useState<string | null>(null);
-	useEffect(() => {
-		writeRendererSetting(TIMELINE_HEIGHT_STORAGE_KEY, String(Math.round(height)));
-	}, [height]);
+	const resizeStart = useRef<{ y: number; height: number; latestHeight: number } | null>(null);
+	const timecodeRef = useRef<HTMLInputElement>(null);
+	const finishResize = () => {
+		const start = resizeStart.current;
+		resizeStart.current = null;
+		if (start && start.latestHeight !== start.height) {
+			writeRendererSetting(TIMELINE_HEIGHT_STORAGE_KEY, String(Math.round(start.latestHeight)));
+		}
+	};
 	useEffect(() => {
 		const resize = () => setHeight((height) => clampHeight(height));
 		window.addEventListener("resize", resize);
@@ -87,13 +103,29 @@ export function EditorTimelinePanel(props: Props) {
 		autoSuggestZoomsTrigger,
 		handleAutoSuggestZoomsConsumed,
 		disableSuggestedZooms,
-		currentTime,
+		playbackClock,
 		handleSelectAnnotation,
 	} = props;
+	const updateTimecode = useCallback(() => {
+		const input = timecodeRef.current;
+		if (input) input.value = formatTimelineTimecode(playbackClock.getTime() * 1000);
+	}, [playbackClock]);
+	useLayoutEffect(() => {
+		updateTimecode();
+		return playbackClock.subscribe(() => {
+			const input = timecodeRef.current;
+			if (input && input.ownerDocument.activeElement !== input) updateTimecode();
+		});
+	}, [playbackClock, updateTimecode]);
 	const captionById = useMemo(() => new Map(projection.effectiveCaptionRegions.map((cue) => [cue.id, cue])), [projection.effectiveCaptionRegions]);
 	const selectedCaptionFragments = useMemo(() => timeline.selectedCaptionId
 		? projection.effectiveCaptionRegions.filter((cue) => cue.sourceCueId === timeline.selectedCaptionId)
 		: [], [projection.effectiveCaptionRegions, timeline.selectedCaptionId]);
+	const selectedCaptionId = useSyncExternalStore(playbackClock.subscribe, () => {
+		const timeMs = playbackClock.getTime() * 1000;
+		return selectedCaptionFragments.find(cue => timeMs >= cue.startMs && timeMs < cue.endMs)?.id
+			?? selectedCaptionFragments[0]?.id ?? null;
+	});
 	const selectedIds = useMemo(() => {
 		const selected = new Set(timeline.selectedRegionIds);
 		if (!selected.size) return timeline.selectedRegionIds;
@@ -150,19 +182,24 @@ export function EditorTimelinePanel(props: Props) {
 				aria-valuenow={Math.round(height)}
 				className="group -mx-4 -mt-2 mb-1 flex h-3 shrink-0 cursor-ns-resize touch-none items-center justify-center border-t border-foreground/10 hover:bg-accent/10 focus:bg-accent/10"
 				onPointerDown={(event) => {
-					resizeStart.current = { y: event.clientY, height };
+					resizeStart.current = { y: event.clientY, height, latestHeight: height };
 					event.currentTarget.setPointerCapture(event.pointerId);
 				}}
 				onPointerMove={(event) => {
 					const start = resizeStart.current;
-					if (start) setHeight(clampHeight(start.height + start.y - event.clientY));
+					if (!start) return;
+					start.latestHeight = clampHeight(start.height + start.y - event.clientY);
+					setHeight(start.latestHeight);
 				}}
-				onPointerUp={() => { resizeStart.current = null; }}
-				onLostPointerCapture={() => { resizeStart.current = null; }}
+				onPointerUp={finishResize}
+				onLostPointerCapture={finishResize}
 				onKeyDown={(event) => {
 					if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
 					event.preventDefault();
-					setHeight(clampHeight(height + (event.key === "ArrowUp" ? 24 : -24)));
+					const nextHeight = clampHeight(height + (event.key === "ArrowUp" ? 24 : -24));
+					if (nextHeight === height) return;
+					setHeight(nextHeight);
+					writeRendererSetting(TIMELINE_HEIGHT_STORAGE_KEY, String(Math.round(nextHeight)));
 				}}
 			>
 				<span className="h-0.5 w-12 rounded bg-foreground/25 group-hover:bg-accent" />
@@ -171,16 +208,15 @@ export function EditorTimelinePanel(props: Props) {
 				{props.focusRange && <button type="button" className="rounded px-2 py-1 text-xs text-accent hover:bg-accent/10"
 					onClick={props.onReturnToFullTimeline}>{t("common.interface.reviewReturnToFull")}</button>}
 				<input
+					ref={timecodeRef}
 					aria-label={t("editor.timeline.timecode", "Timeline timecode")}
 					className="w-32 rounded bg-foreground/5 px-2 py-1 font-mono text-xs tabular-nums text-accent outline-none focus:ring-1 focus:ring-accent"
-					value={timeDraft ?? formatTimelineTimecode(currentTime * 1000)}
-					onChange={(event) => setTimeDraft(event.target.value)}
-					onFocus={(event) => { setTimeDraft(event.target.value); event.target.select(); }}
-					onBlur={() => setTimeDraft(null)}
+					onFocus={(event) => event.currentTarget.select()}
+					onBlur={updateTimecode}
 					onKeyDown={(event) => {
 						if (event.key === "Escape") event.currentTarget.blur();
 						if (event.key !== "Enter") return;
-						const timeMs = parseTimelineTimecode(timeDraft ?? "");
+						const timeMs = parseTimelineTimecode(event.currentTarget.value);
 						if (timeMs !== null) playback.handleTimelineSeek(Math.min(timeMs / 1000, projection.timelineDuration));
 						event.currentTarget.blur();
 					}}
@@ -193,7 +229,15 @@ export function EditorTimelinePanel(props: Props) {
 				<button type="button" className="ml-auto rounded px-2 py-1 text-xs hover:bg-foreground/10" onClick={() => props.videoCommands.addTrack()}>{t("editor.tracks.add", "+ Video track")}</button>
 				<button type="button" className="rounded px-2 py-1 text-xs hover:bg-foreground/10" disabled={props.videoCommands.importing} onClick={() => void props.videoCommands.importVideo()}>{t("editor.tracks.import", "Import B-roll")}</button>
 			</div>
-			<TimelineEditor
+			{!props.readOnly && timeline.clipRegions.length === 0 && timeline.videoRegions.length === 0 && (
+				<div className="flex flex-wrap items-center gap-2 px-2 py-1">
+					<Button type="button" variant="secondary" size="sm"
+						onClick={videoPath ? props.onBrowseClips : props.onOpenMedia}>
+						{videoPath ? t("common.interface.browseTimelineClips") : t("common.interface.openVideoOrProject")}
+					</Button>
+				</div>
+			)}
+			{tracksMounted && <TimelineEditor
 				focusRange={props.focusRange}
 				changeMarkers={props.changeMarkers}
 				selectedIds={selectedIds}
@@ -204,8 +248,8 @@ export function EditorTimelinePanel(props: Props) {
 				videoTrackControls={videoTrackControls}
 				ref={timelineRef}
 				videoDuration={projection.timelineDuration}
-				currentTime={currentTime}
-				playheadTime={projection.timelinePlayheadTime}
+				playbackClock={playbackClock}
+				timeAtClientXRef={props.timeAtClientXRef}
 				onSeek={playback.handleTimelineSeek}
 				videoPath={videoPath}
 				videoSourcePath={videoSourcePath}
@@ -232,7 +276,7 @@ export function EditorTimelinePanel(props: Props) {
 						? current : { ...current, hiddenIds: [...current.hiddenIds, id] }),
 				} : undefined}
 				onMarkersChange={props.readOnly ? undefined : timeline.setMarkers}
-				onClipSplit={() => props.sequenceTools.split()}
+				onClipSplit={props.sequenceTools.split}
 				onClipDelete={clipCommands.handleClipDelete}
 				onClipSpanChange={clipCommands.handleClipSpanChange}
 				selectedClipId={timeline.selectedClipId}
@@ -245,15 +289,7 @@ export function EditorTimelinePanel(props: Props) {
 				onSelectAudio={audioCommands.handleSelectAudio}
 				captionRegions={projection.effectiveCaptionRegions}
 				onCaptionSpanChange={handleCaptionSpanChange}
-				selectedCaptionId={
-					selectedCaptionFragments.find(
-						(cue) =>
-							currentTime * 1000 >= cue.startMs &&
-							currentTime * 1000 < cue.endMs,
-					)?.id ??
-					selectedCaptionFragments[0]?.id ??
-					null
-				}
+				selectedCaptionId={selectedCaptionId}
 				onSelectCaption={handleSelectCaption}
 				onCaptionDelete={handleCaptionDelete}
 				onCaptionAdded={captionCommands.handleCaptionAdded}
@@ -269,12 +305,12 @@ export function EditorTimelinePanel(props: Props) {
 				sourceAudioResourceVersion={timeline.sourceAudioFallbackRefreshKey}
 				sourceAudioVideoDuration={audio.sourceDurationSeconds}
 				sourceAudioStartDelayMsByPath={audio.sourceAudioFallbackStartDelayMsByPath}
-				sourceAudioTrackSettings={audio.activeSourceAudioTrackSettings}
+				sourceAudioSidecarPaths={audio.sourceAudioSidecarPaths}
 				getSourceAudioTrackSettingsForClip={audio.getSourceAudioTrackSettingsForClip}
 				onSourceAudioRangeDelete={audio.onSourceAudioRangeDelete}
 				onSourceAudioAvailabilityChange={timeline.setHasClipSourceAudio}
 				onSourceAudioTracksMetaChange={audio.onSourceAudioTracksMetaChange}
-			/>
+			/>}
 		</div>
 	);
 }

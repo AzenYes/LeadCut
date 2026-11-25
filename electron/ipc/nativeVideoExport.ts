@@ -37,7 +37,7 @@ export interface NativeVideoExportStartOptions {
 	frameRate: number;
 	bitrate: number;
 	encodingMode: NativeExportEncodingMode;
-	inputMode?: "rawvideo" | "h264-stream";
+	inputMode?: "rawvideo" | "h264-stream" | "mp4-stream";
 }
 
 export interface NativeVideoExportAudioSegment {
@@ -55,6 +55,8 @@ export interface NativeVideoExportFinishOptions {
 	audioSourceCodec?: string | null;
 	audioSourceSampleRate?: number;
 	outputDurationSec?: number;
+	outputVideoFrameCount?: number;
+	reuseVideoMp4?: boolean;
 	trimSegments?: NativeVideoExportAudioSegment[];
 	editedTrackStrategy?: NativeVideoExportEditedTrackStrategy;
 	editedTrackSegments?: NativeVideoExportEditedTrackSegment[];
@@ -69,8 +71,16 @@ export interface NativeVideoAudioMuxMetrics {
 	muxedVideoReadMs?: number;
 	tempVideoBytes?: number;
 	tempEditedAudioBytes?: number;
+	inlineEditedAudioBytes?: number;
+	ffmpegMuxOutputWriteBytes?: number;
 	muxedVideoBytes?: number;
 }
+
+export type ExportAudioAppendResult =
+	| { success: true; metrics: NativeVideoAudioMuxMetrics }
+	| { success: false; error: string; retryable?: boolean };
+
+export type ExportAudioAppendDisposition = "finish" | "retry" | "cancel";
 
 export type NativeStaticLayoutBackend =
 	| "cuda-overlay"
@@ -620,6 +630,7 @@ function formatFfmpegSeconds(milliseconds: number): string {
 
 export function buildTrimmedSourceAudioFilter(
 	segments: NativeVideoExportAudioSegment[],
+	inputIndex = 1,
 ): string | null {
 	if (segments.length === 0) {
 		return null;
@@ -631,7 +642,7 @@ export function buildTrimmedSourceAudioFilter(
 	segments.forEach((segment, index) => {
 		const label = `trimmed_audio_${index}`;
 		filterParts.push(
-			`[1:a]atrim=start=${formatFfmpegSeconds(segment.startMs)}:end=${formatFfmpegSeconds(segment.endMs)},asetpts=PTS-STARTPTS[${label}]`,
+			`[${inputIndex}:a]atrim=start=${formatFfmpegSeconds(segment.startMs)}:end=${formatFfmpegSeconds(segment.endMs)},asetpts=PTS-STARTPTS[${label}]`,
 		);
 		segmentLabels.push(`[${label}]`);
 	});
@@ -648,6 +659,7 @@ export function buildTrimmedSourceAudioFilter(
 export function buildEditedTrackSourceAudioFilter(
 	segments: NativeVideoExportEditedTrackSegment[],
 	sourceSampleRate: number,
+	inputIndex = 1,
 ): string | null {
 	if (segments.length === 0 || !Number.isFinite(sourceSampleRate) || sourceSampleRate <= 0) {
 		return null;
@@ -690,7 +702,7 @@ export function buildEditedTrackSourceAudioFilter(
 		}
 
 		const segmentFilter = [
-			`[1:a]atrim=start=${formatFfmpegSeconds(segment.startMs)}:end=${formatFfmpegSeconds(segment.endMs)}`,
+			`[${inputIndex}:a]atrim=start=${formatFfmpegSeconds(segment.startMs)}:end=${formatFfmpegSeconds(segment.endMs)}`,
 			"asetpts=PTS-STARTPTS",
 		];
 
@@ -725,29 +737,64 @@ export function buildEditedTrackSourceAudioFilter(
  * browser's hardware VideoEncoder) and copies it straight into an MP4 container
  * — no re-encoding step, no raw pixel IPC traffic.
  */
+export interface NativeH264StreamAudioOptions {
+	durationSec: number;
+	videoFrameCount: number;
+	sampleRate?: number;
+}
+
+export interface NativeH264StreamSourceAudioOptions extends NativeH264StreamAudioOptions {
+	audioOptions: NativeVideoExportFinishOptions;
+}
+
+export function getNativeH264StreamAudioMuxOptions(options: NativeH264StreamAudioOptions) {
+	const { durationSec, videoFrameCount, sampleRate } = options;
+	if (!Number.isFinite(durationSec) || durationSec <= 0 ||
+		!Number.isSafeInteger(videoFrameCount) || videoFrameCount <= 0) return;
+	const sampleRateForEstimate = typeof sampleRate === "number" && Number.isSafeInteger(sampleRate)
+		? Math.max(48_000, sampleRate)
+		: 48_000;
+	const audioPackets = Math.ceil(durationSec * sampleRateForEstimate / 1024) + 2;
+	const moovReservedBytes = 8192 + 48 * (videoFrameCount + audioPackets);
+	if (moovReservedBytes <= 16 * 1024 * 1024) return { durationSec, moovReservedBytes };
+}
+
 export function buildNativeH264StreamExportArgs(config: {
 	frameRate: number;
 	outputPath: string;
+	fragmentedMp4?: boolean;
+	videoOnlyIntermediate?: boolean;
+	mixedAudio?: { durationSec: number; moovReservedBytes: number };
 }): string[] {
-	return [
+	const args = [
 		"-y",
 		"-hide_banner",
 		"-loglevel",
 		"error",
-		// Input 0: pre-encoded H.264 Annex B stream from browser VideoEncoder via stdin
-		"-f",
-		"h264",
-		"-r",
-		String(config.frameRate),
-		"-i",
-		"pipe:0",
-		"-an", // audio handled separately by muxNativeVideoExportAudio
-		"-c:v",
-		"copy",
-		"-movflags",
-		"+faststart",
-		config.outputPath,
+		"-nostdin",
 	];
+	if (config.mixedAudio) args.push("-thread_queue_size", "16");
+	if (config.fragmentedMp4) {
+		args.push("-f", "mp4");
+	} else {
+		args.push("-f", "h264", "-r", String(config.frameRate));
+	}
+	args.push("-i", "pipe:0");
+	if (config.mixedAudio) {
+		args.push(
+			"-thread_queue_size", "16",
+			"-f", "wav", "-i", "pipe:3",
+			"-map", "0:v:0", "-map", "1:a:0",
+			"-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+			"-t", config.mixedAudio.durationSec.toFixed(3),
+			"-moov_size", String(config.mixedAudio.moovReservedBytes),
+		);
+	} else {
+		args.push("-an", "-c:v", "copy");
+		if (!config.videoOnlyIntermediate) args.push("-movflags", "+faststart");
+	}
+	args.push(config.outputPath);
+	return args;
 }
 
 export function getEditedAudioExtension(mimeType?: string | null): string {

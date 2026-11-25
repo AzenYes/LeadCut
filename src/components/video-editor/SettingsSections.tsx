@@ -29,7 +29,7 @@ export function SettingsSections({
 	return (
 		<SettingsCategoryContext.Provider value={active}>
 			<div className="space-y-6">
-				<ChoiceGroup
+				{categories.length > 1 && <ChoiceGroup
 					aria-label={t("general.sections", "Settings sections")}
 					value={active}
 					onValueChange={(value) => setSelected(value as Category)}
@@ -40,7 +40,7 @@ export function SettingsSections({
 							{categoryLabel(category)}
 						</ChoiceItem>
 					))}
-				</ChoiceGroup>
+				</ChoiceGroup>}
 				<div role="region" aria-label={t("general.categorySettings", "{{category}} settings", { category: categoryLabel(active) })} className="space-y-6">
 					{children}
 				</div>

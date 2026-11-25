@@ -166,6 +166,15 @@ static std::wstring utf8ToWide(const std::string& str) {
     return wstr;
 }
 
+static std::string wideToUtf8(const wchar_t* value) {
+    const int length = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (length <= 0) return "";
+    std::string utf8(length, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value, -1, utf8.data(), length, nullptr, nullptr);
+    utf8.pop_back();
+    return utf8;
+}
+
 static int64_t queryPerformanceCounterHns() {
     LARGE_INTEGER counter;
     LARGE_INTEGER frequency;
@@ -226,7 +235,7 @@ static void writeCompanionAudioTimingMetadata(
         startDelayMs = 0;
     }
 
-    std::ofstream metadataFile(audioPath + ".json", std::ios::trunc);
+    std::ofstream metadataFile(utf8ToWide(audioPath + ".json").c_str(), std::ios::trunc);
     if (!metadataFile) {
         std::cerr << "WARNING: Failed to write audio timing metadata for " << audioPath << std::endl;
         return;
@@ -284,7 +293,7 @@ static void stdinListenerThread() {
     g_stopCv.notify_all();
 }
 
-int main(int argc, char* argv[]) {
+int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         std::cerr << "ERROR: Missing JSON config argument" << std::endl;
         return 1;
@@ -297,7 +306,7 @@ int main(int argc, char* argv[]) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
     CaptureConfig config;
-    if (!parseSimpleJson(argv[1], config)) {
+    if (!parseSimpleJson(wideToUtf8(argv[1]), config)) {
         std::cerr << "ERROR: Failed to parse config JSON" << std::endl;
         return 1;
     }
@@ -353,6 +362,7 @@ int main(int argc, char* argv[]) {
     std::atomic<int64_t> firstVideoTimestampHns{-1};
     std::atomic<bool> recordingStartedAnnounced{false};
     std::atomic<bool> captureSetupComplete{false};
+    std::atomic<bool> frameWriteFailed{false};
     session.setFrameCallback([&](ID3D11Texture2D* texture, int64_t timestampHns) {
         g_lastFrameTimestampHns = timestampHns;
         int64_t expectedFirstVideoTimestampHns = -1;
@@ -369,6 +379,10 @@ int main(int argc, char* argv[]) {
                 std::cout << "Recording started" << std::endl;
                 std::cout.flush();
             }
+        } else if (!frameWriteFailed.exchange(true)) {
+            std::cerr << "ERROR: Failed to write a video frame" << std::endl;
+            g_stopRequested = true;
+            g_stopCv.notify_all();
         }
     });
 
@@ -441,14 +455,24 @@ int main(int argc, char* argv[]) {
     }
 
     // Wait for stop signal while pausing/resuming audio tracks in lockstep.
+    bool systemAudioLost = false;
+    bool micAudioLost = false;
     while (!g_stopRequested && !session.hasFatalError()) {
         session.pollDesktopDuplicationFrame();
         if (g_pauseRequested) {
-            if (audioActive) loopback.pause();
-            if (micActive) micCapture.pause();
+            if (audioActive && !systemAudioLost) loopback.pause();
+            if (micActive && !micAudioLost) micCapture.pause();
         } else {
-            if (audioActive) loopback.resume();
-            if (micActive) micCapture.resume();
+            if (audioActive && !systemAudioLost) loopback.resume();
+            if (micActive && !micAudioLost) micCapture.resume();
+        }
+        if (audioActive && !systemAudioLost && loopback.hasFailed()) {
+            systemAudioLost = true;
+            std::cout << "EVENT audio-lost system" << std::endl;
+        }
+        if (micActive && !micAudioLost && micCapture.hasFailed()) {
+            micAudioLost = true;
+            std::cout << "EVENT audio-lost mic" << std::endl;
         }
 
         if (!session.usesDesktopDuplication()) {
@@ -459,11 +483,17 @@ int main(int argc, char* argv[]) {
 
     // Stop capture and finalize
     const int64_t adjustedStopTimestampHns = adjustedVideoTimestampHns(queryPerformanceCounterHns());
+    if (session.sourceClosed()) std::cout << "EVENT source-closed" << std::endl;
     session.stopCapture();
-    if (audioActive) loopback.stop();
-    if (micActive) micCapture.stop();
+    const auto audioDurationAtStop = [&](const WasapiCapture& capture) -> uint64_t {
+        if (!capture.hasFailed() || firstVideoTimestampHns < 0) return 0;
+        const int64_t start = (std::max)(firstVideoTimestampHns.load(), capture.firstPacketQpcHns());
+        return adjustedStopTimestampHns > start ? (adjustedStopTimestampHns - start) / 10000 : 0;
+    };
+    if (audioActive) loopback.stop(audioDurationAtStop(loopback));
+    if (micActive) micCapture.stop(audioDurationAtStop(micCapture));
 
-    const bool captureFailed = session.hasFatalError();
+    const bool captureFailed = frameWriteFailed || session.hasFatalError();
     if (captureFailed) {
         std::cerr << "ERROR: Native capture session failed during recording" << std::endl;
     }

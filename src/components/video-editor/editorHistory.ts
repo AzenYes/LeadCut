@@ -15,6 +15,7 @@ export type EditorHistorySnapshot = {
 	appearance?: AppearanceHistorySnapshot;
 	aspectRatio?: AspectRatio;
 	autoCaptionSettings?: import("./types").AutoCaptionSettings;
+	transcript?: import("./transcript").ProjectTranscript | null;
 	sourceAudioTrackSettingsByClip?: Record<string, import("./types").SourceAudioTrackSettings>;
 	defaultSourceAudioTrackSettings?: import("./types").SourceAudioTrackSettings;
 	chapterProgress?: import("./chapterProgress").ChapterProgress;
@@ -123,7 +124,7 @@ export function getLatestMarkerEdit(stack: EditorHistoryStack) {
 export function carryMarkerUndoAcrossReload(stack: EditorHistoryStack, edit: { before: TimelineMarker[]; after: TimelineMarker[] }) {
 	const current = stack.current;
 	if (!current || !areDeepEqual(current.markers, edit.after)) return;
-	stack.past.push(cloneEditorHistorySnapshot({ ...current, markers: edit.before }));
+	stack.past.push({ ...current, markers: edit.before });
 }
 
 export function recordEditorHistorySnapshot(
@@ -135,30 +136,29 @@ export function recordEditorHistorySnapshot(
 		coalesce?: boolean;
 	} = {},
 ): EditorHistoryRecordResult {
-	const clonedSnapshot = cloneEditorHistorySnapshot(snapshot);
-
+	// Snapshot fields come from immutable React state. Each edit replaces the affected fields.
 	if (!stack.current) {
-		stack.current = clonedSnapshot;
+		stack.current = snapshot;
 		return "initialized";
 	}
 
 	if (options.applyingHistory) {
-		stack.current = clonedSnapshot;
+		stack.current = snapshot;
 		return "applied";
 	}
 
 	if (areEditorHistorySnapshotsEqual(withoutSelection(stack.current), withoutSelection(snapshot))) {
-		stack.current = clonedSnapshot;
+		stack.current = snapshot;
 		return "unchanged";
 	}
 
-	if (!options.coalesce) stack.past.push(cloneEditorHistorySnapshot(stack.current));
+	if (!options.coalesce) stack.past.push(stack.current);
 	const maxEntries = options.maxEntries ?? MAX_EDITOR_HISTORY_ENTRIES;
 	if (stack.past.length > maxEntries) {
 		stack.past.shift();
 	}
 
-	stack.current = clonedSnapshot;
+	stack.current = snapshot;
 	stack.future = [];
 	return "recorded";
 }
@@ -171,14 +171,14 @@ export function undoEditorHistoryStack(
 		return null;
 	}
 
-	const current = stack.current ?? cloneEditorHistorySnapshot(fallbackCurrent);
+	const current = stack.current ?? fallbackCurrent;
 	const previous = stack.past.pop();
 	if (!previous) {
 		return null;
 	}
 
-	stack.future.push(cloneEditorHistorySnapshot(current));
-	stack.current = cloneEditorHistorySnapshot(previous);
+	stack.future.push(current);
+	stack.current = previous;
 	return cloneEditorHistorySnapshot(previous);
 }
 
@@ -190,13 +190,13 @@ export function redoEditorHistoryStack(
 		return null;
 	}
 
-	const current = stack.current ?? cloneEditorHistorySnapshot(fallbackCurrent);
+	const current = stack.current ?? fallbackCurrent;
 	const next = stack.future.pop();
 	if (!next) {
 		return null;
 	}
 
-	stack.past.push(cloneEditorHistorySnapshot(current));
-	stack.current = cloneEditorHistorySnapshot(next);
+	stack.past.push(current);
+	stack.current = next;
 	return cloneEditorHistorySnapshot(next);
 }

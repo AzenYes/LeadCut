@@ -105,6 +105,12 @@ test("video moves between tracks preserving camera identity and imports reuse an
 test("source audio lanes identify system and microphone separately", async ({ page }) => {
  await page.route("**/waveform.system.wav", route => route.fulfill({ path: "tests/ui/fixtures/waveform.mp4", contentType: "audio/mp4" }));
  await page.route("**/waveform.mic.wav", route => route.fulfill({ path: "tests/ui/fixtures/waveform.mp4", contentType: "audio/mp4" }));
+ await installDesktopBridgeOverrides(page, () => {
+  const base = `${location.origin}/tests/ui/fixtures/waveform`;
+  window.electronAPI.getVideoAudioFallbackPaths = async () => ({
+   success: true, paths: [`${base}.mp4`, `${base}.mic.wav`], sidecarPaths: [`${base}.system.wav`, `${base}.mic.wav`],
+  });
+ });
  await prepare(page);
  await expect(page.locator('[data-timeline-row="row-source-audio-system"]').getByText("Source System", { exact: true })).toBeVisible();
  await expect(page.locator('[data-timeline-row="row-source-audio-mic"]').getByText("Source Mic", { exact: true })).toBeVisible();

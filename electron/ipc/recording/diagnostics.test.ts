@@ -101,7 +101,7 @@ describe("getCompanionAudioFallbackPaths", () => {
 		]);
 	});
 
-	it("keeps the embedded source audio and adds the mic companion when both are present", async () => {
+	it("keeps embedded source playback and makes both companion waveforms available", async () => {
 		const videoPath = path.join(tempRoot, "recording.mp4");
 		const systemPath = path.join(tempRoot, "recording.system.wav");
 		const micPath = path.join(tempRoot, "recording.mic.wav");
@@ -110,6 +110,7 @@ describe("getCompanionAudioFallbackPaths", () => {
 			fs.writeFile(videoPath, "video"),
 			fs.writeFile(systemPath, "system"),
 			fs.writeFile(micPath, "mic"),
+			fs.writeFile(`${systemPath}.json`, JSON.stringify({ startDelayMs: 120 })),
 		]);
 
 		execFileMock.mockImplementation(
@@ -127,12 +128,13 @@ describe("getCompanionAudioFallbackPaths", () => {
 			},
 		);
 
-		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
+		const { getCompanionAudioFallbackInfo } = await import("./diagnostics");
 
-		await expect(getCompanionAudioFallbackPaths(videoPath)).resolves.toEqual([
-			videoPath,
-			micPath,
-		]);
+		await expect(getCompanionAudioFallbackInfo(videoPath)).resolves.toEqual({
+			paths: [videoPath, micPath],
+			sidecarPaths: [systemPath, micPath],
+			startDelayMsByPath: { [systemPath]: 120 },
+		});
 	});
 
 	it("returns both mac sidecars instead of the video when a system sidecar exists", async () => {
@@ -224,6 +226,7 @@ describe("getCompanionAudioFallbackPaths", () => {
 
 		await expect(getCompanionAudioFallbackInfo(videoPath)).resolves.toEqual({
 			paths: [micPath],
+			sidecarPaths: [micPath],
 			startDelayMsByPath: {
 				[micPath]: 2750,
 			},

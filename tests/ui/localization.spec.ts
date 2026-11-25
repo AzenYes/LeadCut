@@ -53,20 +53,26 @@ test("Chinese dashboard supports searching, folder creation and selection withou
 
 test("language switching refreshes component labels and persists the chosen language", async ({ page }) => {
 	await prepare(page);
-	await page.getByRole("radio", { name: "设置", exact: true }).click();
+	await page.getByRole("button", { name: "应用设置", exact: true }).click();
 	await page.getByRole("button", { name: /简体中文/ }).click();
+	await expect(page.getByRole("option", { name: "繁體中文（部分翻譯）", exact: true })).toBeVisible();
 	await page.getByRole("option", { name: "English", exact: true }).click();
 	await expect(page.locator("html")).toHaveAttribute("lang", "en");
 	await page.reload();
 	await expect(page.locator("html")).toHaveAttribute("lang", "en");
-	await page.getByRole("radio", { name: "Settings", exact: true }).click();
 	await expect(page.getByRole("button", { name: "Home", exact: true })).toBeVisible();
 	await page.getByRole("button", { name: "Home", exact: true }).click();
-	await expect(page.getByRole("dialog", { name: "Projects dashboard", exact: true })).toBeVisible();
-	await expect(page.getByRole("textbox", { name: "Search projects", exact: true })).toBeVisible();
-	await page.keyboard.press("Escape");
-	await expect(page.getByRole("dialog", { name: "Projects dashboard", exact: true })).toBeHidden();
-	await page.getByRole("button", { name: /English/ }).click();
+	const dashboard = page.getByRole("dialog", { name: "Projects dashboard", exact: true });
+	await dashboard.getByRole("button", { name: "Settings", exact: true }).click();
+	await dashboard.getByRole("button", { name: /English/ }).click();
+	await page.getByRole("option", { name: "Français (traduction partielle)", exact: true }).click();
+	await expect(page.locator("html")).toHaveAttribute("lang", "fr");
+	await expect(page.getByText("Langue", { exact: true }).first()).toBeVisible();
+	await page.reload();
+	await expect(page.locator("html")).toHaveAttribute("lang", "fr");
+	await page.getByRole("button", { name: "Application settings", exact: true }).click();
+	await expect(page.getByText("Langue", { exact: true }).first()).toBeVisible();
+	await page.getByRole("button", { name: /Français/ }).click();
 	await page.getByRole("option", { name: "简体中文", exact: true }).click();
 	await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
 	await page.reload();

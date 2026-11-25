@@ -17,7 +17,7 @@ Configure Codex with an absolute path:
 ```toml
 [mcp_servers.leadcut]
 command = "node"
-args = ["D:/办公程序/LeadCut/services/leadcut-mcp/dist/index.js"]
+args = ["C:/path/to/LeadCut/services/leadcut-mcp/dist/index.js"]
 ```
 
 Restart or reconnect the client after adding the server. For the development profile set `LEADCUT_USER_DATA_DIR` to `%APPDATA%/LeadCut-dev`. The server also accepts `RECORDLY_USER_DATA_DIR` when the new variable is unset, and defaults to `%APPDATA%/LeadCut`. The profile's `recordings-settings.json` can set a custom recordings directory. Set `FFMPEG_PATH` and `FFPROBE_PATH` to override the binaries. Local ASR also needs Python, faster-whisper and an existing model.
@@ -35,6 +35,9 @@ Version-2 projects with packed clipRegions are supported. Legacy speedRegions, u
 ## Tools
 
 - Projects and media use `get_paths`, `list_projects`, `open_project`, `copy_project`, `get_media_info` and `scan_frames`.
+- `open_project` returns a summary by default. Use `get_revision` for the latest revision, `get_capabilities` for the supported format, and `get_clips` or `get_captions` for paginated details. Pass `includeEditor: true` to read the complete editor state without the embedded thumbnail.
+- `update_captions` previews or applies a batch of caption changes in a single transaction.
+- `list_backups` lists retained Agent versions. Use `restore_backup` with a backup ID, a dry run and the current revision to restore one.
 - `detect_silence` uses a 0.5-second minimum and a −30 dB threshold. The more permissive defaults may report more candidates. Review them against speech and actions before cutting.
 - Sequence editing uses `cut_ranges`. `list_change_log` returns each cut with its current sequence position. `get_recording_markers` reads cut and highlight markers in source milliseconds.
 - Zooms use `list_zooms`, `add_zoom`, `update_zoom` and `delete_zooms`. `add_zoom` rejects overlap and ranges past the sequence duration.

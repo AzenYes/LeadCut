@@ -1,5 +1,5 @@
 import { Tooltip } from "@heroui/react";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type MouseEvent, type SetStateAction } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type Dispatch, type KeyboardEvent, type MouseEvent, type ReactNode, type SetStateAction } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ArrowCounterClockwise, ArrowsMerge, DotsThree, MagnifyingGlass, Play, Scissors, Trash } from "@/components/ui/icons";
@@ -7,6 +7,7 @@ import { toast } from "@/components/ui/toast";
 import { useI18n } from "@/contexts/I18nContext";
 import { useUiText } from "@/i18n/useUiText";
 import { loadAppSetting, saveAppSetting } from "@/lib/appSettings";
+import { CAPTION_PAUSE_ON_TYPING_STORAGE_KEY, CAPTION_SKIP_RIPPLE_CONFIRM_STORAGE_KEY } from "@/lib/storageKeys";
 import { editCaptionCueText, normalizeCaptionEditText } from "../captionEditing";
 import { captionTextOffsetAtTime, deleteCue, joinCaptionText, mergeProjectedCaptionCues, splitCueAtTextOffset, type CaptionRetimeSpan } from "../captionOps";
 import { retimeCaptionFragment } from "../captionTimeline";
@@ -14,7 +15,8 @@ import type { CaptionIssueKind } from "../captionQuality";
 import { getCaptionWordCutRange, mergeEditRanges, type EditRange } from "../sequenceEdits";
 import { formatTimelineTimecode, parseTimelineTimecode } from "../timeline/core/time";
 import type { AutoCaptionSettings, CaptionCue, ClipRegion } from "../types";
-import { captionRowOffsets, captionWindowRange, formatCaptionTime, groupCaptionRows, type CaptionFragment, type CaptionTranscriptRow } from "./captionListModel";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
+import { captionRowOffsets, captionWindowRange, findActiveRowIndex, formatCaptionTime, groupCaptionRows, type CaptionFragment, type CaptionTranscriptRow } from "./captionListModel";
 import { captionTextMatcher, findCaptionTextMatches, replaceInCaptions, type CaptionTextMatch } from "./captionSearch";
 import { CaptionQualityControls, CaptionQualityRuleSettings } from "./CaptionQualityControls";
 import { CaptionRippleDeleteDialog } from "./CaptionRippleDeleteDialog";
@@ -34,13 +36,14 @@ export type CaptionPanelMemory = {
 };
 type PendingCut = { ranges: EditRange[]; count: number; words: boolean };
 type Props = {
+	emptyActions?: ReactNode;
 	rows: CaptionFragment[];
 	appearance: AutoCaptionSettings;
 	durationMs: number;
 	cues: CaptionCue[];
 	clips: ClipRegion[];
 	getPlayheadTime: () => number;
-	activeIndex: number;
+	playbackClock: PlaybackClock;
 	isPlaying: boolean;
 	selectedCueId: string | null;
 	onSelect: (id: string | null, timelineTimeMs?: number, options?: { seek?: boolean }) => void;
@@ -58,8 +61,6 @@ type Props = {
 const timeClass = "text-left font-mono text-[11px] tabular-nums text-muted-foreground";
 const inputClass = "min-w-0 w-full rounded border border-accent bg-background px-1 py-1 text-xs text-foreground";
 const rowKey = (index: number) => `caption-overview-row-${index}`;
-const SKIP_RIPPLE_CONFIRM_KEY = "leadcut.captions.skipRippleDeleteConfirm";
-const PAUSE_ON_TYPING_KEY = "leadcut.captions.pauseOnTyping";
 
 function textOffsetAtClick(event: MouseEvent<HTMLButtonElement>) {
 	const element = event.currentTarget;
@@ -303,8 +304,8 @@ const CaptionOverviewRow = memo(function CaptionOverviewRow({
 });
 
 export const CaptionOverviewPanel = memo(function CaptionOverviewPanel({
-	rows: fragments, appearance, durationMs, cues, clips, getPlayheadTime, activeIndex, isPlaying, selectedCueId, onSelect, onTextEdit, onRetime,
-	onPlayFrom, onPlayRange, onTogglePlay, onPause, setCues, onRippleDelete, memory,
+	rows: fragments, appearance, durationMs, cues, clips, getPlayheadTime, playbackClock, isPlaying, selectedCueId, onSelect, onTextEdit, onRetime,
+	onPlayFrom, onPlayRange, onTogglePlay, onPause, setCues, onRippleDelete, memory, emptyActions,
 }: Props) {
 	const { t } = useI18n();
 	const uiText = useUiText();
@@ -317,12 +318,12 @@ export const CaptionOverviewPanel = memo(function CaptionOverviewPanel({
 	const measuredWidth = useRef(0);
 	const [measurements, setMeasurements] = useState(0);
 	const [following, setFollowing] = useState(memory.following);
-	const [pauseOnTyping, setPauseOnTyping] = useState(() => loadAppSetting(PAUSE_ON_TYPING_KEY) !== false);
+	const [pauseOnTyping, setPauseOnTyping] = useState(() => loadAppSetting(CAPTION_PAUSE_ON_TYPING_STORAGE_KEY) !== false);
 	const playingRef = useRef(isPlaying);
 	playingRef.current = isPlaying;
 	const [onlyIssues, setOnlyIssues] = useState(memory.onlyIssues);
 	const [issueSnapshot, setIssueSnapshot] = useState<ReadonlySet<string>>(() => memory.issueSnapshot ?? new Set());
-	const [skipRippleConfirm, setSkipRippleConfirm] = useState(() => loadAppSetting(SKIP_RIPPLE_CONFIRM_KEY) === true);
+	const [skipRippleConfirm, setSkipRippleConfirm] = useState(() => loadAppSetting(CAPTION_SKIP_RIPPLE_CONFIRM_STORAGE_KEY) === true);
 	const [pendingCut, setPendingCut] = useState<PendingCut | null>(null);
 	const { issues, rules, updateRules } = useCaptionQuality(allRows, appearance);
 	const rows = useMemo(() => onlyIssues ? allRows.filter(row => issues.has(row.id) || issueSnapshot.has(row.id)) : allRows,
@@ -355,6 +356,8 @@ export const CaptionOverviewPanel = memo(function CaptionOverviewPanel({
 	const [replacementCount, setReplacementCount] = useState<number | null>(null);
 	const [pendingReplacementCount, setPendingReplacementCount] = useState(0);
 	const indices = useMemo(() => new Map(rows.map((row, index) => [row.id, index])), [rows]);
+	const activeIndex = useSyncExternalStore(playbackClock.subscribe,
+		() => findActiveRowIndex(fragments, playbackClock.getTime() * 1000));
 	const activeFragment = fragments[activeIndex];
 	const visibleActiveIndex = activeFragment ? indices.get(activeFragment.sourceCueId) ?? -1 : -1;
 	const issueIndices = useMemo(() => rows.flatMap((row, index) => issues.has(row.id) ? [index] : []), [issues, rows]);
@@ -770,7 +773,7 @@ export const CaptionOverviewPanel = memo(function CaptionOverviewPanel({
 							<input type="checkbox" checked={pauseOnTyping} onChange={event => {
 								const value = event.currentTarget.checked;
 								setPauseOnTyping(value);
-								saveAppSetting(PAUSE_ON_TYPING_KEY, value);
+								saveAppSetting(CAPTION_PAUSE_ON_TYPING_STORAGE_KEY, value);
 							}} />
 							{text("PauseOnTyping")}
 						</label>
@@ -816,9 +819,13 @@ export const CaptionOverviewPanel = memo(function CaptionOverviewPanel({
 			</div>
 			{replacementCount !== null && <p role="status" className="text-xs text-muted-foreground">{text("Replaced", replacementCount)}</p>}
 			{hasEditableWords && <p className="text-xs text-muted-foreground">{uiText("captionRippleDeleteWordHint")}</p>}
+			{allRows.length === 0 && emptyActions && (
+				<div className="flex flex-wrap items-center gap-2">{emptyActions}</div>
+			)}
 			<div
 				ref={grid}
 				role="grid"
+				data-caption-transcript-grid
 				tabIndex={0}
 				aria-label={text("Title")}
 				aria-rowcount={rows.length}
@@ -868,7 +875,7 @@ export const CaptionOverviewPanel = memo(function CaptionOverviewPanel({
 					onCancel={() => setPendingCut(null)}
 					onConfirm={skip => {
 						if (skip) {
-							saveAppSetting(SKIP_RIPPLE_CONFIRM_KEY, true);
+							saveAppSetting(CAPTION_SKIP_RIPPLE_CONFIRM_STORAGE_KEY, true);
 							setSkipRippleConfirm(true);
 						}
 						applyCut(pendingCut);

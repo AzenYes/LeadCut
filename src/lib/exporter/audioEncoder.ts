@@ -252,6 +252,7 @@ export class AudioProcessor extends AudioTranscodeProcessor {
 		sourceAudioTrackSettings?: SourceAudioTrackSettings,
 		clipRegions?: ClipRegion[],
 		sourceAudioTrackSettingsByClip?: Record<string, SourceAudioTrackSettings>,
+		writeWavChunk?: (data: ArrayBuffer) => Promise<void>,
 	): Promise<Blob> {
 		const sortedTrims = trimRegions
 			? [...trimRegions].sort((a, b) => a.startMs - b.startMs)
@@ -270,18 +271,22 @@ export class AudioProcessor extends AudioTranscodeProcessor {
 				)
 			: [];
 
-		const prepared = await this.prepareOfflineRender(
-			videoUrl,
-			sortedTrims,
-			sortedSpeedRegions,
-			sortedAudioRegions,
-			sortedSourceAudioFallbackPaths,
-			sourceAudioFallbackStartDelayMsByPath,
-			sourceAudioTrackSettings,
-			clipRegions,
-			sourceAudioTrackSettingsByClip,
-		);
-		return this.renderToWavBlobChunked(prepared);
+		try {
+			const prepared = await this.prepareOfflineRender(
+				videoUrl,
+				sortedTrims,
+				sortedSpeedRegions,
+				sortedAudioRegions,
+				sortedSourceAudioFallbackPaths,
+				sourceAudioFallbackStartDelayMsByPath,
+				sourceAudioTrackSettings,
+				clipRegions,
+				sourceAudioTrackSettingsByClip,
+			);
+			return await this.renderToWavBlobChunked(prepared, writeWavChunk);
+		} finally {
+			await this.releaseOfflineAudioSources();
+		}
 	}
 
 	// Legacy trim-only path used when no speed regions are configured.

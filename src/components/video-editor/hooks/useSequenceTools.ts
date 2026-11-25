@@ -1,5 +1,4 @@
-import { isEditorShortcutBlocked, isShortcutEditingTarget } from "../editorShortcutScope";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { splitVideoRegion } from "../videoTracks";
 import { projectCaptionCues } from "../captionTimeline";
 import { mergeEditRanges, planRippleDelete, splitTimelineCaptions, timelineRangesToSourceRanges, type EditRange } from "../sequenceEdits";
@@ -8,15 +7,24 @@ import type { useTimelineState } from "../state/useTimelineState";
 import type { useClipRegionCommands } from "./useClipRegionCommands";
 import type { useVideoTrackCommands } from "./useVideoTrackCommands";
 
-export function useSequenceTools({ timeline, clipCommands, currentTime }: {
+export function useSequenceTools({ timeline, clipCommands, getCurrentTime }: {
 	timeline: ReturnType<typeof useTimelineState>;
 	clipCommands: ReturnType<typeof useClipRegionCommands>;
 	videoCommands: ReturnType<typeof useVideoTrackCommands>;
-	currentTime: number;
+	getCurrentTime: () => number;
 }) {
 	const [forwardSelectionActive, setForwardSelectionActive] = useState(false);
 	const singleSelection = timeline.selectedVideoId ?? timeline.selectedClipId ?? timeline.selectedAudioId ?? timeline.selectedAnnotationId ?? timeline.selectedZoomId ?? timeline.selectedCaptionId;
-	const selected = timeline.selectedRegionIds.length ? timeline.selectedRegionIds : singleSelection ? [singleSelection] : [];
+	const {
+		selectedRegionIds, autoCaptions, clipRegions, videoRegions, videoTracks, audioRegions,
+		annotationRegions, zoomRegions, setSelectedRegionIds, setAutoCaptions, setVideoRegions,
+		setAudioRegions, setAnnotationRegions, setZoomRegions,
+	} = timeline;
+	const { handleClipSplit } = clipCommands;
+	const selected = useMemo(
+		() => selectedRegionIds.length ? selectedRegionIds : singleSelection ? [singleSelection] : [],
+		[selectedRegionIds, singleSelection],
+	);
 	const clearSelection = useCallback(() => {
 		timeline.setSelectedClipId(null); timeline.setSelectedVideoId(null); timeline.setSelectedAudioId(null); timeline.setSelectedAnnotationId(null); timeline.setSelectedZoomId(null); timeline.setSelectedCaptionId(null); timeline.setSelectedRegionIds([]);
 	}, [timeline.setSelectedClipId, timeline.setSelectedVideoId, timeline.setSelectedAudioId, timeline.setSelectedAnnotationId, timeline.setSelectedZoomId, timeline.setSelectedCaptionId, timeline.setSelectedRegionIds]);
@@ -26,29 +34,38 @@ export function useSequenceTools({ timeline, clipCommands, currentTime }: {
 	}, [timeline.selectedClipId, timeline.selectedAudioId, timeline.selectedAnnotationId, timeline.selectedZoomId, timeline.selectedCaptionId, timeline.setSelectedVideoId, timeline.setSelectedRegionIds]);
 	const selectRegions = useCallback((ids: string[]) => {
 		clearSelection();
-		const captions = projectCaptionCues(timeline.autoCaptions, timeline.clipRegions);
-		const locked = new Set(timeline.videoRegions.filter((region) => timeline.videoTracks.find((track) => track.id === region.trackId)?.locked).map((region) => region.id));
-		timeline.setSelectedRegionIds([...new Set(ids.filter((id) => !locked.has(id)).map((id) => captions.find((cue) => cue.id === id)?.sourceCueId ?? id))]);
-	}, [timeline, clearSelection]);
+		const captions = projectCaptionCues(autoCaptions, clipRegions);
+		const locked = new Set(videoRegions
+			.filter(region => videoTracks.find(track => track.id === region.trackId)?.locked)
+			.map(region => region.id));
+		const sourceIds = ids.filter(id => !locked.has(id))
+			.map(id => captions.find(cue => cue.id === id)?.sourceCueId ?? id);
+		setSelectedRegionIds([...new Set(sourceIds)]);
+	}, [clearSelection, autoCaptions, clipRegions, videoRegions, videoTracks, setSelectedRegionIds]);
 	const selectForward = useCallback((atMs: number) => {
-		const regions = [...timeline.clipRegions, ...timeline.videoRegions.filter((region) => !timeline.videoTracks.find((track) => track.id === region.trackId)?.locked), ...timeline.audioRegions, ...timeline.annotationRegions, ...timeline.zoomRegions];
+		const unlockedVideos = videoRegions.filter(region => !videoTracks.find(track => track.id === region.trackId)?.locked);
+		const regions = [...clipRegions, ...unlockedVideos, ...audioRegions, ...annotationRegions, ...zoomRegions];
 		clearSelection();
-		const captions = projectCaptionCues(timeline.autoCaptions, timeline.clipRegions).filter((region) => region.endMs > atMs);
-		timeline.setSelectedRegionIds([...regions.filter((region) => region.endMs > atMs).map((region) => region.id), ...captions.flatMap((cue) => [cue.id, cue.sourceCueId])]);
+		const captions = projectCaptionCues(autoCaptions, clipRegions).filter((region) => region.endMs > atMs);
+		setSelectedRegionIds([
+			...regions.filter(region => region.endMs > atMs).map(region => region.id),
+			...captions.flatMap(cue => [cue.id, cue.sourceCueId]),
+		]);
 		setForwardSelectionActive(false);
-	}, [timeline, clearSelection]);
+	}, [clipRegions, videoRegions, videoTracks, audioRegions, annotationRegions, zoomRegions, clearSelection, autoCaptions, setSelectedRegionIds]);
 	const split = useCallback(() => {
-		const atMs = Math.round(currentTime * 1000);
+		const atMs = Math.round(getCurrentTime() * 1000);
 		const ids = new Set(selected);
-		const cutsPrimary = timeline.clipRegions.some((region) => (!ids.size || ids.has(region.id)) && region.startMs < atMs && region.endMs > atMs);
+		const cutsPrimary = clipRegions.some((region) => (!ids.size || ids.has(region.id)) && region.startMs < atMs && region.endMs > atMs);
 		const includes = (id: string) => cutsPrimary || ids.size === 0 || ids.has(id);
-		timeline.setAutoCaptions((current) => splitTimelineCaptions(current, timeline.clipRegions, atMs, cutsPrimary ? undefined : ids));
-		if (timeline.clipRegions.some((region) => includes(region.id) && region.startMs < atMs && region.endMs > atMs)) clipCommands.handleClipSplit(atMs);
-		timeline.setVideoRegions((current) => current.flatMap((region) => !includes(region.id) || timeline.videoTracks.find((track) => track.id === region.trackId)?.locked ? [region] : splitVideoRegion(region, atMs, () => `video-${crypto.randomUUID()}`)));
-		timeline.setAudioRegions((current) => current.flatMap((region) => !includes(region.id) || atMs <= region.startMs || atMs >= region.endMs ? [region] : [{ ...region, endMs: atMs }, { ...region, id: `audio-${crypto.randomUUID()}`, startMs: atMs, sourceStartMs: (region.sourceStartMs ?? 0) + (atMs - region.startMs) * (region.speed ?? 1) }]));
-		timeline.setAnnotationRegions((current) => current.flatMap((region) => !includes(region.id) || atMs <= region.startMs || atMs >= region.endMs ? [region] : [{ ...region, endMs: atMs }, { ...region, id: `annotation-${crypto.randomUUID()}`, startMs: atMs }]));
-		timeline.setZoomRegions((current) => current.flatMap((region) => !includes(region.id) || atMs <= region.startMs || atMs >= region.endMs ? [region] : [{ ...region, endMs: atMs }, { ...region, id: `zoom-${crypto.randomUUID()}`, startMs: atMs }]));
-	}, [currentTime, timeline, selected, clipCommands]);
+		setAutoCaptions((current) => splitTimelineCaptions(current, clipRegions, atMs, cutsPrimary ? undefined : ids));
+		if (clipRegions.some((region) => includes(region.id) && region.startMs < atMs && region.endMs > atMs)) handleClipSplit(atMs);
+		setVideoRegions((current) => current.flatMap((region) => !includes(region.id) || videoTracks.find((track) => track.id === region.trackId)?.locked ? [region] : splitVideoRegion(region, atMs, () => `video-${crypto.randomUUID()}`)));
+		setAudioRegions((current) => current.flatMap((region) => !includes(region.id) || atMs <= region.startMs || atMs >= region.endMs ? [region] : [{ ...region, endMs: atMs }, { ...region, id: `audio-${crypto.randomUUID()}`, startMs: atMs, sourceStartMs: (region.sourceStartMs ?? 0) + (atMs - region.startMs) * (region.speed ?? 1) }]));
+		setAnnotationRegions((current) => current.flatMap((region) => !includes(region.id) || atMs <= region.startMs || atMs >= region.endMs ? [region] : [{ ...region, endMs: atMs }, { ...region, id: `annotation-${crypto.randomUUID()}`, startMs: atMs }]));
+		setZoomRegions((current) => current.flatMap((region) => !includes(region.id) || atMs <= region.startMs || atMs >= region.endMs ? [region] : [{ ...region, endMs: atMs }, { ...region, id: `zoom-${crypto.randomUUID()}`, startMs: atMs }]));
+	}, [getCurrentTime, selected, clipRegions, setAutoCaptions, handleClipSplit, videoTracks, setVideoRegions,
+		setAudioRegions, setAnnotationRegions, setZoomRegions]);
 	const rippleDeleteRanges = useCallback((selection: EditRange[], reason?: string) => {
 		const ranges = mergeEditRanges(selection);
 		if (!ranges.length) return false;
@@ -123,22 +140,10 @@ export function useSequenceTools({ timeline, clipCommands, currentTime }: {
 		deleteSelection();
 		return true;
 	}, [timeline.selectedVideoId, timeline.selectedRegionIds.length, singleSelection, deleteSelection]);
-	useEffect(() => {
-		const keydown = (event: KeyboardEvent) => {
-			if (isEditorShortcutBlocked(event.target) || isShortcutEditingTarget(event.target) ||
-				event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-			const key = event.key.toLowerCase();
-			if ((key === "delete" || key === "backspace") && deleteGroupedSelection()) {
-				event.preventDefault();
-				event.stopImmediatePropagation();
-			}
-			if (key === "escape") {
-				setForwardSelectionActive(false);
-				timeline.setSelectedRegionIds([]);
-			}
-		};
-		window.addEventListener("keydown", keydown, { capture: true });
-		return () => window.removeEventListener("keydown", keydown, { capture: true });
-	}, [deleteGroupedSelection, timeline.setSelectedRegionIds]);
-	return { split, rippleDelete, rippleDeleteRanges, deleteGroupedSelection, selectRegions, selectForward, forwardSelectionActive, setForwardSelectionActive, hasSelection: selected.length > 0 };
+	const clearForwardSelection = () => {
+		setForwardSelectionActive(false);
+		timeline.setSelectedRegionIds([]);
+	};
+	return { split, rippleDelete, rippleDeleteRanges, deleteGroupedSelection, selectRegions, selectForward,
+		forwardSelectionActive, setForwardSelectionActive, clearForwardSelection, hasSelection: selected.length > 0 };
 }

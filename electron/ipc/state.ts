@@ -120,9 +120,15 @@ export function setCurrentProjectRevision(revision: string | null) {
 
 export function setCurrentProjectPath(v: string | null, revision: string | null = null) {
 	const changed = currentProjectPath !== v;
+	if (changed) projectHandedToAgent = null;
 	currentProjectPath = v;
 	setCurrentProjectRevision(v ? revision : null);
 	if (changed) for (const listener of projectPathListeners) listener(v);
+}
+
+export let projectHandedToAgent: string | null = null;
+export function setProjectHandedToAgent(path: string | null) {
+	projectHandedToAgent = path;
 }
 
 export function onCurrentProjectPathChanged(listener: (file: string | null) => void) {

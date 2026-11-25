@@ -266,7 +266,15 @@
     "record": "Record your screen, or open a video or an existing project.",
     "edit": "Trim clips, adjust zoom and backgrounds, and generate or import subtitles.",
     "save": "Save your editable project and export MP4 or GIF files to your computer.",
-    "start": "Get started"
+    "start": "Get started",
+    "stepCount": "{{current}} of {{total}}",
+    "splitHint": "Move the playhead to the cut, then split the clip into two parts.",
+    "zoomHint": "Add a zoom at the playhead to draw attention to part of the recording.",
+    "captionsHint": "Open Captions to generate subtitles from the audio or import an SRT file.",
+    "exportHint": "Choose MP4 or GIF, then choose where to save the video.",
+    "previous": "Back",
+    "next": "Next",
+    "skip": "Skip guide"
   },
   "media": {
     "addingVideo": "Adicionando vídeo…",

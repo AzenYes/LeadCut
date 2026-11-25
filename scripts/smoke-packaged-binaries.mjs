@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { listPackage, statFile } from "@electron/asar";
 
 const projectRoot = process.cwd();
-const releaseRoot = path.join(projectRoot, "release");
+const releaseRoot = path.resolve(process.argv[2] ?? "release");
 const packageJson = JSON.parse(readFileSync(path.join(projectRoot, "package.json"), "utf8"));
 const productName = packageJson.productName ?? packageJson.name ?? "LeadCut";
 const packageName = packageJson.name ?? "leadcut";
@@ -14,6 +15,22 @@ function relativePath(filePath) {
 
 function fail(message) {
 	throw new Error(`[packaged-smoke] ${message}`);
+}
+
+function verifyApplicationArchive(unpackedRoot) {
+	if (process.platform !== "win32") return;
+	const archive = path.join(path.dirname(unpackedRoot), "app.asar");
+	const maxBytes = 24 * 1024 * 1024;
+	const size = statSync(archive).size;
+	const largestFiles = listPackage(archive).map(filename => {
+		const name = filename.replace(/^[/\\]/, "");
+		return { name, entry: statFile(archive, name, false) };
+	}).filter(({ entry }) => !entry.unpacked && typeof entry.size === "number")
+		.sort((left, right) => right.entry.size - left.entry.size)
+		.slice(0, 20);
+	console.log(`[packaged-smoke] app.asar: ${size} bytes (budget ${maxBytes})`);
+	for (const { name, entry } of largestFiles) console.log(`  ${entry.size}\t${name}`);
+	if (size > maxBytes) fail("app.asar exceeded its Windows size budget");
 }
 
 function assertFile(filePath, label, { executable = false } = {}) {
@@ -214,23 +231,46 @@ function getExpectedNativeHelperFiles(archTag) {
 	return [];
 }
 
-function verifyFfmpeg(unpackedRoot) {
-	const binaryName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
-	const ffmpegPath = path.join(unpackedRoot, "node_modules", "ffmpeg-static", binaryName);
-
-	assertFile(ffmpegPath, "packaged FFmpeg binary", { executable: true });
-
-	const output = execFileSync(ffmpegPath, ["-version"], {
-		encoding: "utf8",
-		timeout: 15000,
-		windowsHide: true,
-	});
-
-	if (!output.startsWith("ffmpeg version")) {
-		fail(`FFmpeg version smoke returned unexpected output from ${relativePath(ffmpegPath)}`);
+function verifyMediaBinaries(unpackedRoot) {
+	const extension = process.platform === "win32" ? ".exe" : "";
+	const mediaTools = path.join(path.dirname(unpackedRoot), "media-tools");
+	const sharedRuntime = process.platform === "win32" && existsSync(mediaTools);
+	const binaries = sharedRuntime ? [
+		["ffmpeg", path.join(mediaTools, "ffmpeg.exe")],
+		["ffprobe", path.join(mediaTools, "ffprobe.exe")],
+	] : [
+		["ffmpeg", path.join(unpackedRoot, "node_modules", "ffmpeg-static", `ffmpeg${extension}`)],
+		["ffprobe", path.join(unpackedRoot, "node_modules", "ffprobe-static", "bin", process.platform, process.arch, `ffprobe${extension}`)],
+	];
+	for (const [name, executable] of binaries) {
+		assertFile(executable, `packaged ${name} binary`, { executable: true });
+		const output = execFileSync(executable, ["-version"], {
+			encoding: "utf8",
+			timeout: 15000,
+			windowsHide: true,
+		});
+		if (!output.startsWith(`${name} version`)) {
+			fail(`${name} version smoke returned unexpected output from ${relativePath(executable)}`);
+		}
+		console.log(output.split(/\r?\n/, 1)[0]);
 	}
-
-	console.log(output.split(/\r?\n/, 1)[0]);
+	if (sharedRuntime) {
+		const executable = path.join(mediaTools, "ffmpeg.exe");
+		const required = {
+			encoders: ["libx264", "h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "aac", "gif", "png"],
+			decoders: ["libdav1d", "h264", "hevc", "vp9", "opus", "png"],
+			filters: ["scale_cuda", "overlay_cuda", "hwupload_cuda", "amix", "palettegen", "paletteuse"],
+		};
+		for (const [flag, names] of Object.entries(required)) {
+			const output = execFileSync(executable, ["-hide_banner", `-${flag}`], {
+				encoding: "utf8", timeout: 15000, windowsHide: true,
+			});
+			const options = new Set(output.split(/\r?\n/).map(line => line.trim().split(/\s+/, 3)[1]));
+			for (const name of names) {
+				if (!options.has(name)) fail(`packaged FFmpeg -${flag} is missing ${name}`);
+			}
+		}
+	}
 }
 
 function verifyNativeHelpers(unpackedRoot) {
@@ -251,13 +291,17 @@ function verifyNativeHelpers(unpackedRoot) {
 		}
 
 		for (const expectedFile of expectedFiles) {
+			const executable = path.join(archDir, expectedFile.name);
 			assertFile(
-				path.join(archDir, expectedFile.name),
+				executable,
 				`${expectedFile.label} (${archTag})`,
 				{
 					executable: expectedFile.executable,
 				},
 			);
+			if (archTag === `${process.platform}-${process.arch}` && /^whisper-cli(?:\.exe)?$/.test(expectedFile.name)) {
+				execFileSync(executable, ["--help"], { timeout: 15000, windowsHide: true, stdio: "pipe" });
+			}
 		}
 		if (archTag === "win32-x64") {
 			assertFile(
@@ -287,7 +331,8 @@ console.log(
 for (const unpackedRoot of unpackedRoots) {
 	console.log(`[packaged-smoke] root: ${relativePath(unpackedRoot)}`);
 	assertPackagedAppExecutable(unpackedRoot);
-	verifyFfmpeg(unpackedRoot);
+	verifyApplicationArchive(unpackedRoot);
+	verifyMediaBinaries(unpackedRoot);
 	verifyNativeHelpers(unpackedRoot);
 }
 

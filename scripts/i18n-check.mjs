@@ -26,27 +26,20 @@ function loadJson(filePath) {
 	}
 }
 
-function collectKeyPaths(obj, prefix = "") {
+function collectLeaves(obj, prefix = "", leaves = new Map()) {
 	if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
-		return prefix ? [prefix] : [];
+		if (prefix) leaves.set(prefix, obj);
+		return leaves;
 	}
 
-	const keys = Object.keys(obj);
-	if (keys.length === 0) {
-		return prefix ? [prefix] : [];
-	}
+	const entries = Object.entries(obj);
+	if (!entries.length && prefix) leaves.set(prefix, obj);
 
-	const paths = [];
-	for (const key of keys) {
+	for (const [key, value] of entries) {
 		const nextPrefix = prefix ? `${prefix}.${key}` : key;
-		const value = obj[key];
-		if (value && typeof value === "object" && !Array.isArray(value)) {
-			paths.push(...collectKeyPaths(value, nextPrefix));
-		} else {
-			paths.push(nextPrefix);
-		}
+		collectLeaves(value, nextPrefix, leaves);
 	}
-	return paths;
+	return leaves;
 }
 
 const baseLocaleDir = path.join(localesDir, "en");
@@ -56,14 +49,14 @@ const namespaceFiles = fs
 	.sort((left, right) => left.localeCompare(right));
 
 let hasErrors = false;
+const coverage = new Map(locales.filter(locale => locale !== "en")
+	.map(locale => [locale, { englishPhrases: 0, identical: 0 }]));
 
 for (const namespaceFile of namespaceFiles) {
 	const baseData = loadJson(path.join(baseLocaleDir, namespaceFile));
-	const baseKeys = new Set(collectKeyPaths(baseData));
+	const baseKeys = collectLeaves(baseData);
 
-	for (const locale of locales) {
-		if (locale === "en") continue;
-
+	for (const [locale, stats] of coverage) {
 		const localeFile = path.join(localesDir, locale, namespaceFile);
 		if (!fs.existsSync(localeFile)) {
 			console.error(`i18n-check: missing namespace file ${locale}/${namespaceFile}`);
@@ -72,22 +65,37 @@ for (const namespaceFile of namespaceFiles) {
 		}
 
 		const localeData = loadJson(localeFile);
-		const localeKeys = new Set(collectKeyPaths(localeData));
+		const localeKeys = collectLeaves(localeData);
 
-		for (const key of baseKeys) {
+		for (const [key, baseValue] of baseKeys) {
 			if (!localeKeys.has(key)) {
 				console.error(`i18n-check: missing key ${locale}/${namespaceFile}:${key}`);
 				hasErrors = true;
 			}
+			if (typeof baseValue === "string" && /[A-Za-z]{3}/.test(baseValue)) {
+				stats.englishPhrases++;
+				if (localeKeys.get(key) === baseValue) stats.identical++;
+			}
 		}
 
-		for (const key of localeKeys) {
+		for (const key of localeKeys.keys()) {
 			if (!baseKeys.has(key)) {
 				console.error(`i18n-check: extra key ${locale}/${namespaceFile}:${key}`);
 				hasErrors = true;
 			}
 		}
 	}
+}
+
+for (const [locale, { englishPhrases, identical }] of coverage) {
+	// Leave room for shared product names and terminology in supported translations.
+	const limit = locale === "zh-CN" ? 5 : locale === "zh-TW" ? 50 : 70;
+	const percent = englishPhrases ? (100 * identical) / englishPhrases : 0;
+	const message = `i18n-check: ${locale} ${percent.toFixed(1)}% identical to English (limit ${limit}%)`;
+	if (percent > limit) {
+		console.error(message);
+		hasErrors = true;
+	} else console.log(message);
 }
 
 if (hasErrors) {

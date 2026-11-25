@@ -7,6 +7,7 @@ import {
 	CaretUpIcon,
 	House,
 	DotsThreeVerticalIcon,
+	FolderOpenIcon,
 	MicrophoneIcon,
 	MicrophoneSlashIcon,
 	MinusIcon,
@@ -22,6 +23,7 @@ import { Tooltip } from "@heroui/react";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
 import { Separator } from "@/components/ui/separator";
+import { BackgroundTaskStatus } from "@/components/ui/BackgroundTaskStatus";
 import { useScopedT } from "../../contexts/I18nContext";
 import { useScreenRecorder } from "../../hooks/useScreenRecorder";
 import { toast } from "../ui/toast";
@@ -67,11 +69,14 @@ function LaunchWindowContent() {
 
 	const {
 		recording,
+		starting,
+		recoveringCapture,
 		paused,
 		initialElapsedMs,
 		markerCount,
 		webcamInterrupted,
 		finalizing,
+		finalization,
 		countdownActive,
 		toggleRecording,
 		pauseRecording,
@@ -487,17 +492,48 @@ function LaunchWindowContent() {
 		</>
 	);
 
+	const savedPath = finalization && "savedPath" in finalization ? finalization.savedPath : undefined;
+	const finalizationTitles = {
+		stopping: t("recording.stoppingCapture", "Stopping capture"),
+		saving: t("recording.savingCapture", "Saving recording"),
+		preparing: t("recording.preparing", "Preparing recording"),
+		opening: t("recording.openingEditor", "Opening the editor"),
+		discarding: t("recording.discardingCapture", "Discarding recording"),
+	};
+	const savedMessage = savedPath ? t("recording.savedAt", "Recording saved at {{path}}", { path: savedPath }) : "";
 	const finalizingControls = (
-		<div className={styles.finalizingState}>
-			<ArrowClockwiseIcon size={15} className={styles.finalizingSpin} />
-			<div className={styles.finalizingCopy}>
-				<span>{t("recording.preparing", "Preparing recording")}</span>
-				<small>{t("recording.preparingSubtitle", "Opening the editor in a moment")}</small>
-			</div>
-		</div>
+		<BackgroundTaskStatus className={styles.finalizingState} copyClassName={styles.finalizingCopy}
+			title={recoveringCapture && finalization?.stage !== "opening"
+				? t("recording.recoveringCapture", "Recovering recording")
+				: finalizationTitles[finalization?.stage ?? "stopping"]}
+			detailAfterElapsed={savedPath ? {
+				seconds: 20,
+				content: (
+					<button type="button" className={styles.savedRecording} title={savedMessage}
+						aria-label={`${t("recording.revealSavedRecording", "Show recording in folder")} — ${savedPath}`}
+						onClick={() => void window.electronAPI.revealInFolder(savedPath)}>
+						<FolderOpenIcon size={13} />
+						<span className="truncate">{savedMessage}</span>
+					</button>
+				),
+			} : undefined}
+			icon={<ArrowClockwiseIcon size={15} className={styles.finalizingSpin} />}
+			showElapsed
+		/>
 	);
 
-	const hudMode = finalizing ? "finalizing" : recording ? "recording" : "idle";
+	const startingControls = (
+		<BackgroundTaskStatus className={styles.finalizingState}
+			title={t("recording.startingCapture", "Starting capture")}
+			icon={<ArrowClockwiseIcon size={15} className={styles.finalizingSpin} />}
+			action={<HudButton variant="ghost" size="icon" tooltip={t("recording.cancel")} onClick={cancelRecording}>
+				<XIcon className="size-4" />
+			</HudButton>}
+		/>
+	);
+	const hudMode = finalizing || recoveringCapture ? "finalizing"
+		: recording ? "recording"
+		: starting && !countdownActive ? "starting" : "idle";
 	let diskNotice: string | undefined;
 	let diskWarning = false;
 	if (diskAlert?.level === "stop") {
@@ -586,9 +622,11 @@ function LaunchWindowContent() {
 											}}
 											transition={hudStateTransition}
 										>
-											{finalizing
+											{hudMode === "finalizing"
 												? finalizingControls
-												: recording
+												: hudMode === "starting"
+													? startingControls
+													: hudMode === "recording"
 													? recordingControls
 													: idleControls}
 										</motion.div>

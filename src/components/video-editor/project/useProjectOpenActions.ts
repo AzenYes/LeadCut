@@ -28,14 +28,14 @@ type UseProjectOpenActionsInput = {
 	pendingFreshRecordingAutoZoomPathRef: MutableRefObject<string | null>;
 	hasUnsavedChanges: boolean;
 	setIsPlaying: Set<boolean>;
-	setCurrentTime: Set<number>;
+	setCurrentTime: (seconds: number) => void;
 	setDuration: Set<number>;
 	applyLoadedProject: (candidate: unknown, path?: string | null, revision?: string) => Promise<boolean>;
 	offerRelink: (result: ProjectLoadResult, onApplied?: () => void) => boolean;
 	openUnsavedChangesDialog: (actionLabel: string) => Promise<"save" | "discard" | "cancel">;
 	saveProject: ReturnType<typeof useProjectSaveActions>["saveProject"];
 	withSavesSuspended: ReturnType<typeof useProjectSaveActions>["withSavesSuspended"];
-	isPreviewReadOnly: ReturnType<typeof useProjectSaveActions>["isPreviewReadOnly"];
+	isVersionPreview: ReturnType<typeof useProjectSaveActions>["isVersionPreview"];
 	refreshProjectLibrary: () => Promise<void>;
 	resetSourceScopedEditorState: () => void;
 	applySessionPresentation: (session: null) => void;
@@ -55,7 +55,7 @@ export function useProjectOpenActions({
 	applyLoadedProject,
 	offerRelink,
 	withSavesSuspended,
-	isPreviewReadOnly,
+	isVersionPreview,
 	saveProject,
 	refreshProjectLibrary,
 	resetSourceScopedEditorState,
@@ -86,11 +86,11 @@ export function useProjectOpenActions({
 	}, [videoPlaybackRef, setIsPlaying, setCurrentTime, setDuration, project, pendingFreshRecordingAutoZoomPathRef, appearance.setWebcam, applySessionPresentation, resetSourceScopedEditorState]);
 	const confirmReplaceSourceWithUnsavedChanges = useCallback(
 		async (_actionLabel: string) => {
-			if (isPreviewReadOnly()) return false;
+			if (isVersionPreview()) return false;
 			if (!hasUnsavedChanges) return true;
-			return saveProject(false, { remountPreviewAfterSave: false });
+			return saveProject(false);
 		},
-		[hasUnsavedChanges, isPreviewReadOnly, saveProject],
+		[hasUnsavedChanges, isVersionPreview, saveProject],
 	);
 
 	const handleOpenProjectFromLibrary = useCallback(
@@ -113,7 +113,7 @@ export function useProjectOpenActions({
 				notifyProjectFormat(result, uiText);
 				releasedProjectPathRef.current = null;
 				project.setProjectBrowserOpen(false);
-				await refreshProjectLibrary();
+				void refreshProjectLibrary();
 				return true;
 			} catch (error) {
 				logError("project-open", error);
@@ -162,7 +162,7 @@ export function useProjectOpenActions({
 				notifyProjectFormat(result, uiText);
 				releasedProjectPathRef.current = null;
 				project.setProjectBrowserOpen(false);
-				await refreshProjectLibrary();
+				void refreshProjectLibrary();
 				toast.success(
 					result.path ? uiText("projectLoadedFromValue", { value0: result.path }) : uiText("projectLoaded"),
 				);
@@ -204,7 +204,7 @@ export function useProjectOpenActions({
 			applySessionPresentation(null);
 			releasedProjectPathRef.current = null;
 			project.setProjectBrowserOpen(false);
-			await refreshProjectLibrary();
+			void refreshProjectLibrary();
 			toast.success(uiText("mediaImported"));
 		} catch (error) {
 			logError("project-open", error);
@@ -239,7 +239,7 @@ export function useProjectOpenActions({
 	}, [handleOpenProjectFromLibrary, project.setProjectBrowserOpen]);
 
 	const handleOpenProjectBrowser = useCallback(async () => {
-		if (enteringLibraryRef.current || isPreviewReadOnly()) return;
+		if (enteringLibraryRef.current || isVersionPreview()) return;
 		if (project.projectBrowserOpen) {
 			handleProjectBrowserOpenChange(false);
 			return;
@@ -252,7 +252,6 @@ export function useProjectOpenActions({
 		try {
 			if (project.videoPath && hasUnsavedChanges) {
 				const saved = await saveProject(false, {
-					remountPreviewAfterSave: false,
 					refreshLibraryAfterSave: false,
 				});
 				if (!saved) {
@@ -288,7 +287,7 @@ export function useProjectOpenActions({
 		setIsPlaying,
 		saveProject,
 		hasUnsavedChanges,
-		isPreviewReadOnly,
+		isVersionPreview,
 		withSavesSuspended,
 		clearActiveProject,
 		uiText,
@@ -313,7 +312,7 @@ export function useProjectOpenActions({
 			notifyProjectFormat(result, uiText);
 			releasedProjectPathRef.current = null;
 			project.setProjectBrowserOpen(false);
-			await refreshProjectLibrary();
+			void refreshProjectLibrary();
 		} catch (error) {
 			logError("project-open", error);
 			toast.error(uiText("couldNotOpenProjectValue", { value0: error instanceof Error ? error.message : String(error) }));

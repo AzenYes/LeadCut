@@ -2,12 +2,14 @@
 #include <windows.h>
 #include <codecapi.h>
 #include <d3d11.h>
+#include <d3d10.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <wrl/client.h>
+#include <wrl/implements.h>
 #include <wincodec.h>
 
 #include <algorithm>
@@ -40,6 +42,33 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+class EncoderSurfaceRelease final : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IMFAsyncCallback> {
+public:
+    EncoderSurfaceRelease() : available_(CreateEventW(nullptr, FALSE, TRUE, nullptr)) {}
+
+    ~EncoderSurfaceRelease() override {
+        if (available_) {
+            CloseHandle(available_);
+        }
+    }
+
+    HANDLE available() const {
+        return available_;
+    }
+
+    STDMETHODIMP GetParameters(DWORD*, DWORD*) override {
+        return E_NOTIMPL;
+    }
+
+    STDMETHODIMP Invoke(IMFAsyncResult*) override {
+        return SetEvent(available_) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    }
+
+private:
+    HANDLE available_;
+};
 
 struct Options {
     std::wstring inputPath;
@@ -84,7 +113,9 @@ struct Options {
     int adapterIndex = -1;
     bool fastEncoderTuning = false;
     UINT surfacePoolSize = 4;
+    UINT initialSurfacePoolSize = 4;
     bool nvencSdk = false;
+    bool measureGpuStages = false;
 };
 
 struct ShaderConstants {
@@ -180,6 +211,186 @@ struct Timer {
         const auto now = std::chrono::steady_clock::now();
         return std::chrono::duration<double, std::milli>(now - start).count();
     }
+};
+
+class SinkWriterOutputTiming {
+public:
+    explicit SinkWriterOutputTiming(UINT expectedFrames)
+        : stride_(std::max<UINT>(30, (expectedFrames - 1) / 120 + 1)) {}
+
+    void submit(LONGLONG timestamp) {
+        submissions_[submittedFrames_ % submissions_.size()] = {timestamp, clock_.elapsedMs()};
+        ++submittedFrames_;
+    }
+
+    void observe(IMFSinkWriter* writer, DWORD streamIndex) {
+        MF_SINK_WRITER_STATISTICS statistics{};
+        statistics.cb = sizeof(statistics);
+        const Timer queryTimer;
+        const HRESULT status = writer->GetStatistics(streamIndex, &statistics);
+        queryMs_ += queryTimer.elapsedMs();
+        ++queries_;
+        if (FAILED(status)) return;
+        ++successfulQueries_;
+        processedFrames_ = std::max(processedFrames_, statistics.qwNumSamplesProcessed);
+        processedBytes_ = std::max(processedBytes_, statistics.qwByteCountProcessed);
+        if (statistics.qwNumSamplesEncoded <= encodedFrames_) return;
+
+        const double observedMs = clock_.elapsedMs();
+        if (encodedFrames_ == 0) firstOutputObservedMs_ = observedMs;
+        encodedFrames_ = statistics.qwNumSamplesEncoded;
+        lastOutputObservedMs_ = observedMs;
+        if (encodedFrames_ < nextSampleAt_) return;
+
+        // The counter may advance by several frames between observations. Only
+        // sample the exact timestamp the writer reports, without inferring the others.
+        const auto matched = std::find_if(submissions_.begin(), submissions_.end(), [&](const auto& submission) {
+            return submission.timestamp == statistics.llLastTimestampEncoded;
+        });
+        if (matched == submissions_.end()) return;
+        latencies_.push_back(observedMs - matched->submittedMs);
+        matched->timestamp = -1;
+        nextSampleAt_ = encodedFrames_ + stride_;
+    }
+
+    void beforeFinalize(IMFSinkWriter* writer, DWORD streamIndex) {
+        observe(writer, streamIndex);
+        encodedFramesBeforeFinalize_ = encodedFrames_;
+    }
+
+    void writeSummary(std::ostream& output) {
+        output << "\"mediaFoundationOutputTiming\":{"
+               << "\"queries\":" << queries_ << ","
+               << "\"successfulQueries\":" << successfulQueries_ << ","
+               << "\"queryMs\":" << queryMs_ << ","
+               << "\"submittedFrames\":" << submittedFrames_ << ","
+               << "\"encodedFramesBeforeFinalize\":" << encodedFramesBeforeFinalize_ << ","
+               << "\"encodedFrames\":" << encodedFrames_ << ","
+               << "\"processedFrames\":" << processedFrames_ << ","
+               << "\"processedBytes\":" << processedBytes_;
+        if (encodedFrames_ > 0) {
+            output << ",\"firstOutputObservedMs\":" << firstOutputObservedMs_
+                   << ",\"lastOutputObservedMs\":" << lastOutputObservedMs_;
+        }
+        if (!latencies_.empty()) {
+            std::sort(latencies_.begin(), latencies_.end());
+            const auto percentile = [&](double fraction) {
+                return latencies_[static_cast<size_t>(std::ceil(latencies_.size() * fraction)) - 1];
+            };
+            output << ",\"observedOutputLatencyMs\":{"
+                   << "\"sampleCount\":" << latencies_.size() << ","
+                   << "\"p50\":" << percentile(0.5) << ","
+                   << "\"p95\":" << percentile(0.95) << "}";
+        }
+        output << "},";
+    }
+
+private:
+    struct Submission {
+        LONGLONG timestamp = -1;
+        double submittedMs = 0;
+    };
+    const Timer clock_;
+    const UINT stride_;
+    std::array<Submission, 64> submissions_{};
+    std::vector<double> latencies_;
+    QWORD nextSampleAt_ = 1;
+    QWORD submittedFrames_ = 0;
+    QWORD encodedFramesBeforeFinalize_ = 0;
+    QWORD encodedFrames_ = 0;
+    QWORD processedFrames_ = 0;
+    QWORD processedBytes_ = 0;
+    UINT queries_ = 0;
+    UINT successfulQueries_ = 0;
+    double queryMs_ = 0;
+    double firstOutputObservedMs_ = 0;
+    double lastOutputObservedMs_ = 0;
+};
+
+class GpuStageTiming {
+public:
+    using Timestamps = std::array<ComPtr<ID3D11Query>, 4>;
+
+    GpuStageTiming(ID3D11Device* device, ID3D11DeviceContext* context, UINT outputFrames, bool enabled)
+        : device_(device), context_(context),
+          stride_(std::max<UINT>(30, (outputFrames - 1) / 120 + 1)), enabled_(enabled) {
+        if (!enabled_) return;
+        const D3D11_QUERY_DESC query{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+        if (SUCCEEDED(device_->CreateQuery(&query, &disjoint_))) {
+            context_->Begin(disjoint_.Get());
+        }
+    }
+
+    Timestamps* beginFrame(UINT frameIndex) {
+        if (!disjoint_ || frameIndex % stride_ != 0) return nullptr;
+        const D3D11_QUERY_DESC query{D3D11_QUERY_TIMESTAMP, 0};
+        Timestamps timestamps;
+        for (auto& timestamp : timestamps) {
+            if (FAILED(device_->CreateQuery(&query, &timestamp))) return nullptr;
+        }
+        frames_.push_back(std::move(timestamps));
+        return &frames_.back();
+    }
+
+    void mark(Timestamps* timestamps, size_t stage) {
+        if (timestamps) context_->End((*timestamps)[stage].Get());
+    }
+
+    void end() {
+        if (!disjoint_) return;
+        context_->End(disjoint_.Get());
+        context_->Flush();
+    }
+
+    void writeSummary(std::ostream& output) const {
+        if (!enabled_) return;
+        const Timer readbackTimer;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
+        HRESULT status = S_FALSE;
+        if (disjoint_) {
+            do {
+                status = context_->GetData(disjoint_.Get(), &clock, sizeof(clock), 0);
+                if (status == S_FALSE) Sleep(1);
+            } while (status == S_FALSE && readbackTimer.elapsedMs() < 100.0);
+        }
+        double renderMs = 0;
+        double copyConvertMs = 0;
+        size_t samples = 0;
+        if (status == S_OK && !clock.Disjoint && clock.Frequency > 0) {
+            const double tickMs = 1000.0 / static_cast<double>(clock.Frequency);
+            for (const auto& frame : frames_) {
+                std::array<UINT64, 4> timestamps{};
+                bool available = true;
+                for (size_t stage = 0; stage < timestamps.size(); ++stage) {
+                    if (context_->GetData(frame[stage].Get(), &timestamps[stage], sizeof(UINT64),
+                            D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+                        available = false;
+                        break;
+                    }
+                }
+                if (!available || !std::is_sorted(timestamps.begin(), timestamps.end())) continue;
+                renderMs += static_cast<double>(timestamps[2] - timestamps[1]) * tickMs;
+                copyConvertMs += static_cast<double>(
+                    (timestamps[1] - timestamps[0]) + (timestamps[3] - timestamps[2])) * tickMs;
+                ++samples;
+            }
+        }
+        output << "\"gpuStageTiming\":{"
+               << "\"sampleCount\":" << samples << ","
+               << "\"submittedSamples\":" << frames_.size() << ","
+               << "\"sampleStride\":" << stride_ << ","
+               << "\"renderMs\":" << renderMs << ","
+               << "\"copyConvertMs\":" << copyConvertMs << ","
+               << "\"readbackMs\":" << readbackTimer.elapsedMs() << "},";
+    }
+
+private:
+    ID3D11Device* device_;
+    ID3D11DeviceContext* context_;
+    const UINT stride_;
+    const bool enabled_;
+    ComPtr<ID3D11Query> disjoint_;
+    std::vector<Timestamps> frames_;
 };
 
 std::wstring getArgValue(const std::vector<std::wstring>& args, const std::wstring& key) {
@@ -448,12 +659,16 @@ Options parseOptions(int argc, wchar_t** argv) {
     options.adapterIndex = static_cast<int>(parseLongArg(args, L"--adapter-index", options.adapterIndex));
     options.fastEncoderTuning = hasArg(args, L"--fast-encoder-tuning");
     options.nvencSdk = hasArg(args, L"--nvenc-sdk");
+    options.measureGpuStages = hasArg(args, L"--measure-gpu-stages");
     options.surfacePoolSize = parseUIntArg(args, L"--surface-pool-size", options.surfacePoolSize);
     options.width = std::max<UINT>(2, options.width & ~1U);
     options.height = std::max<UINT>(2, options.height & ~1U);
     options.fps = std::max<UINT>(1, options.fps);
     options.seconds = std::max(0.001, options.seconds);
     options.surfacePoolSize = std::min<UINT>(32, std::max<UINT>(4, options.surfacePoolSize));
+    options.initialSurfacePoolSize = std::clamp<UINT>(
+        parseUIntArg(args, L"--initial-surface-pool-size", options.surfacePoolSize),
+        1, options.surfacePoolSize);
     options.radius = std::max(0.0f, options.radius);
     options.shadow = std::max(0.0f, options.shadow);
     options.webcamSize = std::max<LONG>(0, options.webcamSize & ~1L);
@@ -594,18 +809,22 @@ public:
         double writeMs = 0;
 
         for (UINT frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
+            size_t surfaceIndex = 0;
+            if (!acquireEncoderSurface(frameIndex, surfaceIndex)) {
+                return false;
+            }
             const Timer clearTimer;
             renderSyntheticFrame(frameIndex);
             clearMs += clearTimer.elapsedMs();
 
             const Timer processTimer;
-            if (!convertBgraToNv12(frameIndex)) {
+            if (!convertBgraToNv12(frameIndex, surfaceIndex)) {
                 return false;
             }
             processMs += processTimer.elapsedMs();
 
             const Timer writeTimer;
-            if (!writeFrame(frameIndex)) {
+            if (!writeFrame(frameIndex, surfaceIndex)) {
                 return false;
             }
             writeMs += writeTimer.elapsedMs();
@@ -631,7 +850,8 @@ public:
             << "\"width\":" << options_.width << ","
             << "\"height\":" << options_.height << ","
             << "\"fps\":" << options_.fps << ","
-            << "\"surfacePoolSize\":" << options_.surfacePoolSize << ","
+            << "\"surfacePoolSize\":" << nv12Textures_.size() << ","
+            << "\"surfacePoolLimit\":" << options_.surfacePoolSize << ","
             << "\"adapterIndex\":" << selectedAdapterIndex_ << ","
             << "\"adapterVendorId\":" << selectedAdapterVendorId_ << ","
             << "\"adapterDeviceId\":" << selectedAdapterDeviceId_ << ","
@@ -655,6 +875,9 @@ public:
             << "\"clearMs\":" << clearMs << ","
             << "\"videoProcessMs\":" << processMs << ","
             << "\"writeSampleMs\":" << writeMs << ","
+            << "\"surfaceWaitMs\":" << surfaceWaitMs_ << ","
+            << "\"surfaceWaitMaxMs\":" << surfaceWaitMaxMs_ << ","
+            << "\"surfaceWaitOver1ms\":" << surfaceWaitOver1ms_ << ","
             << "\"finalizeMs\":" << finalizeMs << ","
             << "\"realtimeMultiplier\":" << realtime
             << "}" << std::endl;
@@ -847,6 +1070,12 @@ private:
         hr = deviceContext_.As(&videoContext_);
         if (!succeeded(hr, "Query ID3D11VideoContext")) {
             return false;
+        }
+
+        // Media Foundation can use the same immediate context from its decoder threads.
+        ComPtr<ID3D10Multithread> multithread;
+        if (SUCCEEDED(device_.As(&multithread))) {
+            multithread->SetMultithreadProtected(TRUE);
         }
 
         UINT resetToken = 0;
@@ -1125,6 +1354,21 @@ private:
             }
         }
 
+        const size_t surfaceCount = static_cast<size_t>(options_.surfacePoolSize);
+        nv12Textures_.reserve(surfaceCount);
+        nv12OutputViews_.reserve(surfaceCount);
+        bgraNv12OutputViews_.reserve(surfaceCount);
+        surfaceReleases_.reserve(surfaceCount);
+        availableSurfaces_.reserve(surfaceCount);
+
+        const size_t initialCount = options_.nvencSdk ? surfaceCount : options_.initialSurfacePoolSize;
+        for (size_t index = 0; index < initialCount; ++index) {
+            if (!addEncoderSurface()) return false;
+        }
+        return true;
+    }
+
+    bool addEncoderSurface() {
         D3D11_TEXTURE2D_DESC nv12Desc = {};
         nv12Desc.Width = options_.width;
         nv12Desc.Height = options_.height;
@@ -1140,43 +1384,45 @@ private:
         outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
         outputViewDesc.Texture2D.MipSlice = 0;
 
-        const size_t surfaceCount = static_cast<size_t>(options_.surfacePoolSize);
-        nv12Textures_.reserve(surfaceCount);
-        nv12OutputViews_.reserve(surfaceCount);
-        bgraNv12OutputViews_.reserve(surfaceCount);
-
-        for (size_t index = 0; index < surfaceCount; ++index) {
-            ComPtr<ID3D11Texture2D> texture;
-            hr = device_->CreateTexture2D(&nv12Desc, nullptr, &texture);
-            if (!succeeded(hr, "Create NV12 texture")) {
-                return false;
-            }
-
-            ComPtr<ID3D11VideoProcessorOutputView> outputView;
-            hr = videoDevice_->CreateVideoProcessorOutputView(
-                texture.Get(),
-                videoProcessorEnumerator_.Get(),
-                &outputViewDesc,
-                &outputView);
-            if (!succeeded(hr, "Create video processor output view")) {
-                return false;
-            }
-
-            ComPtr<ID3D11VideoProcessorOutputView> bgraOutputView;
-            hr = videoDevice_->CreateVideoProcessorOutputView(
-                texture.Get(),
-                bgraVideoProcessorEnumerator_.Get(),
-                &outputViewDesc,
-                &bgraOutputView);
-            if (!succeeded(hr, "Create BGRA video processor output view")) {
-                return false;
-            }
-
-            nv12Textures_.push_back(texture);
-            nv12OutputViews_.push_back(outputView);
-            bgraNv12OutputViews_.push_back(bgraOutputView);
+        ComPtr<ID3D11Texture2D> texture;
+        HRESULT hr = device_->CreateTexture2D(&nv12Desc, nullptr, &texture);
+        if (!succeeded(hr, "Create NV12 texture")) {
+            return false;
         }
 
+        ComPtr<ID3D11VideoProcessorOutputView> outputView;
+        hr = videoDevice_->CreateVideoProcessorOutputView(
+            texture.Get(),
+            videoProcessorEnumerator_.Get(),
+            &outputViewDesc,
+            &outputView);
+        if (!succeeded(hr, "Create video processor output view")) {
+            return false;
+        }
+
+        ComPtr<ID3D11VideoProcessorOutputView> bgraOutputView;
+        hr = videoDevice_->CreateVideoProcessorOutputView(
+            texture.Get(),
+            bgraVideoProcessorEnumerator_.Get(),
+            &outputViewDesc,
+            &bgraOutputView);
+        if (!succeeded(hr, "Create BGRA video processor output view")) {
+            return false;
+        }
+
+        nv12Textures_.push_back(texture);
+        nv12OutputViews_.push_back(outputView);
+        bgraNv12OutputViews_.push_back(bgraOutputView);
+
+        if (!options_.nvencSdk) {
+            auto release = Microsoft::WRL::Make<EncoderSurfaceRelease>();
+            if (!release || !release->available()) {
+                std::cerr << "ERROR: Could not create encoder surface release event" << std::endl;
+                return false;
+            }
+            availableSurfaces_.push_back(release->available());
+            surfaceReleases_.push_back(std::move(release));
+        }
         return true;
     }
 
@@ -2285,8 +2531,7 @@ float4 main(PSIn input) : SV_Target {
         deviceContext_->ClearRenderTargetView(bgraRenderTargetView_.Get(), color);
     }
 
-    bool convertBgraToNv12(UINT frameIndex) {
-        const size_t surfaceIndex = static_cast<size_t>(frameIndex) % nv12OutputViews_.size();
+    bool convertBgraToNv12(UINT frameIndex, size_t surfaceIndex) {
         D3D11_VIDEO_PROCESSOR_STREAM stream = {};
         stream.Enable = TRUE;
         stream.OutputIndex = 0;
@@ -2310,7 +2555,8 @@ float4 main(PSIn input) : SV_Target {
     bool convertSourceTextureToNv12(
         ID3D11Texture2D* texture,
         UINT subresourceIndex,
-        UINT frameIndex) {
+        UINT frameIndex,
+        size_t surfaceIndex) {
         ComPtr<ID3D11VideoProcessorInputView> inputView;
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc = {};
         inputViewDesc.FourCC = 0;
@@ -2327,7 +2573,6 @@ float4 main(PSIn input) : SV_Target {
             return false;
         }
 
-        const size_t surfaceIndex = static_cast<size_t>(frameIndex) % nv12OutputViews_.size();
         D3D11_VIDEO_PROCESSOR_STREAM stream = {};
         stream.Enable = TRUE;
         stream.OutputIndex = 0;
@@ -2905,14 +3150,13 @@ float4 main(PSIn input) : SV_Target {
         return true;
     }
 
-    bool writeNvencSdkFrame(UINT frameIndex) {
+    bool writeNvencSdkFrame(size_t surfaceIndex) {
 #ifdef RECORDLY_GPU_EXPORT_ENABLE_NVENC_SDK
         if (!nvencEncoder_) {
             std::cerr << "[gpu-export] NVENC SDK encoder is not initialized" << std::endl;
             return false;
         }
         try {
-            const size_t surfaceIndex = static_cast<size_t>(frameIndex) % nv12Textures_.size();
             const NvEncInputFrame* inputFrame = nvencEncoder_->GetNextInputFrame();
             auto* encoderTexture = reinterpret_cast<ID3D11Texture2D*>(inputFrame->inputPtr);
             deviceContext_->CopyResource(encoderTexture, nv12Textures_[surfaceIndex].Get());
@@ -2926,7 +3170,7 @@ float4 main(PSIn input) : SV_Target {
             return false;
         }
 #else
-        (void)frameIndex;
+        (void)surfaceIndex;
         return false;
 #endif
     }
@@ -2958,15 +3202,47 @@ float4 main(PSIn input) : SV_Target {
 #endif
     }
 
-    bool writeFrame(
-        UINT frameIndex,
-        LONGLONG sampleTimeOverride = -1,
-        LONGLONG sampleDurationOverride = -1) {
+    bool acquireEncoderSurface(UINT frameIndex, size_t& surfaceIndex) {
         if (options_.nvencSdk) {
-            return writeNvencSdkFrame(frameIndex);
+            surfaceIndex = static_cast<size_t>(frameIndex) % nv12Textures_.size();
+            return true;
         }
 
-        const size_t surfaceIndex = static_cast<size_t>(frameIndex) % nv12Textures_.size();
+        // The sink writer can still own previously submitted samples when WriteSample returns.
+        double waitMs = 0;
+        for (;;) {
+            const bool canGrow = availableSurfaces_.size() < options_.surfacePoolSize;
+            const Timer waitTimer;
+            const DWORD result = WaitForMultipleObjects(
+                static_cast<DWORD>(availableSurfaces_.size()), availableSurfaces_.data(),
+                FALSE, canGrow ? 25 : 5'000);
+            waitMs += waitTimer.elapsedMs();
+            if (result == WAIT_TIMEOUT && canGrow) {
+                if (!addEncoderSurface()) return false;
+                continue;
+            }
+            surfaceWaitMs_ += waitMs;
+            surfaceWaitMaxMs_ = std::max(surfaceWaitMaxMs_, waitMs);
+            if (waitMs > 1.0) ++surfaceWaitOver1ms_;
+            if (result >= WAIT_OBJECT_0 + availableSurfaces_.size()) {
+                std::cerr << "ERROR: No encoder surface became available, wait result " << result << std::endl;
+                return false;
+            }
+            surfaceIndex = result - WAIT_OBJECT_0;
+            return true;
+        }
+    }
+
+    bool writeFrame(
+        UINT frameIndex,
+        size_t surfaceIndex,
+        LONGLONG sampleTimeOverride = -1,
+        LONGLONG sampleDurationOverride = -1,
+        SinkWriterOutputTiming* outputTiming = nullptr) {
+        if (options_.nvencSdk) {
+            return writeNvencSdkFrame(surfaceIndex);
+        }
+
         ComPtr<IMFMediaBuffer> buffer;
         HRESULT hr = MFCreateDXGISurfaceBuffer(
             __uuidof(ID3D11Texture2D),
@@ -2983,9 +3259,14 @@ float4 main(PSIn input) : SV_Target {
             return false;
         }
 
+        ComPtr<IMFTrackedSample> trackedSample;
+        hr = MFCreateTrackedSample(&trackedSample);
+        if (!succeeded(hr, "MFCreateTrackedSample")) {
+            return false;
+        }
         ComPtr<IMFSample> sample;
-        hr = MFCreateSample(&sample);
-        if (!succeeded(hr, "MFCreateSample")) {
+        hr = trackedSample.As(&sample);
+        if (!succeeded(hr, "Query encoder sample")) {
             return false;
         }
         hr = sample->AddBuffer(buffer.Get());
@@ -3003,8 +3284,35 @@ float4 main(PSIn input) : SV_Target {
         sample->SetSampleTime(sampleTime);
         sample->SetSampleDuration(sampleDuration);
 
+        hr = trackedSample->SetAllocator(surfaceReleases_[surfaceIndex].Get(), nullptr);
+        if (!succeeded(hr, "IMFTrackedSample::SetAllocator")) {
+            return false;
+        }
+        if (outputTiming) outputTiming->submit(sampleTime);
         hr = sinkWriter_->WriteSample(streamIndex_, sample.Get());
         return succeeded(hr, "IMFSinkWriter::WriteSample");
+    }
+
+    bool processSourceFrame(ID3D11Texture2D* texture, UINT subresource, UINT frameIndex,
+        LONGLONG overlayTimestamp, size_t surfaceIndex, GpuStageTiming& timing) {
+        auto timestamps = timing.beginFrame(frameIndex);
+        timing.mark(timestamps, 0);
+        if (options_.shaderComposite) {
+            if (!convertSourceTextureToBgra(texture, subresource, frameIndex) ||
+                !readWebcamFrameForTimestamp(overlayTimestamp, frameIndex)) {
+                return false;
+            }
+            timing.mark(timestamps, 1);
+            if (!renderShaderComposite(overlayTimestamp)) return false;
+            timing.mark(timestamps, 2);
+            if (!convertBgraToNv12(frameIndex, surfaceIndex)) return false;
+        } else {
+            timing.mark(timestamps, 1);
+            timing.mark(timestamps, 2);
+            if (!convertSourceTextureToNv12(texture, subresource, frameIndex, surfaceIndex)) return false;
+        }
+        timing.mark(timestamps, 3);
+        return true;
     }
 
     bool runSourceVideo() {
@@ -3026,6 +3334,9 @@ float4 main(PSIn input) : SV_Target {
         const UINT expectedOutputFrames = std::max<UINT>(
             1,
             static_cast<UINT>(std::ceil(options_.seconds * static_cast<double>(options_.fps))));
+        GpuStageTiming gpuTiming(device_.Get(), deviceContext_.Get(), expectedOutputFrames, options_.measureGpuStages);
+        SinkWriterOutputTiming writerTiming(expectedOutputFrames);
+        auto* outputTiming = options_.measureGpuStages && !options_.nvencSdk ? &writerTiming : nullptr;
 
         while (frameIndex < maxFrames && frameIndex < expectedOutputFrames) {
             DWORD streamIndex = 0;
@@ -3128,6 +3439,10 @@ float4 main(PSIn input) : SV_Target {
                             : (frameIndex < expectedFramesForSample)
                     )
                 ) {
+                    size_t surfaceIndex = 0;
+                    if (!acquireEncoderSurface(frameIndex, surfaceIndex)) {
+                        return false;
+                    }
                     const LONGLONG overlayTimestamp = timelineSegments_.empty()
                         ? nextOutputTimestamp
                         : static_cast<LONGLONG>(std::llround(
@@ -3136,30 +3451,19 @@ float4 main(PSIn input) : SV_Target {
                                 static_cast<double>(nextOutputTimestamp) / 10'000.0) *
                             10'000.0));
                     const Timer processTimer;
-                    if (options_.shaderComposite) {
-                        if (!convertSourceTextureToBgra(uploadedSourceTexture, 0, frameIndex)) {
-                            return false;
-                        }
-                        if (!readWebcamFrameForTimestamp(overlayTimestamp, frameIndex)) {
-                            return false;
-                        }
-                        if (!renderShaderComposite(overlayTimestamp)) {
-                            return false;
-                        }
-                        if (!convertBgraToNv12(frameIndex)) {
-                            return false;
-                        }
-                    } else if (!convertSourceTextureToNv12(uploadedSourceTexture, 0, frameIndex)) {
+                    if (!processSourceFrame(uploadedSourceTexture, 0, frameIndex,
+                            overlayTimestamp, surfaceIndex, gpuTiming)) {
                         return false;
                     }
                     processMs += processTimer.elapsedMs();
 
                     const Timer writeTimer;
                     lastOutputTimestamp = nextOutputTimestamp;
-                    if (!writeFrame(frameIndex, nextOutputTimestamp, outputFrameDuration)) {
+                    if (!writeFrame(frameIndex, surfaceIndex, nextOutputTimestamp, outputFrameDuration, outputTiming)) {
                         return false;
                     }
                     writeMs += writeTimer.elapsedMs();
+                    if (outputTiming) outputTiming->observe(sinkWriter_.Get(), streamIndex_);
                     frameIndex++;
                     nextOutputTimestamp += outputFrameDuration;
                     emitProgress(std::min(frameIndex, expectedOutputFrames), expectedOutputFrames);
@@ -3187,6 +3491,10 @@ float4 main(PSIn input) : SV_Target {
                         : (frameIndex < expectedFramesForSample)
                 )
             ) {
+                size_t surfaceIndex = 0;
+                if (!acquireEncoderSurface(frameIndex, surfaceIndex)) {
+                    return false;
+                }
                 const LONGLONG overlayTimestamp = timelineSegments_.empty()
                     ? nextOutputTimestamp
                     : static_cast<LONGLONG>(std::llround(
@@ -3195,38 +3503,27 @@ float4 main(PSIn input) : SV_Target {
                             static_cast<double>(nextOutputTimestamp) / 10'000.0) *
                         10'000.0));
                 const Timer processTimer;
-                if (options_.shaderComposite) {
-                    if (!convertSourceTextureToBgra(sourceTexture.Get(), subresourceIndex, frameIndex)) {
-                        return false;
-                    }
-                    if (!readWebcamFrameForTimestamp(overlayTimestamp, frameIndex)) {
-                        return false;
-                    }
-                    if (!renderShaderComposite(overlayTimestamp)) {
-                        return false;
-                    }
-                    if (!convertBgraToNv12(frameIndex)) {
-                        return false;
-                    }
-                } else {
-                    if (!convertSourceTextureToNv12(sourceTexture.Get(), subresourceIndex, frameIndex)) {
-                        return false;
-                    }
+                if (!processSourceFrame(sourceTexture.Get(), subresourceIndex, frameIndex,
+                        overlayTimestamp, surfaceIndex, gpuTiming)) {
+                    return false;
                 }
                 processMs += processTimer.elapsedMs();
 
                 const Timer writeTimer;
                 lastOutputTimestamp = nextOutputTimestamp;
-                if (!writeFrame(frameIndex, nextOutputTimestamp, outputFrameDuration)) {
+                if (!writeFrame(frameIndex, surfaceIndex, nextOutputTimestamp, outputFrameDuration, outputTiming)) {
                     return false;
                 }
                 writeMs += writeTimer.elapsedMs();
+                if (outputTiming) outputTiming->observe(sinkWriter_.Get(), streamIndex_);
                 ++frameIndex;
                 emitProgress(std::min(frameIndex, expectedOutputFrames), expectedOutputFrames);
                 nextOutputTimestamp += outputFrameDuration;
             }
         }
         emitProgress(std::min(frameIndex, expectedOutputFrames), expectedOutputFrames, true);
+        gpuTiming.end();
+        if (outputTiming) outputTiming->beforeFinalize(sinkWriter_.Get(), streamIndex_);
 
         const Timer finalizeTimer;
         const bool finalized = options_.nvencSdk ? finalizeNvencSdk() : SUCCEEDED(sinkWriter_->Finalize());
@@ -3238,6 +3535,7 @@ float4 main(PSIn input) : SV_Target {
             return false;
         }
 
+        if (outputTiming) outputTiming->observe(sinkWriter_.Get(), streamIndex_);
         const double totalMs = totalTimer.elapsedMs();
         const double mediaMs =
             (static_cast<double>(lastOutputTimestamp) / 10'000.0) +
@@ -3260,7 +3558,8 @@ float4 main(PSIn input) : SV_Target {
             << "\"width\":" << options_.width << ","
             << "\"height\":" << options_.height << ","
             << "\"fps\":" << options_.fps << ","
-            << "\"surfacePoolSize\":" << options_.surfacePoolSize << ","
+            << "\"surfacePoolSize\":" << nv12Textures_.size() << ","
+            << "\"surfacePoolLimit\":" << options_.surfacePoolSize << ","
             << "\"adapterIndex\":" << selectedAdapterIndex_ << ","
             << "\"adapterVendorId\":" << selectedAdapterVendorId_ << ","
             << "\"adapterDeviceId\":" << selectedAdapterDeviceId_ << ","
@@ -3284,7 +3583,13 @@ float4 main(PSIn input) : SV_Target {
             << "\"readMs\":" << readMs << ","
             << "\"videoProcessMs\":" << processMs << ","
             << "\"writeSampleMs\":" << writeMs << ","
-            << "\"finalizeMs\":" << finalizeMs << ","
+            << "\"surfaceWaitMs\":" << surfaceWaitMs_ << ","
+            << "\"surfaceWaitMaxMs\":" << surfaceWaitMaxMs_ << ","
+            << "\"surfaceWaitOver1ms\":" << surfaceWaitOver1ms_ << ","
+            << "\"finalizeMs\":" << finalizeMs << ",";
+        gpuTiming.writeSummary(std::cout);
+        if (outputTiming) outputTiming->writeSummary(std::cout);
+        std::cout
             << "\"realtimeMultiplier\":" << realtime
             << "}" << std::endl;
         return true;
@@ -3294,6 +3599,9 @@ float4 main(PSIn input) : SV_Target {
     UINT sourceWidth_ = 1920;
     UINT sourceHeight_ = 1080;
     double initializeMs_ = 0.0;
+    double surfaceWaitMs_ = 0.0;
+    double surfaceWaitMaxMs_ = 0.0;
+    unsigned int surfaceWaitOver1ms_ = 0;
     double initCoInitializeMs_ = 0.0;
     double initMfStartupMs_ = 0.0;
     double initD3DDeviceMs_ = 0.0;
@@ -3362,6 +3670,8 @@ float4 main(PSIn input) : SV_Target {
     std::vector<BYTE> uploadPaddedScratch_;
     std::vector<TimelineSegment> timelineSegments_;
     std::vector<ComPtr<ID3D11Texture2D>> nv12Textures_;
+    std::vector<ComPtr<EncoderSurfaceRelease>> surfaceReleases_;
+    std::vector<HANDLE> availableSurfaces_;
     std::vector<ComPtr<ID3D11VideoProcessorOutputView>> nv12OutputViews_;
     std::vector<ComPtr<ID3D11VideoProcessorOutputView>> bgraNv12OutputViews_;
     ComPtr<IMFSinkWriter> sinkWriter_;

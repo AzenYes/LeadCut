@@ -1,14 +1,17 @@
 import type { Dispatch, MutableRefObject, RefObject, SetStateAction } from "react";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "@/components/ui/toast";
 import { uiText } from "@/i18n/uiText";
+import { requiresNewerProjectReader } from "../../../../services/leadcut-mcp/src/projectFormat";
 import type { useI18n } from "@/contexts/I18nContext";
 import type { AspectRatio } from "@/utils/aspectRatioUtils";
 import { useAutoCaptionController } from "../captions/useAutoCaptionController";
-import { loadEditorPreferences } from "../editorPreferences";
+import { normalizeChangeLog } from "../changeLog";
+import { loadEditorPreferences, saveEditorPreferences } from "../editorPreferences";
 import { useEditorHistory } from "../hooks/useEditorHistory";
-import { useEditorPreferencesPersistence } from "../presets/useEditorPreferencesPersistence";
 import { hasUnsavedProjectChanges } from "../projectDirtyState";
+import { deriveNextId, fromFileUrl, normalizeProjectEditor, validateProjectData } from "../projectPersistence";
+import { emptyChapterProgress } from "../chapterProgress";
 import { getDevOpenRecordingConfig, getSmokeExportConfig } from "../smokeExportConfig";
 import type { useAppearanceState } from "../state/useAppearanceState";
 import type { useProjectState } from "../state/useProjectState";
@@ -24,6 +27,7 @@ import { useProjectSaveActions } from "./useProjectSaveActions";
 import { useExternalProjectChange } from "./useExternalProjectChange";
 import { useProjectSnapshotModel } from "./useProjectSnapshotModel";
 import { useProjectVersionHistory } from "./useProjectVersionHistory";
+import { createAgentEditRestoreCheck, findAgentEditsThroughRevisions, mergeAgentReviewEdits, restoreAgentEdit, type AgentEdit } from "./agentEditReview";
 
 type Input = {
 	cropEditing?: boolean;
@@ -40,8 +44,7 @@ type Input = {
 	setVideoPath: Dispatch<SetStateAction<string | null>>;
 	videoSourcePath: string | null;
 	setVideoSourcePath: Dispatch<SetStateAction<string | null>>;
-	currentTime: number;
-	setCurrentTime: Dispatch<SetStateAction<number>>;
+	setCurrentTime: (seconds: number) => void;
 	setIsPlaying: Dispatch<SetStateAction<boolean>>;
 	setActiveEffectSection: Dispatch<SetStateAction<EditorEffectSection>>;
 	setDuration: Dispatch<SetStateAction<number>>;
@@ -82,10 +85,16 @@ type Input = {
 	captureProjectThumbnail: ReturnType<
 		typeof useProjectLibraryController
 	>["captureProjectThumbnail"];
-	remountPreview: () => void;
 };
 
+const NO_RECENT_AGENT_CUTS: ReadonlySet<string> = new Set();
+const NO_AGENT_EDITS: readonly AgentEdit[] = [];
+
 export function useEditorProjectController(input: Input) {
+	const { whisperExecutablePath, whisperModelPath } = input;
+	useEffect(() => {
+		void saveEditorPreferences({ whisperExecutablePath, whisperModelPath });
+	}, [whisperExecutablePath, whisperModelPath]);
 	useEffect(() => window.electronAPI?.onRendererRecovered?.(() => {
 		toast.warning(uiText("editorRecoveredAfterCrash"), { duration: 10000 });
 	}), []);
@@ -125,7 +134,6 @@ export function useEditorProjectController(input: Input) {
 		setCurrentTime: input.setCurrentTime,
 		setDuration: input.setDuration,
 		applySessionPresentation: input.applySessionPresentation,
-		refreshProjectLibrary: input.refreshProjectLibrary,
 		buildPersistedEditorState: snapshot.buildPersistedEditorState,
 		resetHistory: history.resetHistory,
 		refs: {
@@ -145,6 +153,7 @@ export function useEditorProjectController(input: Input) {
 	});
 	const hasUnsavedChanges = useMemo(
 		() =>
+			!requiresNewerProjectReader(input.project.lastSavedSnapshot ?? {}) &&
 			hasUnsavedProjectChanges(
 				lifecycle.currentProjectSnapshot,
 				input.project.lastSavedSnapshot,
@@ -196,7 +205,6 @@ export function useEditorProjectController(input: Input) {
 		resolveProjectSaveDialog: lifecycle.resolveProjectSaveDialog,
 		captureProjectThumbnail: input.captureProjectThumbnail,
 		refreshProjectLibrary: input.refreshProjectLibrary,
-		remountPreview: input.remountPreview,
 	});
 	const mediaRelink = useProjectMediaRelink({
 		project: input.project,
@@ -216,13 +224,7 @@ export function useEditorProjectController(input: Input) {
 		offerRelink: mediaRelink.offerRelink,
 		resetSourceScopedEditorState: lifecycle.resetSourceScopedEditorState,
 		applySessionPresentation: input.applySessionPresentation,
-	});
-	useEditorPreferencesPersistence({
-		appearance: input.appearance,
-		aspectRatio: input.aspectRatio,
-		whisperExecutablePath: input.whisperExecutablePath,
-		whisperModelPath: input.whisperModelPath,
-		suspended: saveActions.previewReadOnly,
+		refreshProjectLibrary: input.refreshProjectLibrary,
 	});
 	const versionHistory = useProjectVersionHistory({
 		project: input.project,
@@ -244,13 +246,42 @@ export function useEditorProjectController(input: Input) {
 		openUnsavedChangesDialog: lifecycle.openUnsavedChangesDialog,
 		saveProject: saveActions.saveProject,
 		withSavesSuspended: saveActions.withSavesSuspended,
-		isPreviewReadOnly: saveActions.isPreviewReadOnly,
+		isVersionPreview: saveActions.isVersionPreview,
 		refreshProjectLibrary: input.refreshProjectLibrary,
 		resetSourceScopedEditorState: lifecycle.resetSourceScopedEditorState,
 		applySessionPresentation: input.applySessionPresentation,
 		handleSaveProject: saveActions.handleSaveProject,
 		handleSaveProjectAs: saveActions.handleSaveProjectAs,
 	});
+	const [agentHandoffBusy, setAgentHandoffBusy] = useState(false);
+	const agentHandoffPending = useRef(false);
+	const [agentReviewRound, setAgentReviewRound] = useState<{ path: string; cutIds: ReadonlySet<string>; edits: AgentEdit[] }>();
+	const recordAgentChanges = (path: string, incoming: unknown, history: unknown[] = []) => {
+		if (!validateProjectData(incoming)) return;
+		const editor = normalizeProjectEditor(incoming.editor);
+		const existingIds = new Set(input.timeline.changeLog.entries.map(entry => entry.id));
+		const addedIds = normalizeChangeLog(editor.changeLog).entries
+			.filter(entry => entry.source === "agent" && !existingIds.has(entry.id))
+			.map(entry => entry.id);
+		const reviewValue = (state: typeof editor, videoPath: string) => ({
+			...state, sourcePath: fromFileUrl(videoPath),
+			chapterProgress: state.chapterProgress ?? emptyChapterProgress(), transcript: state.transcript ?? null,
+		});
+		const revisions = history.every(validateProjectData)
+			? history.map(project => reviewValue(normalizeProjectEditor(project.editor), project.videoPath))
+			: [];
+		revisions.push(reviewValue(editor, incoming.videoPath));
+		const edits = findAgentEditsThroughRevisions(
+			{ ...input.timeline, sourcePath: snapshot.currentSourcePath }, revisions, crypto.randomUUID(),
+		);
+		if (!addedIds.length && !edits.length) return;
+		setAgentReviewRound(round => ({
+			path,
+			cutIds: new Set([...(round?.path === path ? round.cutIds : []), ...addedIds]),
+			edits: mergeAgentReviewEdits(round?.path === path ? round.edits : [], edits),
+		}));
+		input.setActiveEffectSection("review");
+	};
 	const externalProjectChange = useExternalProjectChange({
 		project: input.project,
 		applyLoadedProject: lifecycle.applyLoadedProject,
@@ -258,7 +289,70 @@ export function useEditorProjectController(input: Input) {
 		saveActions,
 		projectDisplayName: snapshot.projectDisplayName,
 		hasUnsavedChanges,
+		agentHandoffBusy,
+		onAgentProjectReload: recordAgentChanges,
 	});
+	async function changeAgentHandoff(handedOff: boolean) {
+		const path = input.project.currentProjectPath;
+		if (!path || !window.electronAPI.setProjectAgentHandoff ||
+			agentHandoffPending.current || externalProjectChange.resolving || externalProjectChange.conflictOpen) return;
+		agentHandoffPending.current = true;
+		setAgentHandoffBusy(true);
+		try {
+			if (handedOff && hasUnsavedChanges && !(await saveActions.saveProject(false))) return;
+			await saveActions.withSavesSuspended(async () => {
+				if (handedOff) saveActions.setAgentReadOnly(path);
+				const result = await window.electronAPI.setProjectAgentHandoff(path, handedOff);
+				if (!result.success) {
+					if (handedOff) saveActions.setAgentReadOnly(null);
+					throw new Error(result.message || uiText("failedToLoadProject"));
+				}
+				if (handedOff) setAgentReviewRound(undefined);
+				if (!handedOff) {
+				const loaded = await window.electronAPI.openProjectFileAtPath(path, true);
+					if (!loaded.success || !loaded.project || !(await lifecycle.applyLoadedProject(
+						loaded.project, loaded.path ?? path, loaded.revision, { preservePlayhead: true },
+					))) {
+						await window.electronAPI.setProjectAgentHandoff(path, true).catch(() => undefined);
+						throw new Error(loaded.message || uiText("failedToLoadProject"));
+					}
+				recordAgentChanges(loaded.path ?? path, loaded.project, loaded.agentReviewHistory);
+					saveActions.setAgentReadOnly(null);
+				}
+			});
+		} catch (error) {
+			if (handedOff) saveActions.setAgentReadOnly(null);
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			agentHandoffPending.current = false;
+			setAgentHandoffBusy(false);
+		}
+	}
+	const activeAgentReview = agentReviewRound?.path === input.project.currentProjectPath ? agentReviewRound : undefined;
+	function updateAgentEdit(id: string, update: Partial<Pick<AgentEdit, "status" | "note">>) {
+		setAgentReviewRound(round => round && {
+			...round, edits: round.edits.map(edit => edit.id === id ? { ...edit, ...update } : edit),
+		});
+	}
+	let agentRestoreCheck: ReturnType<typeof createAgentEditRestoreCheck> | undefined;
+	const agentEdits = {
+		entries: activeAgentReview?.edits ?? NO_AGENT_EDITS,
+		canRestore: (edit: AgentEdit) => {
+			agentRestoreCheck ??= createAgentEditRestoreCheck({ ...input.timeline, sourcePath: snapshot.currentSourcePath });
+			return agentRestoreCheck(edit);
+		},
+		accept: (edit: AgentEdit) => { if (!saveActions.previewReadOnly) updateAgentEdit(edit.id, { status: "accepted" }); },
+		restore: (edit: AgentEdit) => {
+			if (saveActions.previewReadOnly || !restoreAgentEdit(edit, input.timeline, snapshot.currentSourcePath)) return;
+			if (edit.field === "zoomRegions") {
+				const targetId = edit.target?.id;
+				const retained = targetId ? input.timeline.zoomRegions.filter(zoom => zoom.id !== targetId) : [];
+				input.nextZoomIdRef.current = deriveNextId("zoom", [...retained, ...edit.before].map(zoom => zoom.id));
+			}
+			updateAgentEdit(edit.id, { status: "restored" });
+		},
+		saveNote: (edit: AgentEdit, note: string) => { if (!saveActions.previewReadOnly) updateAgentEdit(edit.id, { note }); },
+	};
 
 	return {
 		refreshProjectLibrary: input.refreshProjectLibrary,
@@ -270,6 +364,10 @@ export function useEditorProjectController(input: Input) {
 		openActions,
 		mediaRelink,
 		externalProjectChange,
+		agentHandoffBusy,
+		recentAgentCutIds: activeAgentReview?.cutIds ?? NO_RECENT_AGENT_CUTS,
+		agentEdits,
+		changeAgentHandoff,
 		versionHistory,
 		hasUnsavedChanges,
 	};

@@ -116,11 +116,18 @@ export interface TimelineSlice {
 	speed: number;
 }
 
+export type OfflineAudioInput = AudioBuffer | {
+	duration: number;
+	numberOfChannels: number;
+	readWindow(context: BaseAudioContext, startSec: number, durationSec: number, paddingSec?: number):
+		Promise<{ buffer: AudioBuffer; offsetSec: number }>;
+};
+
 export interface PreparedOfflineRender {
 	usesClipTimeline?: boolean;
-	mainBufferEntry: { buffer: AudioBuffer; gain: number } | null;
-	companionEntries: Array<{ buffer: AudioBuffer; startDelaySec: number; gain: number; trackId?: SourceTrackId }>;
-	regionEntries: Array<{ buffer: AudioBuffer; region: AudioRegion }>;
+	mainBufferEntry: { buffer: OfflineAudioInput; gain: number } | null;
+	companionEntries: Array<{ buffer: OfflineAudioInput; startDelaySec: number; gain: number; trackId?: SourceTrackId }>;
+	regionEntries: Array<{ buffer: OfflineAudioInput; region: AudioRegion }>;
 	mutedSourceOutputRangesSec: Array<{ startSec: number; endSec: number }>;
 	slices: TimelineSlice[];
 	outputDurationMs: number;

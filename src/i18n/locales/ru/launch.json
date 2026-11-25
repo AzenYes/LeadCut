@@ -94,7 +94,14 @@
 			"availableGenericTitle": "Доступно обновление."
 		},
 		"preparing": "Preparing recording",
-		"preparingSubtitle": "Opening the editor in a moment"
+		"startingCapture": "Запуск захвата",
+		"recoveringCapture": "Восстановление записи",
+		"stoppingCapture": "Остановка захвата",
+		"savingCapture": "Сохранение записи",
+		"openingEditor": "Открытие редактора",
+		"discardingCapture": "Удаление записи",
+		"savedAt": "Запись сохранена в {{path}}",
+		"revealSavedRecording": "Показать запись в папке"
 	},
 	"sourceSelector": {
 		"loadingSources": "Загрузка источников...",

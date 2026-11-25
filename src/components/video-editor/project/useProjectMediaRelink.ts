@@ -34,8 +34,11 @@ export function useProjectMediaRelink({
 	}, []);
 	const cancel = useCallback(() => {
 		setRequest(null);
-		if (!project.videoPath) project.setProjectBrowserOpen(true);
-	}, [project]);
+		if (!project.videoPath) {
+			project.setProjectBrowserOpen(true);
+			void refreshProjectLibrary();
+		}
+	}, [project, refreshProjectLibrary]);
 	const confirm = useCallback(async (mapping: MediaRelinkMapping) => {
 		if (!request) return;
 		await withSavesSuspended(async () => {

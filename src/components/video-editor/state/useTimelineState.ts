@@ -1,6 +1,7 @@
 import { emptyChapterProgress, type ChapterProgress } from "../chapterProgress";
 import { emptyChangeLog, type ChangeLog } from "../changeLog";
 import { useState } from "react";
+import { createObservableValue } from "@/lib/observableValue";
 import type { VideoRegion, VideoTrack } from "../videoTracks";
 import type { SourceAudioTrackSettings } from "../audio/audioTypes";
 import type { ProjectTranscript } from "../transcript";
@@ -51,6 +52,7 @@ export function useTimelineState(videoSourcePath: string | null = null) {
 	const [sourceAudioFallbackRefreshKey, setSourceAudioFallbackRefreshKey] = useState(0);
 	const [hasClipSourceAudio, setHasClipSourceAudio] = useState(false);
 	const [autoCaptions, setAutoCaptions] = useState<CaptionCue[]>([]);
+	const [captionFontSizeDraft] = useState(() => createObservableValue<number | null>(null));
 	const [autoCaptionSettings, setAutoCaptionSettings] = useState<AutoCaptionSettings>(
 		DEFAULT_AUTO_CAPTION_SETTINGS,
 	);
@@ -102,6 +104,7 @@ export function useTimelineState(videoSourcePath: string | null = null) {
 		autoCaptions,
 		setAutoCaptions,
 		autoCaptionSettings,
+		captionFontSizeDraft,
 		setAutoCaptionSettings,
 	};
 }

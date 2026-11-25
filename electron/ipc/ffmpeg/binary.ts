@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import path from "node:path";
 import { app } from "electron";
 
 const nodeRequire = createRequire(import.meta.url);
@@ -116,7 +117,15 @@ export function resolveSystemFfprobeBinaryPath(): string | null {
 	return null;
 }
 
+function getPackagedWindowsMediaTool(name: "ffmpeg" | "ffprobe") {
+	if (!app.isPackaged || process.platform !== "win32" || process.arch !== "x64") return null;
+	const executable = path.join(process.resourcesPath, "media-tools", `${name}.exe`);
+	return existsSync(executable) ? executable : null;
+}
+
 export function getFfmpegBinaryPath(): string {
+	const packagedTool = getPackagedWindowsMediaTool("ffmpeg");
+	if (packagedTool) return packagedTool;
 	const ffmpegStatic = loadFfmpegStatic();
 	if (ffmpegStatic && typeof ffmpegStatic === "string") {
 		const bundledPath = app.isPackaged
@@ -139,6 +148,8 @@ export function getFfmpegBinaryPath(): string {
 }
 
 export function getFfprobeBinaryPath(): string {
+	const packagedTool = getPackagedWindowsMediaTool("ffprobe");
+	if (packagedTool) return packagedTool;
 	const ffprobeStatic = loadFfprobeStatic();
 	if (ffprobeStatic && typeof ffprobeStatic === "string") {
 		const bundledPath = app.isPackaged

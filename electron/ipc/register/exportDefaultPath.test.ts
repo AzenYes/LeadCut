@@ -4,6 +4,7 @@ import path from "node:path";
 import { dialog, ipcMain } from "electron";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { readAppSetting, writeAppSetting } from "../../appSettingsStore";
+import { configureTrustedIpcDocuments } from "../../trustedIpc";
 import { LAST_EXPORT_DIRECTORY_SETTING_KEY } from "../../../src/lib/storageKeys";
 import { registerExportHandlers, resolveDefaultExportDirectory, resolveUniqueExportFileName } from "./export";
 
@@ -59,7 +60,10 @@ it("offers the remembered directory and persists only a confirmed choice", async
 	const choose = vi.mocked(ipcMain.handle).mock.calls.find(([channel]) => channel === "choose-export-path")?.[1];
 	expect(choose).toBeDefined();
 	vi.mocked(dialog.showSaveDialog).mockResolvedValueOnce({ canceled: true, filePath: "" });
-	const event = { sender: {} } as Electron.IpcMainInvokeEvent;
+	const url = "http://127.0.0.1:45920/";
+	configureTrustedIpcDocuments(() => [url]);
+	const senderFrame = { url };
+	const event = { senderFrame, sender: { mainFrame: senderFrame, getURL: () => url, isDestroyed: () => false } } as Electron.IpcMainInvokeEvent;
 	await expect(choose!(event, "Project.mp4")).resolves.toEqual({ success: false, canceled: true });
 	expect(dialog.showSaveDialog).toHaveBeenCalledWith(expect.objectContaining({
 		defaultPath: path.join(directory, "Project (2).mp4"),

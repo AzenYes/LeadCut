@@ -1,8 +1,9 @@
-import { ipcMain, shell, systemPreferences } from "electron";
+import { handleTrustedIpc } from "../../trustedIpc";
+import { shell, systemPreferences } from "electron";
 import { getMacPrivacySettingsUrl } from "../utils";
 
 export function registerPermissionHandlers() {
-	ipcMain.handle("open-external-url", async (_, url: string) => {
+	handleTrustedIpc("open-external-url", async (_, url: string) => {
 		try {
 			// Security: only allow http/https URLs to prevent file:// or custom protocol abuse
 			const parsed = new URL(url);
@@ -17,7 +18,7 @@ export function registerPermissionHandlers() {
 		}
 	});
 
-	ipcMain.handle("get-accessibility-permission-status", () => {
+	handleTrustedIpc("get-accessibility-permission-status", () => {
 		if (process.platform !== "darwin") {
 			return { success: true, trusted: true, prompted: false };
 		}
@@ -29,7 +30,7 @@ export function registerPermissionHandlers() {
 		};
 	});
 
-	ipcMain.handle("request-accessibility-permission", () => {
+	handleTrustedIpc("request-accessibility-permission", () => {
 		if (process.platform !== "darwin") {
 			return { success: true, trusted: true, prompted: false };
 		}
@@ -41,7 +42,7 @@ export function registerPermissionHandlers() {
 		};
 	});
 
-	ipcMain.handle("get-screen-recording-permission-status", () => {
+	handleTrustedIpc("get-screen-recording-permission-status", () => {
 		if (process.platform !== "darwin") {
 			return { success: true, status: "granted" };
 		}
@@ -57,7 +58,7 @@ export function registerPermissionHandlers() {
 		}
 	});
 
-	ipcMain.handle("open-screen-recording-preferences", async () => {
+	handleTrustedIpc("open-screen-recording-preferences", async () => {
 		if (process.platform !== "darwin") {
 			return { success: true };
 		}
@@ -71,7 +72,7 @@ export function registerPermissionHandlers() {
 		}
 	});
 
-	ipcMain.handle("open-accessibility-preferences", async () => {
+	handleTrustedIpc("open-accessibility-preferences", async () => {
 		if (process.platform !== "darwin") {
 			return { success: true };
 		}

@@ -94,7 +94,14 @@
 			"availableGenericTitle": "Er is een update beschikbaar."
 		},
 		"preparing": "Preparing recording",
-		"preparingSubtitle": "Opening the editor in a moment"
+		"startingCapture": "Opname wordt gestart",
+		"recoveringCapture": "Opname wordt hersteld",
+		"stoppingCapture": "Opname wordt gestopt",
+		"savingCapture": "Opname wordt opgeslagen",
+		"openingEditor": "Editor wordt geopend",
+		"discardingCapture": "Opname wordt verwijderd",
+		"savedAt": "Opname opgeslagen in {{path}}",
+		"revealSavedRecording": "Opname in map weergeven"
 	},
 	"sourceSelector": {
 		"loadingSources": "Bronnen laden...",

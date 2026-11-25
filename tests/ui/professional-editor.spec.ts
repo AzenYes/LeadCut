@@ -19,10 +19,16 @@ test.beforeEach(async ({ page }) => {
 test("timeline resizes, seeks precisely, cuts and ripple-deletes with F2/F3", async ({ page }) => {
 	const resize = page.getByRole("separator", { name: "Resize timeline" });
 	const initial = Number(await resize.getAttribute("aria-valuenow"));
+	const storedHeight = () => page.evaluate(() => localStorage.getItem("leadcut.timeline.height"));
+	expect(await storedHeight()).toBeNull();
 	const box = (await resize.boundingBox())!;
 	await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-	await page.mouse.down(); await page.mouse.move(box.x + box.width / 2, box.y - 150); await page.mouse.up();
+	await page.mouse.down();
+	await page.mouse.move(box.x + box.width / 2, box.y - 150);
 	await expect.poll(async () => Number(await resize.getAttribute("aria-valuenow"))).toBeGreaterThan(initial + 100);
+	expect(await storedHeight()).toBeNull();
+	await page.mouse.up();
+	await expect.poll(storedHeight).toBe(await resize.getAttribute("aria-valuenow"));
 	const timecode = page.getByRole("textbox", { name: "Timeline timecode", exact: true });
 	await timecode.fill("00:00:02.125"); await timecode.press("Enter");
 	await expect(timecode).toHaveValue("00:00:02.125");
@@ -189,7 +195,10 @@ test("paused B-roll paints immediately, stops its media clock and survives proje
 		const png = await canvas.screenshot();
 		return [...execFileSync(path.resolve("node_modules/ffmpeg-static/ffmpeg.exe"), ["-v", "error", "-i", "pipe:0", "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], { input: png, windowsHide: true })];
 	};
-	await expect.poll(async () => (await pixel())[2] - (await pixel())[0]).toBeGreaterThan(120);
+	await expect.poll(async () => {
+		const [red, , blue] = await pixel();
+		return blue - red;
+	}).toBeGreaterThan(120);
 	await page.locator('[data-timeline-panel]').focus(); await page.keyboard.press("L");
 	await expect.poll(() => page.evaluate(() => window.layerVideos.some((video) => video.src.endsWith("broll-blue.mp4") && !video.paused))).toBe(true);
 	await page.keyboard.press("Space");

@@ -94,7 +94,14 @@
 			"availableGenericTitle": "È disponibile un aggiornamento."
 		},
 		"preparing": "Preparing recording",
-		"preparingSubtitle": "Opening the editor in a moment"
+		"startingCapture": "Avvio dell’acquisizione",
+		"recoveringCapture": "Recupero della registrazione",
+		"stoppingCapture": "Interruzione della cattura",
+		"savingCapture": "Salvataggio della registrazione",
+		"openingEditor": "Apertura dell’editor",
+		"discardingCapture": "Eliminazione della registrazione",
+		"savedAt": "Registrazione salvata in {{path}}",
+		"revealSavedRecording": "Mostra la registrazione nella cartella"
 	},
 	"sourceSelector": {
 		"loadingSources": "Caricamento sorgenti...",

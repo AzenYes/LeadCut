@@ -15,7 +15,8 @@
   "protocols": [],
   "npmRebuild": true,
   "buildDependenciesFromSource": true,
-  "compression": "normal",
+  "compression": "maximum",
+  "afterPack": "./scripts/prepare-packaged-resources.cjs",
   "directories": {
     "output": "release"
   },
@@ -23,14 +24,11 @@
     "dist",
     "!dist/wallpapers/**",
     "dist-electron",
-    "electron/native/bin",
     "electron/native/nvidia-cuda-compositor/run-mp4-pipeline.mjs",
     "!electron/native/bin/**/whisper-bench*",
     "!electron/native/bin/**/whisper-quantize*",
     "!electron/native/bin/**/whisper-server*",
     "!electron/native/bin/**/whisper-vad-speech-segments*",
-    "!node_modules/ffprobe-static/bin/darwin/**",
-    "!node_modules/ffprobe-static/bin/linux/**",
     "!node_modules/ffprobe-static/bin/win32/ia32/**",
     "!electron/native/**/build/**",
     "!*.png",
@@ -44,14 +42,25 @@
     { "from": "README.md", "to": "使用说明.md" },
     { "from": "LICENSE.md", "to": "LICENSE.md" },
     { "from": "THIRD_PARTY_NOTICES.md", "to": "THIRD_PARTY_NOTICES.md" },
+    { "from": ".tmp/leadcut-mcp-bundle/index.cjs", "to": "leadcut-mcp/dist/index.cjs" },
+    { "from": "services/leadcut-mcp/scripts/transcribe.py", "to": "leadcut-mcp/scripts/transcribe.py" },
     {
       "from": "public/wallpapers",
       "to": "assets/wallpapers"
     }
   ],
-  "publish": null,
+  "publish": [{ "provider": "github", "owner": "AzenYes", "repo": "LeadCut" }],
 
   "mac": {
+    "files": [
+      "dist/**",
+      "!dist/wallpapers/**",
+      "dist-electron/**",
+      "electron/native/bin/darwin-${arch}/**",
+      "electron/native/nvidia-cuda-compositor/run-mp4-pipeline.mjs",
+      "!node_modules/ffprobe-static/bin/linux/**",
+      "!node_modules/ffprobe-static/bin/win32/**"
+    ],
     "hardenedRuntime": true,
     "entitlements": "build/entitlements.mac.plist",
     "entitlementsInherit": "build/entitlements.mac.inherit.plist",
@@ -97,6 +106,12 @@
     }
   },
   "linux": {
+    "files": [
+      "electron/native/bin/linux-${arch}/**",
+      "!node_modules/ffprobe-static/bin/darwin/**",
+      "!node_modules/ffprobe-static/bin/linux/ia32/**",
+      "!node_modules/ffprobe-static/bin/win32/**"
+    ],
     "target": [
       "AppImage"
     ],
@@ -105,10 +120,42 @@
     "category": "AudioVideo"
   },
   "win": {
-    "extraResources": [{
-      "from": "electron/native/bin/win32-${arch}/LeadCutThumbnail.dll",
-      "to": "LeadCutThumbnail.dll"
-    }],
+    "electronLanguages": [
+      "de", "en-GB", "en-US", "es", "es-419", "fr", "it", "ko", "nl", "pt-BR", "ru", "zh-CN", "zh-TW"
+    ],
+    "files": [
+      "dist/**",
+      "!dist/wallpapers/**",
+      "dist-electron/**",
+      "electron/native/nvidia-cuda-compositor/run-mp4-pipeline.mjs",
+      "!node_modules/ffprobe-static/bin/darwin/**",
+      "!node_modules/ffprobe-static/bin/linux/**",
+      "!node_modules/ffprobe-static/bin/win32/ia32/**"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/native/bin/win32-${arch}",
+        "to": "app.asar.unpacked/electron/native/bin/win32-${arch}",
+        "filter": [
+          "cursor-monitor.exe",
+          "ggml-base.dll",
+          "ggml-cpu.dll",
+          "ggml.dll",
+          "helpers-manifest.json",
+          "leadcut-gpu-export.exe",
+          "leadcut-local-font-catalog.exe",
+          "recordly-nvidia-cuda-compositor.exe",
+          "wgc-capture.exe",
+          "whisper-cli.exe",
+          "whisper-runtime.json",
+          "whisper.dll"
+        ]
+      },
+      {
+        "from": "electron/native/bin/win32-${arch}/LeadCutThumbnail.dll",
+        "to": "LeadCutThumbnail.dll"
+      }
+    ],
     "fileAssociations": [{
       "ext": "leadcut",
       "name": "LeadCut.Project",

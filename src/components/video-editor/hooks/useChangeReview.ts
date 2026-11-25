@@ -7,6 +7,7 @@ import { packClipSequence } from "../clipSequence";
 import type { useTimelineState } from "../state/useTimelineState";
 import type { EditorEffectSection, WebcamOverlaySettings } from "../types";
 import { getCutSeams } from "../videoPlayback/playbackStepping";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 import { createWebcamVideoRegions } from "../videoTracks";
 import type { useClipRegionCommands } from "./useClipRegionCommands";
 import type { useEditorPlaybackControls } from "./useEditorPlaybackControls";
@@ -14,13 +15,13 @@ import type { useEditorPlaybackControls } from "./useEditorPlaybackControls";
 export const changeConfidencePriority: Record<ChangeConfidence, number> = { low: 0, medium: 1, high: 2 };
 
 export function useChangeReview({
-	timeline, sourceDurationMs, webcam, playheadSeconds, durationSeconds, isPlaying,
+	timeline, sourceDurationMs, webcam, playbackClock, durationSeconds, isPlaying,
 	applySequence, seek, startPlayback, pause, setActiveSection,
 }: {
 	timeline: ReturnType<typeof useTimelineState>;
 	sourceDurationMs: number;
 	webcam: WebcamOverlaySettings;
-	playheadSeconds: number;
+	playbackClock: PlaybackClock;
 	durationSeconds: number;
 	isPlaying: boolean;
 	applySequence: ReturnType<typeof useClipRegionCommands>["applySequence"];
@@ -134,11 +135,19 @@ export function useChangeReview({
 
 	useEffect(() => {
 		if (auditionUntil === null) return;
-		if (playheadSeconds >= auditionUntil || !isPlaying) {
-			if (isPlaying) pause();
+		if (!isPlaying) {
 			setAuditionUntil(null);
+			return;
 		}
-	}, [auditionUntil, playheadSeconds, isPlaying, pause]);
+		const checkEnd = () => {
+			if (playbackClock.getTime() < auditionUntil) return;
+			pause();
+			setAuditionUntil(null);
+		};
+		const unsubscribe = playbackClock.subscribe(checkEnd);
+		checkEnd();
+		return unsubscribe;
+	}, [auditionUntil, playbackClock, isPlaying, pause]);
 
 	return {
 		entries, markers, current, selected: current?.id ?? null, auditioning: auditionUntil !== null,

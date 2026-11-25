@@ -1,3 +1,4 @@
+import { handleTrustedIpc, onTrustedIpc } from "./trustedIpc";
 import { readAppEnv } from "./envCompat";
 import { isHudInEditorMode } from "./hudEditorMode";
 import { EventEmitter } from "node:events";
@@ -6,7 +7,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, shell } from "electron";
 import {
 	supportsHudCaptureProtection,
 	shouldProtectHudCapture,
@@ -173,7 +174,7 @@ export function beginHudCaptureProtection(): void {
 	hudCaptureStarting = true;
 	reassertHudOverlayCaptureProtection();
 }
-ipcMain.handle("finish-recording-startup", () => {
+handleTrustedIpc("finish-recording-startup", () => {
 	hudCaptureStarting = false;
 	reassertHudOverlayCaptureProtection();
 });
@@ -364,11 +365,11 @@ function setHudOverlayMousePassthrough(ignore: boolean) {
 	hudOverlayWindow.setIgnoreMouseEvents(false);
 }
 
-ipcMain.on("hud-overlay-set-ignore-mouse", (_event, ignore: boolean) => {
+onTrustedIpc("hud-overlay-set-ignore-mouse", (_event, ignore: boolean) => {
 	setHudOverlayMousePassthrough(Boolean(ignore));
 });
 
-ipcMain.on("hud-overlay-set-source-selection-active", (_event, active: boolean) => {
+onTrustedIpc("hud-overlay-set-source-selection-active", (_event, active: boolean) => {
 	hudOverlaySourceSelectionActive = Boolean(active);
 	if (hudOverlaySourceSelectionActive) {
 		hudOverlayFallbackExpanded = false;
@@ -385,7 +386,7 @@ let hudDragOffset: { x: number; y: number } | null = null;
 let hudDragLastCursor: { x: number; y: number } | null = null;
 let hudDragFixedSize: { width: number; height: number } | null = null;
 
-ipcMain.on("hud-overlay-drag", (_event, phase: string, screenX: number, screenY: number) => {
+onTrustedIpc("hud-overlay-drag", (_event, phase: string, screenX: number, screenY: number) => {
 	if (!hudOverlayWindow || hudOverlayWindow.isDestroyed()) return;
 
 	// On Linux the compositor (especially Wayland) refuses programmatic window
@@ -436,13 +437,13 @@ ipcMain.on("hud-overlay-drag", (_event, phase: string, screenX: number, screenY:
 	}
 });
 
-ipcMain.on("hud-overlay-hide", () => {
+onTrustedIpc("hud-overlay-hide", () => {
 	if (hudOverlayWindow && !hudOverlayWindow.isDestroyed()) {
 		hudOverlayWindow.minimize();
 	}
 });
 
-ipcMain.handle("get-hud-overlay-capture-protection", () => {
+handleTrustedIpc("get-hud-overlay-capture-protection", () => {
 	const enabled = loadHudOverlayCaptureProtectionSetting();
 
 	return {
@@ -451,14 +452,14 @@ ipcMain.handle("get-hud-overlay-capture-protection", () => {
 	};
 });
 
-ipcMain.handle("get-hud-overlay-mouse-passthrough-supported", () => {
+handleTrustedIpc("get-hud-overlay-mouse-passthrough-supported", () => {
 	return {
 		success: true,
 		supported: isHudOverlayMousePassthroughSupported(),
 	};
 });
 
-ipcMain.on("hud-overlay-set-webcam-preview-visible", (_event, visible: boolean) => {
+onTrustedIpc("hud-overlay-set-webcam-preview-visible", (_event, visible: boolean) => {
 	const nextVisible = Boolean(visible);
 	if (hudOverlayWebcamPreviewVisible === nextVisible) {
 		return;
@@ -470,7 +471,7 @@ ipcMain.on("hud-overlay-set-webcam-preview-visible", (_event, visible: boolean) 
 	}
 });
 
-ipcMain.handle("set-hud-overlay-capture-protection", (_event, enabled: boolean) => {
+handleTrustedIpc("set-hud-overlay-capture-protection", (_event, enabled: boolean) => {
 	loadHudOverlayCaptureProtectionSetting();
 	hudOverlayHiddenFromCapture = Boolean(enabled);
 	writeHudOverlaySettings({ hiddenFromCapture: hudOverlayHiddenFromCapture });
@@ -483,14 +484,14 @@ ipcMain.handle("set-hud-overlay-capture-protection", (_event, enabled: boolean) 
 	};
 });
 
-ipcMain.handle("get-hud-overlay-placement", ({ sender }) => {
+handleTrustedIpc("get-hud-overlay-placement", ({ sender }) => {
 	const hud = getHudOverlayWindow();
 	if (hud?.webContents !== sender || !isHudOverlayMousePassthroughSupported()) return null;
 	loadHudOverlayCaptureProtectionSetting();
 	return { displayId: getHudOverlayDisplay().id, ...hudOverlayPlacements };
 });
 
-ipcMain.handle("hud-overlay-set-placement", ({ sender }, kind: unknown, value: unknown) => {
+handleTrustedIpc("hud-overlay-set-placement", ({ sender }, kind: unknown, value: unknown) => {
 	const hud = getHudOverlayWindow();
 	if (hud?.webContents !== sender || !isHudOverlayMousePassthroughSupported()) return false;
 	if (kind !== "bar" && kind !== "webcam") return false;
@@ -502,7 +503,7 @@ ipcMain.handle("hud-overlay-set-placement", ({ sender }, kind: unknown, value: u
 	return writeHudOverlaySettings(patch);
 });
 
-ipcMain.on("hud-overlay-follow-cursor-display", ({ sender }) => {
+onTrustedIpc("hud-overlay-follow-cursor-display", ({ sender }) => {
 	const hud = getHudOverlayWindow();
 	if (!hud || hud.webContents !== sender || !isHudOverlayMousePassthroughSupported()) return;
 	const screen = getScreen();
@@ -536,8 +537,8 @@ function notifyEditorMode() {
 		hudOverlayWindow.webContents.send("editor-mode-changed", getHudEditorMode());
 	}
 }
-ipcMain.handle("get-editor-mode", getHudEditorMode);
-ipcMain.on("hud-overlay-quit-app", ({ sender }) => {
+handleTrustedIpc("get-editor-mode", getHudEditorMode);
+onTrustedIpc("hud-overlay-quit-app", ({ sender }) => {
 	if (sender !== getHudOverlayWindow()?.webContents) return;
 	if (hudCaptureStarting || hudOverlayRecordingActive) return;
 	app.quit();
@@ -571,7 +572,7 @@ export function createHudOverlayWindow(recovery?: { show: boolean }): BrowserWin
 			preload: path.join(electronWindowsDir, "preload.cjs"),
 			nodeIntegration: false,
 			contextIsolation: true,
-			webSecurity: false,
+			webSecurity: true,
 			backgroundThrottling: false,
 		},
 	});
@@ -687,13 +688,12 @@ export function createHudOverlayWindow(recovery?: { show: boolean }): BrowserWin
 		}, 500);
 	});
 
-	const handleHudRendererReady = () => {
-		if (!win.isDestroyed()) {
+	const removeHudRendererReadyListener = onTrustedIpc("hud-overlay-renderer-ready", event => {
+		if (!win.isDestroyed() && event.sender === win.webContents) {
 			console.log(`[PERF:MAIN] HUD Window: renderer-ready in ${Date.now() - perfStart}ms`);
 			showHudWindow();
 		}
-	};
-	ipcMain.on("hud-overlay-renderer-ready", handleHudRendererReady);
+	});
 
 	hudOverlayWindow = win;
 	// Windows can constrain the constructor size against the primary work area
@@ -745,7 +745,7 @@ export function createHudOverlayWindow(recovery?: { show: boolean }): BrowserWin
 	screen.on("display-metrics-changed", handleDisplayMetricsChanged);
 
 	win.on("closed", () => {
-		ipcMain.removeListener("hud-overlay-renderer-ready", handleHudRendererReady);
+		removeHudRendererReadyListener();
 		screen.removeListener("display-removed", handleDisplayRemoved);
 		screen.removeListener("display-metrics-changed", handleDisplayMetricsChanged);
 		if (hudOverlayWindow === win) {
@@ -929,8 +929,9 @@ export function hideUpdateToastWindow(): void {
 	restoreHudAfterUpdateToast();
 }
 
-function loadPackagedEditorWindow(win: BrowserWindow) {
+function loadPackagedEditorWindow(win: BrowserWindow, preloadStartupProject: boolean) {
 	const query = getEditorWindowQuery();
+	if (preloadStartupProject) query.startupPreview = "1";
 	const queryString = new URLSearchParams(query).toString();
 	const indexHtmlPath = path.join(RENDERER_DIST, "index.html");
 	const packagedRendererBaseUrl = getPackagedRendererBaseUrl();
@@ -1034,7 +1035,10 @@ function loadPackagedEditorWindow(win: BrowserWindow) {
 	});
 }
 
-export function createEditorWindow(onRendererCrash: () => Promise<boolean>): BrowserWindow {
+export function createEditorWindow(
+	onRendererCrash: () => Promise<boolean>,
+	preloadStartupProject = false,
+): BrowserWindow {
 	const perfStart = Date.now();
 	console.log("[PERF:MAIN] createEditorWindow: STARTED");
 	const isMac = process.platform === "darwin";
@@ -1070,7 +1074,7 @@ export function createEditorWindow(onRendererCrash: () => Promise<boolean>): Bro
 			preload: path.join(electronWindowsDir, "preload.cjs"),
 			nodeIntegration: false,
 			contextIsolation: true,
-			webSecurity: false,
+			webSecurity: true,
 			backgroundThrottling: false,
 		},
 	});
@@ -1101,7 +1105,6 @@ export function createEditorWindow(onRendererCrash: () => Promise<boolean>): Bro
 
 	win.webContents.on("did-finish-load", () => {
 		console.log(`[PERF:MAIN] Editor Window: did-finish-load in ${Date.now() - perfStart}ms`);
-		createCountdownWindow(true);
 		win?.webContents.send("main-process-message", new Date().toLocaleString());
 		// Fallback for Linux/Wayland where `ready-to-show` may not fire reliably.
 		if (!win.isDestroyed() && !win.isVisible()) {
@@ -1176,7 +1179,7 @@ export function createEditorWindow(onRendererCrash: () => Promise<boolean>): Bro
 		const query = new URLSearchParams(getEditorWindowQuery());
 		win.loadURL(`${VITE_DEV_SERVER_URL}?${query.toString()}`);
 	} else {
-		loadPackagedEditorWindow(win);
+		loadPackagedEditorWindow(win, preloadStartupProject);
 	}
 
 	return win;

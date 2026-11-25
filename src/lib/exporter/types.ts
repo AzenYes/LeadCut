@@ -1,4 +1,5 @@
 import { uiText } from "@/i18n/uiText";
+import type { EncoderRoutePlan, ExportEncodeRoute, ExportRoutePlan, NativeStaticExportRoute } from "./backendPolicy";
 export interface ExportConfig {
 	width: number;
 	height: number;
@@ -21,6 +22,11 @@ export type ExportRenderBackend = "webgpu" | "webgl";
 export type ExportEncodeBackend = "ffmpeg" | "webcodecs";
 export type ExportBackendPreference = "auto" | "webcodecs" | "breeze";
 export type ExportPipelineModel = "modern" | "legacy";
+export type ExportRouteChange = {
+	reason: "native-encoder" | "audio-mux" | "media-reader" | "static-compositor";
+	detail: string;
+	restarted: boolean;
+};
 
 export interface ExportProgress {
 	currentFrame: number;
@@ -31,6 +37,7 @@ export interface ExportProgress {
 	renderBackend?: ExportRenderBackend;
 	encodeBackend?: ExportEncodeBackend;
 	encoderName?: string;
+	exportRoute?: ExportEncodeRoute;
 	nativeStaticLayoutSkipReason?: string;
 	nativeStaticLayoutSkipReasons?: string[];
 	phase?: "preparing" | "extracting" | "finalizing" | "saving"; // Phase of export
@@ -44,6 +51,8 @@ export interface ExportFinalizationStageMetrics {
 	audioProcessingMs?: number;
 	muxerFinalizeMs?: number;
 	editedAudioRenderMs?: number;
+	editedAudioEncodeMs?: number;
+	editedAudioWaitMs?: number;
 	ffmpegAudioMuxMs?: number;
 	nativeExportFinalizeMs?: number;
 	nativeEncoderFlushMs?: number;
@@ -57,6 +66,8 @@ export interface ExportFfmpegAudioMuxBreakdown {
 	muxedVideoReadMs?: number;
 	tempVideoBytes?: number;
 	tempEditedAudioBytes?: number;
+	inlineEditedAudioBytes?: number;
+	ffmpegMuxOutputWriteBytes?: number;
 	muxedVideoBytes?: number;
 	chunkCount?: number;
 	chunkDurationSec?: number;
@@ -65,6 +76,8 @@ export interface ExportFfmpegAudioMuxBreakdown {
 	staticAssetExecMs?: number;
 	fallbackChunkCount?: number;
 	videoOnlyBytes?: number;
+	exportRoutePlan?: ExportRoutePlan<NativeStaticExportRoute>;
+	exportRoute?: NativeStaticExportRoute;
 	chunks?: Array<{
 		index: number;
 		startSec: number;
@@ -86,6 +99,7 @@ export interface ExportFfmpegAudioMuxBreakdown {
 			cursorOverlay?: boolean;
 			zoomOverlay?: boolean;
 			surfacePoolSize?: number;
+			surfacePoolLimit?: number;
 			adapterIndex?: number;
 			adapterVendorId?: number;
 			adapterDeviceId?: number;
@@ -108,10 +122,46 @@ export interface ExportFfmpegAudioMuxBreakdown {
 			clearMs?: number;
 			videoProcessMs?: number;
 			writeSampleMs?: number;
+			surfaceWaitMs?: number;
+			surfaceWaitMaxMs?: number;
+			surfaceWaitOver1ms?: number;
+			gpuStageTiming?: D3D11GpuStageTiming;
+			mediaFoundationOutputTiming?: MediaFoundationOutputTiming;
 			finalizeMs?: number;
 			realtimeMultiplier?: number;
 		};
 	}>;
+}
+
+export interface D3D11GpuStageTiming {
+	sampleCount: number;
+	submittedSamples: number;
+	sampleStride: number;
+	renderMs: number;
+	copyConvertMs: number;
+	readbackMs: number;
+}
+
+export interface MediaFoundationOutputTiming {
+	queries: number;
+	successfulQueries: number;
+	queryMs: number;
+	submittedFrames: number;
+	encodedFramesBeforeFinalize: number;
+	encodedFrames: number;
+	processedFrames: number;
+	/** Compressed payload accepted by the media sink before container writes. */
+	processedBytes: number;
+	firstOutputObservedMs?: number;
+	lastOutputObservedMs?: number;
+	/** Submit to the first statistics query that observed this exact output timestamp. */
+	observedOutputLatencyMs?: ExportFrameTimingDistribution;
+}
+
+export interface ExportFrameTimingDistribution {
+	sampleCount: number;
+	p50: number;
+	p95: number;
 }
 
 export interface ExportMetrics {
@@ -122,18 +172,29 @@ export interface ExportMetrics {
 	decodeLoopMs?: number;
 	frameCallbackMs?: number;
 	renderFrameMs?: number;
+	/** Sampled render start to completion fence on WebGPU, including queued GPU work. */
+	gpuRenderCompletionMs?: ExportFrameTimingDistribution;
+	/** Sampled encode submission to matching WebCodecs output, including conversion and queueing. */
+	frameEncodeLatencyMs?: ExportFrameTimingDistribution;
 	encodeWaitMs?: number;
+	framePreparationMs?: number;
 	encodeWaitEvents?: number;
 	peakEncodeQueueSize?: number;
 	peakNativeWriteInFlight?: number;
+	/** Canvas frame construction on the native streaming route, included in framePreparationMs. */
 	nativeCaptureMs?: number;
+	/** Wall time with at least one encoded-video IPC write awaiting acknowledgement. */
 	nativeWriteMs?: number;
 	finalizationMs?: number;
 	frameCount?: number;
 	renderBackend?: ExportRenderBackend;
 	encodeBackend?: ExportEncodeBackend;
 	encoderName?: string;
+	exportRoute?: ExportEncodeRoute;
+	exportRoutePlan?: EncoderRoutePlan;
+	gpuReadbackRecovery?: "canvas-in-place" | "restart";
 	backpressureProfile?: string;
+	routeChanges?: ExportRouteChange[];
 	nativeStaticLayoutSkipReason?: string;
 	nativeStaticLayoutSkipReasons?: string[];
 	averageFrameCallbackMs?: number;

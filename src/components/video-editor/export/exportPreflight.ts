@@ -26,8 +26,8 @@ export function collectExportPreflightIssues(input: {
 			issues.push({ kind, fontName, fallbackName: "微软雅黑" });
 		}
 	}
-	const neededBytes = input.estimatedBytes * 1.1;
 	for (const [location, freeBytes] of [["target", input.targetFreeBytes], ["temp", input.tempFreeBytes]] as const) {
+		const neededBytes = input.estimatedBytes * (location === "temp" ? 2.2 : 1.1);
 		if (freeBytes !== null && freeBytes < neededBytes) {
 			issues.push({ kind: "diskSpace", location, freeBytes, neededBytes });
 		}

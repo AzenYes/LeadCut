@@ -76,7 +76,7 @@ export function ProjectThumbnail({
 					src={
 						/^(data:|blob:)/.test(path)
 							? path
-							: `${/^https?:/.test(path) ? path : toFileUrl(path)}?v=${revision}`
+							: `${/^https?:/.test(path) ? path : toFileUrl(path)}${path.includes("?") ? "&" : "?"}v=${revision}`
 					}
 					alt=""
 					loading="lazy"

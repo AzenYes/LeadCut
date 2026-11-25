@@ -78,6 +78,36 @@ async function saved(page: Page) {
 	);
 }
 
+test("caption font size previews during a drag and commits one undoable edit", async ({ page }) => {
+	test.setTimeout(60_000);
+	await prepare(page);
+	await page.getByRole("radio", { name: "字幕", exact: true }).click();
+	const slider = page.getByRole("slider", { name: "字号", exact: true });
+	const track = slider.locator("xpath=ancestor::*[@data-slot='slider-track']");
+	await track.scrollIntoViewIfNeeded();
+	const box = (await track.boundingBox())!;
+	const preview = page.locator("[data-preview-surface]").getByText("字幕测试", { exact: true });
+	const fontPixels = () => preview.evaluate(node => Number.parseFloat(getComputedStyle(node).fontSize));
+	await expect(preview).toBeVisible();
+	const previewSize = await fontPixels();
+	await expect(slider).toHaveValue("44");
+	await page.mouse.move(box.x + box.width * 0.5, box.y + box.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(box.x + box.width * 0.78, box.y + box.height / 2, { steps: 5 });
+	const draft = Number(await slider.inputValue());
+	expect(draft).toBeGreaterThan(44);
+	await expect.poll(fontPixels).toBeGreaterThan(previewSize);
+	await page.waitForTimeout(750);
+	expect((await saved(page))?.autoCaptionSettings.fontSize ?? 44).toBe(44);
+	await page.mouse.up();
+	await expect.poll(async () => (await saved(page))?.autoCaptionSettings.fontSize).toBe(draft);
+	await page.getByRole("button", { name: "撤销", exact: true }).click();
+	await expect(slider).toHaveValue("44");
+	await slider.focus();
+	await slider.press("ArrowRight");
+	await expect.poll(async () => (await saved(page))?.autoCaptionSettings.fontSize).toBe(45);
+});
+
 test("built-in PR subtitle preset applies Medium and survives reopening without replacing existing presets", async ({
 	page,
 }) => {
@@ -122,7 +152,7 @@ test("built-in PR subtitle preset applies Medium and survives reopening without 
 
 test("simplified Chinese settings and animation labels use Chinese", async ({ page }) => {
 	await prepare(page);
-	await page.getByRole("radio", { name: "设置", exact: true }).click();
+	await page.getByRole("button", { name: "应用设置", exact: true }).click();
 	await expect(page.getByRole("row", { name: "常规", exact: true })).toBeVisible();
 	await expect(page.getByRole("row", { name: "浅色", exact: true })).toBeVisible();
 	await expect(page.getByRole("button", { name: "查看教程", exact: true })).toBeVisible();
@@ -130,6 +160,7 @@ test("simplified Chinese settings and animation labels use Chinese", async ({ pa
 	await expect(page.getByRole("option", { name: "简体中文", exact: true })).toBeVisible();
 	await expect(page.getByText("簡體中文", { exact: true })).toHaveCount(0);
 	await page.keyboard.press("Escape");
+	await page.getByRole("dialog", { name: "应用设置", exact: true }).getByRole("button", { name: "关闭", exact: true }).click();
 	await page.getByRole("radio", { name: "字幕", exact: true }).click();
 	await expect(page.getByRole("button", { name: /^淡入淡出/ })).toBeVisible();
 	await expect(page.getByText("字幕生成", { exact: true })).toBeVisible();
@@ -250,7 +281,7 @@ test("large font menus keep keyboard navigation and search over the entire cache
 	await expect(options).toHaveCount(1);
 	await search.press("Enter");
 	await expect(font).toHaveText("Test Font 537");
-	await page.getByRole("radio", { name: "设置", exact: true }).click();
+	await page.getByRole("radio", { name: "场景", exact: true }).click();
 	await captions.click();
 	await font.click();
 	await expect(options.first()).toHaveAttribute("aria-setsize", "600");

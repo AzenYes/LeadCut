@@ -426,8 +426,8 @@ export async function getUsableCompanionAudioCandidates(
 
 		for (const companionPath of [systemPath, micPath]) {
 			try {
-				const stat = await fs.stat(companionPath);
-				if (stat.size > 0) {
+				const stat = await fs.lstat(companionPath);
+				if (stat.isFile() && stat.size > 0) {
 					usablePaths.push(companionPath);
 				}
 			} catch {
@@ -509,13 +509,14 @@ export async function getCompanionAudioFallbackPaths(videoPath: string) {
  */
 export async function getCompanionAudioFallbackInfo(videoPath: string) {
 	const companionCandidates = await getUsableCompanionAudioCandidates(videoPath);
-	if (companionCandidates.length === 0) {
-		return { paths: [], startDelayMsByPath: {} };
+	const sidecarPaths = [...new Set(companionCandidates.flatMap(candidate => candidate.usablePaths))];
+	if (sidecarPaths.length === 0) {
+		return { paths: [], sidecarPaths, startDelayMsByPath: {} };
 	}
 
 	let paths: string[];
 	if (isLibrarySequenceSource(videoPath)) {
-		paths = companionCandidates.flatMap((candidate) => candidate.usablePaths);
+		paths = sidecarPaths;
 	} else if (await hasEmbeddedAudioStream(videoPath)) {
 		const hasUsableMacSystemCompanion = companionCandidates.some(
 			(candidate) =>
@@ -558,20 +559,14 @@ export async function getCompanionAudioFallbackInfo(videoPath: string) {
 					),
 				),
 			);
-			if (companionPaths.length === 0) {
-				return { paths: [], startDelayMsByPath: {} };
-			}
-
-			paths = [videoPath, ...companionPaths];
+			paths = companionPaths.length ? [videoPath, ...companionPaths] : [];
 		}
 	} else {
-		paths = Array.from(
-			new Set(companionCandidates.flatMap((candidate) => candidate.usablePaths)),
-		);
+		paths = sidecarPaths;
 	}
 
 	const metadataEntries = await Promise.all(
-		paths.map(async (audioPath) => {
+		[...new Set([...paths, ...sidecarPaths])].map(async (audioPath) => {
 			const startDelayMs = await getCompanionAudioStartDelayMs(audioPath);
 			if (!Number.isFinite(startDelayMs)) {
 				return null;
@@ -583,6 +578,7 @@ export async function getCompanionAudioFallbackInfo(videoPath: string) {
 
 	return {
 		paths,
+		sidecarPaths,
 		startDelayMsByPath: Object.fromEntries(
 			metadataEntries.filter((entry): entry is readonly [string, number] => entry !== null),
 		),

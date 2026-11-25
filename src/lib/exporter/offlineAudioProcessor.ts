@@ -21,6 +21,7 @@ import {
 	OFFLINE_AUDIO_SAMPLE_RATE,
 	OFFLINE_CHUNK_DURATION_SEC,
 	OFFLINE_ENCODE_CHUNK_FRAMES,
+	type OfflineAudioInput,
 	type PreparedOfflineRender,
 	resolveSourceTrackGain,
 	softLimitOfflineMixPeaksInPlace,
@@ -28,6 +29,19 @@ import {
 	type TrimLikeRegion,
 } from "./audioProcessorShared";
 import type { VideoMuxer } from "./muxer";
+
+function getEmbeddedAudioWindow(clips: readonly ClipRegion[] | undefined) {
+	if (!clips?.length) return undefined;
+	let startSec = Infinity;
+	let endSec = 0;
+	for (const clip of clips) {
+		// Include the sample padding required by the pitch-preserving stretch.
+		const paddingSec = 0.1 * clip.speed + 0.001;
+		startSec = Math.min(startSec, getClipSourceStartMs(clip) / 1000 - paddingSec);
+		endSec = Math.max(endSec, getClipSourceEndMs(clip) / 1000 + paddingSec);
+	}
+	return { startSec: Math.max(0, startSec), endSec };
+}
 
 export class OfflineAudioProcessor extends AudioMediaProcessor {
 	protected async renderAndMuxOfflineAudio(
@@ -42,19 +56,23 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 		muxer: VideoMuxer,
 		sourceAudioTrackSettingsByClip?: Record<string, SourceAudioTrackSettings>,
 	): Promise<void> {
-		const prepared = await this.prepareOfflineRender(
-			videoUrl,
-			trimRegions,
-			speedRegions,
-			audioRegions,
-			sourceAudioFallbackPaths,
-			sourceAudioFallbackStartDelayMsByPath,
-			sourceAudioTrackSettings,
-			clipRegions,
-			sourceAudioTrackSettingsByClip,
-		);
-		if (this.cancelled) return;
-		await this.renderAndEncodeChunked(prepared, muxer);
+		try {
+			const prepared = await this.prepareOfflineRender(
+				videoUrl,
+				trimRegions,
+				speedRegions,
+				audioRegions,
+				sourceAudioFallbackPaths,
+				sourceAudioFallbackStartDelayMsByPath,
+				sourceAudioTrackSettings,
+				clipRegions,
+				sourceAudioTrackSettingsByClip,
+			);
+			if (this.cancelled) return;
+			await this.renderAndEncodeChunked(prepared, muxer);
+		} finally {
+			await this.releaseOfflineAudioSources();
+		}
 	}
 
 	protected async prepareOfflineRender(
@@ -94,16 +112,24 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 		});
 
 		// Decode embedded source audio separately from companion sidecars.
-		const mainBuffer = resolvedPlan.includeEmbeddedInExport
-			? await this.decodeAudioFromUrl(videoUrl)
-			: null;
+		const inputs = new Map<string, OfflineAudioInput | null>();
+		const embeddedWindow = resolvedPlan.includeEmbeddedInExport &&
+			resolvedPlan.playbackPaths.length === 0 && !audioRegions.some(region => region.audioPath === videoUrl)
+			? getEmbeddedAudioWindow(clipRegions) : undefined;
+		const loadAudio = async (resource: string) => {
+			if (!inputs.has(resource)) {
+				inputs.set(resource, await this.loadOfflineAudioInput(resource, resource === videoUrl ? embeddedWindow : undefined));
+			}
+			return inputs.get(resource) ?? null;
+		};
+		const mainBuffer = resolvedPlan.includeEmbeddedInExport ? await loadAudio(videoUrl) : null;
 		const mainBufferGain = resolveSourceTrackGain(sourceAudioTrackSettings, sourceAudioTrackSettings?.mixed ? "mixed" : "system");
 		const mainBufferEntry = mainBuffer ? { buffer: mainBuffer, gain: mainBufferGain } : null;
 		if (this.cancelled) throw new Error("Export cancelled");
 
 		// Decode companion / sidecar audio files
 		const companionEntries: Array<{
-			buffer: AudioBuffer;
+			buffer: OfflineAudioInput;
 			startDelaySec: number;
 			gain: number;
 			trackId: "mic" | "system" | "mixed";
@@ -113,7 +139,7 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 			(resolvedPlan.playbackPaths.length > 0 ? await this.getMediaDurationSec(videoUrl) : 0);
 		for (const audioPath of resolvedPlan.playbackPaths) {
 			if (this.cancelled) throw new Error("Export cancelled");
-			const buffer = await this.decodeAudioFromUrl(audioPath);
+			const buffer = await loadAudio(audioPath);
 			if (!buffer) continue;
 
 			companionEntries.push({
@@ -133,13 +159,10 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 		if (this.cancelled) throw new Error("Export cancelled");
 
 		// Decode audio region overlay files
-		const regionEntries: Array<{ buffer: AudioBuffer; region: AudioRegion }> = [];
-		const regionBuffers = new Map<string, AudioBuffer | null>();
-		if (mainBuffer) regionBuffers.set(videoUrl, mainBuffer);
+		const regionEntries: Array<{ buffer: OfflineAudioInput; region: AudioRegion }> = [];
 		for (const region of audioRegions) {
 			if (this.cancelled) throw new Error("Export cancelled");
-			if (!regionBuffers.has(region.audioPath)) regionBuffers.set(region.audioPath, await this.decodeAudioFromUrl(region.audioPath));
-			const buffer = regionBuffers.get(region.audioPath);
+			const buffer = await loadAudio(region.audioPath);
 			if (buffer) regionEntries.push({ buffer, region });
 		}
 
@@ -291,16 +314,21 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 
 	// Render timeline to a WAV blob for the native/FFmpeg export path.
 	// Processes in chunks to avoid holding the entire output in memory.
-	protected async renderToWavBlobChunked(prepared: PreparedOfflineRender): Promise<Blob> {
+	protected async renderToWavBlobChunked(
+		prepared: PreparedOfflineRender,
+		writeChunk?: (data: ArrayBuffer) => Promise<void>,
+	): Promise<Blob> {
 		const totalOutputSec = Math.max(prepared.outputDurationMs / 1000, 0.01);
 		const totalFrames = Math.ceil(totalOutputSec * OFFLINE_AUDIO_SAMPLE_RATE);
 		const numChannels = prepared.numChannels;
 
 		const header = this.createWavHeader(OFFLINE_AUDIO_SAMPLE_RATE, numChannels, totalFrames);
-		const pcmParts: ArrayBuffer[] = [header];
+		const pcmParts: ArrayBuffer[] = [];
+		const append = writeChunk ?? (async (data: ArrayBuffer) => { pcmParts.push(data); });
+		await append(header);
 
 		await this.renderChunked(prepared, totalOutputSec, async (rendered) => {
-			pcmParts.push(...this.audioBufferToPcmParts(rendered));
+			for (const part of this.audioBufferToPcmParts(rendered)) await append(part);
 		});
 		if (this.cancelled) throw new Error("Export cancelled");
 
@@ -334,7 +362,7 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 
 			// Schedule main audio
 			if (prepared.mainBufferEntry) {
-				this.scheduleBufferThroughTimeline(
+				await this.scheduleBufferThroughTimeline(
 					offlineCtx,
 					prepared.mainBufferEntry.buffer,
 					slices,
@@ -348,7 +376,7 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 
 			// Schedule companion/sidecar audio
 			for (const entry of prepared.companionEntries) {
-				this.scheduleBufferThroughTimeline(
+				await this.scheduleBufferThroughTimeline(
 					offlineCtx,
 					entry.buffer,
 					slices,
@@ -363,7 +391,7 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 
 			// Schedule audio region overlays
 			for (const { buffer, region } of prepared.regionEntries) {
-				this.scheduleRegionForChunk(
+				await this.scheduleRegionForChunk(
 					offlineCtx,
 					buffer,
 					region,
@@ -386,15 +414,15 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 	}
 
 	// Schedule an audio region overlay clipped to a specific chunk window.
-	protected scheduleRegionForChunk(
+	protected async scheduleRegionForChunk(
 		ctx: OfflineAudioContext,
-		buffer: AudioBuffer,
+		buffer: OfflineAudioInput,
 		region: AudioRegion,
 		slices: TimelineSlice[],
 		chunkOutputStartSec: number,
 		chunkDurationSec: number,
 		usesClipTimeline = false,
-	): void {
+	): Promise<void> {
 		const outputStartMs = usesClipTimeline
 			? region.startMs
 			: this.sourceTimeToOutputTime(region.startMs, slices);
@@ -428,10 +456,13 @@ export class OfflineAudioProcessor extends AudioMediaProcessor {
 		gainNode.connect(ctx.destination);
 
 		const source = ctx.createBufferSource();
-		source.buffer = buffer;
+		const window = "readWindow" in buffer
+			? await buffer.readWindow(ctx, bufferOffsetSec, duration)
+			: { buffer, offsetSec: bufferOffsetSec };
+		source.buffer = window.buffer;
 		source.playbackRate.value = rate;
 		source.connect(gainNode);
-		source.start(localStartSec, bufferOffsetSec, duration);
+		source.start(localStartSec, window.offsetSec, duration);
 	}
 
 	// Feed a rendered AudioBuffer chunk to an AudioEncoder with a timestamp offset.

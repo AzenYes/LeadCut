@@ -173,6 +173,43 @@ interface LayoutResult {
 	cropBounds: { startX: number; endX: number; startY: number; endY: number };
 }
 
+const previewMaskShapes = new WeakMap<Graphics, {
+	width: number;
+	height: number;
+	borderRadius: number;
+	rounded: boolean;
+	scale: number;
+}>();
+
+function updatePreviewMask(
+	graphics: Graphics,
+	layout: PaddedLayoutResult,
+	width: number,
+	height: number,
+	borderRadius: number,
+) {
+	const radius = scalePreviewBorderRadius(layout.croppedDisplayWidth, layout.croppedDisplayHeight, borderRadius);
+	const rounded = radius > 0.5;
+	const shape = previewMaskShapes.get(graphics);
+	if (shape && shape.width === width && shape.height === height && shape.borderRadius === borderRadius &&
+		shape.rounded === rounded && shape.scale > 0 && layout.scale > 0) {
+		graphics.scale.set(layout.scale / shape.scale);
+	} else {
+		graphics.clear();
+		drawSquircleOnGraphics(graphics, {
+			x: 0,
+			y: 0,
+			width: layout.croppedDisplayWidth,
+			height: layout.croppedDisplayHeight,
+			radius,
+		});
+		graphics.fill({ color: 0xffffff });
+		previewMaskShapes.set(graphics, { width, height, borderRadius, rounded, scale: layout.scale });
+		graphics.scale.set(1);
+	}
+	graphics.position.set(layout.centerOffsetX, layout.centerOffsetY);
+}
+
 export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
 	const {
 		container,
@@ -201,9 +238,16 @@ export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
 		return null;
 	}
 
-	app.renderer.resize(width, height);
-	app.canvas.style.width = "100%";
-	app.canvas.style.height = "100%";
+	const { canvas, renderer } = app;
+	const resolution = renderer.resolution;
+	if (
+		canvas.width !== Math.round(width * resolution) ||
+		canvas.height !== Math.round(height * resolution)
+	) {
+		renderer.resize(width, height);
+	}
+	canvas.style.width = "100%";
+	canvas.style.height = "100%";
 
 	const crop = cropRegion || { x: 0, y: 0, width: 1, height: 1 };
 	const layout = computePaddedLayout({
@@ -219,23 +263,14 @@ export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
 	videoSprite.scale.set(layout.scale);
 	videoSprite.position.set(layout.spriteX, layout.spriteY);
 
-	maskGraphics.clear();
-	drawSquircleOnGraphics(maskGraphics, {
-		x: layout.centerOffsetX,
-		y: layout.centerOffsetY,
-		width: layout.croppedDisplayWidth,
-		height: layout.croppedDisplayHeight,
-		radius: scalePreviewBorderRadius(
-			layout.croppedDisplayWidth,
-			layout.croppedDisplayHeight,
-			borderRadius,
-		),
-	});
-	maskGraphics.fill({ color: 0xffffff });
+	const cropWidth = videoWidth * crop.width;
+	const cropHeight = videoHeight * crop.height;
+	// Padding changes the displayed size and position without changing the mask's shape.
+	updatePreviewMask(maskGraphics, layout, cropWidth, cropHeight, borderRadius);
 
 	return {
 		stageSize: { width, height },
-		videoSize: { width: videoWidth * crop.width, height: videoHeight * crop.height },
+		videoSize: { width: cropWidth, height: cropHeight },
 		baseScale: layout.scale,
 		baseOffset: { x: layout.spriteX, y: layout.spriteY },
 		maskRect: {
@@ -247,9 +282,9 @@ export function layoutVideoContent(params: LayoutParams): LayoutResult | null {
 		},
 		cropBounds: {
 			startX: layout.cropStartX,
-			endX: layout.cropStartX + videoWidth * crop.width,
+			endX: layout.cropStartX + cropWidth,
 			startY: layout.cropStartY,
-			endY: layout.cropStartY + videoHeight * crop.height,
+			endY: layout.cropStartY + cropHeight,
 		},
 	};
 }

@@ -4,12 +4,14 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Slider } from "@/components/ui/slider";
 import { useI18n } from "@/contexts/I18nContext";
 import { useUiText } from "@/i18n/useUiText";
+import { useLayoutEffect, useRef } from "react";
 import type { useEditorPlaybackControls } from "../hooks/useEditorPlaybackControls";
 import { formatTimelineTimecode } from "../timeline/core/time";
 import { REVIEW_RATES } from "../videoPlayback/playbackStepping";
+import type { PlaybackClock } from "../videoPlayback/playbackClock";
 
 type Props = {
-	currentTime: number;
+	playbackClock: PlaybackClock;
 	duration: number;
 	isPlaying: boolean;
 	playback: ReturnType<typeof useEditorPlaybackControls>;
@@ -18,9 +20,17 @@ type Props = {
 	detached?: boolean;
 };
 
-export function PreviewTransportBar({ currentTime, duration, isPlaying, playback, volume, setVolume, detached }: Props) {
+export function PreviewTransportBar({ playbackClock, duration, isPlaying, playback, volume, setVolume, detached }: Props) {
 	const { t } = useI18n();
 	const text = useUiText();
+	const timecodeRef = useRef<HTMLSpanElement>(null);
+	useLayoutEffect(() => {
+		const node = timecodeRef.current;
+		if (!node) return;
+		const update = () => { node.textContent = formatTimelineTimecode(playbackClock.getTime() * 1000); };
+		update();
+		return playbackClock.subscribe(update);
+	}, [playbackClock]);
 	const active = Boolean(isPlaying || playback.reverseRate);
 	const playLabel = text(active ? "pause" : "play");
 	const volumeLabel = t("editor.playback.volume", "Preview volume");
@@ -29,9 +39,7 @@ export function PreviewTransportBar({ currentTime, duration, isPlaying, playback
 		<>
 			<div className="editor-playback-center z-10 flex flex-col items-center justify-center gap-1.5">
 				<div className="pointer-events-auto flex items-center justify-center gap-1.5">
-					<span data-testid="preview-current-time" className="mr-1 inline-block w-[12ch] shrink-0 text-right font-mono text-[10px] font-medium text-muted-foreground">
-						{formatTimelineTimecode(currentTime * 1000)}
-					</span>
+					<span ref={timecodeRef} data-testid="preview-current-time" className="mr-1 inline-block w-[12ch] shrink-0 text-right font-mono text-[10px] font-medium text-muted-foreground" />
 					<Button variant="ghost" size="icon" className="size-9" title={t("editor.playback.skipBack")} onClick={playback.handlePreviewSkipBack}>
 						<SkipBack className="size-3.5" weight="fill" />
 					</Button>

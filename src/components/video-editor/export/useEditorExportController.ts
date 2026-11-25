@@ -1,5 +1,4 @@
 import type { RefObject } from "react";
-import type { useI18n } from "@/contexts/I18nContext";
 import type { useVideoEditorAudio } from "../audio/useVideoEditorAudio";
 import type { getSmokeExportConfig } from "../smokeExportConfig";
 import type { useAppearanceState } from "../state/useAppearanceState";
@@ -8,16 +7,13 @@ import type { CursorTelemetryPoint, SpeedRegion, ZoomRegion } from "../types";
 import type { VideoPlaybackRef } from "../VideoPlayback";
 import { useExportDialogActions } from "./useExportDialogActions";
 import type { useExportDimensions } from "./useExportDimensions";
-import { useExportMessages } from "./useExportMessages";
 import { useExportPreflight } from "./useExportPreflight";
 import { useExportRunner } from "./useExportRunner";
 import type { useExportSession } from "./useExportSession";
 import type { useExportSettings } from "./useExportSettings";
-import { useExportStatusViewModel } from "./useExportStatusViewModel";
 import { useSmokeExportAutomation } from "./useSmokeExportAutomation";
 
 type Input = {
-	t: ReturnType<typeof useI18n>["t"];
 	projectDisplayName: string;
 	videoPath: string | null;
 	videoSourcePath: string | null;
@@ -100,15 +96,5 @@ export function useEditorExportController(input: Input) {
 		videoSourcePath: input.videoSourcePath,
 		handleExport: runner.handleExport,
 	});
-	const status = useExportStatusViewModel({
-		t: input.t,
-		session: input.session,
-		settings: input.settings,
-	});
-	const exportMessage = useExportMessages({
-		t: input.t,
-		active: status.isLightningExportInProgress,
-	});
-
-	return { dialogActions, preflight, status, exportMessage };
+	return { dialogActions, preflight };
 }

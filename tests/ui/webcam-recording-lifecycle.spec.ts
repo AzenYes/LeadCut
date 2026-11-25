@@ -6,8 +6,11 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 		page,
 	}) => {
 		await installDesktopBridge(page);
-		await installDesktopBridgeOverrides(page, () => {
+		await installDesktopBridgeOverrides(page, (mode) => {
 			const success = async () => ({ success: true });
+			const cameraSaved = new Promise<void>(resolve => {
+				window.addEventListener("test-release-camera-file", () => resolve(), { once: true });
+			});
 			Object.assign(window.electronAPI, {
 				getPlatform: async () => "win32",
 				getCountdownDelay: async () => ({ success: true, delay: 0 }),
@@ -28,19 +31,21 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 					return { success: true, path: "/recordings/screen.mp4" };
 				},
 				muxNativeWindowsRecording: success,
-				switchToEditor: success,
+				switchToEditor: async () => {
+					document.documentElement.dataset.editorOpened = "true";
+					return { success: true };
+				},
 				hudOverlayClose: success,
 				writeWebcamChunk: async (_name: string, data: ArrayBuffer) => {
 					const root = document.documentElement;
 					root.dataset.webcamSavedBytes = String(Number(root.dataset.webcamSavedBytes ?? 0) + data.byteLength);
 				},
 				finishWebcamFile: async (name: string) => {
-					await new Promise((resolve) => setTimeout(resolve, 200));
+					if (mode === "normal stop") await cameraSaved;
 					return `/recordings/${name}`;
 				},
-				setCurrentRecordingSession: async (session: { webcamPath?: string | null }) => {
-					document.documentElement.dataset.sessionWebcam =
-						session.webcamPath ?? "missing";
+				setCurrentRecordingSession: async (session: { webcamPath?: string | null }, options?: { background?: string }) => {
+					if (options?.background === "camera") document.documentElement.dataset.sessionWebcam = session.webcamPath ?? "missing";
 					return { success: true };
 				},
 			});
@@ -81,7 +86,7 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 					);
 				}
 			};
-		});
+		}, interruption);
 		await page.goto("/?windowType=hud-overlay");
 		await expect(page.locator("html")).toHaveAttribute("data-camera-requests", "1");
 		await page.getByRole("button", { name: "Record", exact: true }).click();
@@ -114,6 +119,11 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 			await page.getByRole("button", { name: "Stop", exact: true }).click();
 		}
 		await expect(page.locator("html")).toHaveAttribute("data-native-stopped", "true");
+		await expect(page.locator("html")).toHaveAttribute("data-editor-opened", "true");
+		if (interruption === "normal stop") {
+			await expect(page.locator("html")).not.toHaveAttribute("data-session-webcam");
+			await page.evaluate(() => window.dispatchEvent(new Event("test-release-camera-file")));
+		}
 		await expect
 			.poll(() => page.locator("html").getAttribute("data-session-webcam"))
 			.toMatch(/-webcam\.(mp4|webm)$/);

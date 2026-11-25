@@ -11,6 +11,34 @@
       document.documentElement.dataset.windowType =
         new URLSearchParams(location.search).get("windowType") || "";
       if (document.documentElement.dataset.windowType === "editor") {
+        if (new URLSearchParams(location.search).get("startupPreview") === "1" && window.electronAPI?.loadCurrentProjectFile) {
+          const api = window.electronAPI;
+          const request = api.loadCurrentProjectFile();
+          const startup = { request };
+          window.leadcutStartupPreview = startup;
+          void request.then(async result => {
+            const source = result.project?.videoPath;
+            if (!result.success || !result.startupOpen || typeof source !== "string" || !/^(?:[A-Z]:[\\/]|\\\\)/i.test(source)) return;
+            const media = await api.getLocalMediaUrl(source);
+            if (!media.success || !media.url) return;
+            const video = document.createElement("video");
+            video.style.cssText = "position:absolute;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none";
+            video.crossOrigin = "anonymous";
+            video.preload = "auto";
+            video.playsInline = true;
+            video.muted = true;
+            video.src = media.url;
+            document.body?.append(video);
+            performance.mark("leadcut-early-video-load");
+            startup.video = video;
+            startup.expiry = window.setTimeout(() => {
+              delete startup.video;
+              video.removeAttribute("src");
+              video.load();
+              video.remove();
+            }, 6000);
+          }).catch(() => undefined);
+        }
         let preference = "system";
         try {
           preference = window.electronAPI?.getAppSetting("leadcut.theme") ||

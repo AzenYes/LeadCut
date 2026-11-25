@@ -8,7 +8,7 @@ import { installDesktopBridge, installDesktopBridgeOverrides } from "./bridge";
 test("editor opens, plays and seeks video from the separate local media server", async ({ page }, testInfo) => {
 	const fixture = fs.realpathSync(path.resolve("tests/ui/fixtures/filmstrip.mp4"));
 	approvedLocalReadPaths.add(fixture);
-	const mediaUrl = buildMediaUrl(await ensureMediaServer(), fixture);
+	const mediaUrl = buildMediaUrl(await ensureMediaServer(testInfo.project.use.baseURL), fixture);
 	const errors: string[] = [];
 	page.on("pageerror", error => errors.push(error.message));
 	page.on("console", message => {

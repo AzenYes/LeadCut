@@ -60,3 +60,25 @@ describe("modern export audio cancellation", () => {
 		expect(mux).not.toHaveBeenCalled();
 	});
 });
+
+it("wakes a full Breeze encoder queue when the export is cancelled", async () => {
+	const exporter = new ModernVideoExporter({
+		videoUrl: "file:///source.mp4",
+		width: 3840, height: 2160, frameRate: 60, bitrate: 10_000_000,
+		wallpaper: "#000000", zoomRegions: [], showShadow: false, shadowIntensity: 0,
+		backgroundBlur: 0, cropRegion: { x: 0, y: 0, width: 1, height: 1 },
+	});
+	const encoder = { encodeQueueSize: 8, close: vi.fn(), encode: vi.fn() };
+	const access = exporter as unknown as {
+		nativeH264Encoder: typeof encoder;
+		nativeExportSessionId: string;
+		encodeRenderedFrameNative(timestamp: number, frameDuration: number, frameIndex: number): Promise<void>;
+	};
+	access.nativeH264Encoder = encoder;
+	access.nativeExportSessionId = "test-session";
+	const pending = access.encodeRenderedFrameNative(0, 16667, 0);
+	exporter.cancel();
+	await expect(pending).resolves.toBeUndefined();
+	expect(encoder.close).toHaveBeenCalledOnce();
+	expect(encoder.encode).not.toHaveBeenCalled();
+}, 1000);

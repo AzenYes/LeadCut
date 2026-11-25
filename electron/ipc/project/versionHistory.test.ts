@@ -83,15 +83,15 @@ it("rejects foreign paths and stale revisions without changing the project", asy
 	expect(await listProjectVersions(projectPath)).toHaveLength(1);
 });
 
-it("prunes only copies beyond both the age and count limits", async () => {
+it("caps retained copies even when they are recent", async () => {
 	const now = Date.now();
 	for (const age of [0, 1, 5, 31, 40, 50]) {
 		await fixture(".leadcut-history", `Example.leadcut.${now - age * DAY}-before-restore.leadcut`, 1_000 + age);
 	}
 	await expect(pruneProjectVersions(projectPath, { keepLast: 4, maxAgeDays: 30 })).resolves.toBe(2);
 	expect((await listProjectVersions(projectPath)).map(version => version.durationMs)).toEqual([1000, 1001, 1005, 1031]);
-	await expect(pruneProjectVersions(projectPath, { keepLast: 1, maxAgeDays: 30 })).resolves.toBe(1);
-	expect(await listProjectVersions(projectPath)).toHaveLength(3);
+	await expect(pruneProjectVersions(projectPath, { keepLast: 1, maxAgeDays: 30 })).resolves.toBe(3);
+	expect(await listProjectVersions(projectPath)).toHaveLength(1);
 });
 
 it("takes the first application snapshot and waits ten minutes for the next", async () => {
@@ -124,7 +124,7 @@ it("moves only associated copies on rename and deletes the chosen version by its
 	expect(versions.map(version => version.id)).toEqual([
 		"Renamed.leadcut.1700000000200-app.leadcut", "Renamed.recordly.1700000000000-agent.recordly",
 	]);
-	await deleteProjectVersion(renamed, versions[0].path);
+	await deleteProjectVersion(renamed, versions[0].path, fs.unlink);
 	expect(await listProjectVersions(renamed)).toEqual([versions[1]]);
 	await expect(fs.readFile(unrelated, "utf8")).resolves.toBe(project(12_000));
 });

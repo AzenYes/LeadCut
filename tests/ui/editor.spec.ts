@@ -35,7 +35,7 @@ test("editor loads video, switches tools and edits export options", async ({ pag
 	await page.getByRole("radio", { name: "Cursor", exact: true }).click();
 	await page.getByRole("radio", { name: "Webcam", exact: true }).click();
 	await page.getByRole("radio", { name: "Captions", exact: true }).click();
-	await page.getByRole("radio", { name: "Settings", exact: true }).click();
+	await page.getByRole("button", { name: "Application settings", exact: true }).click();
 	await expect(page.getByText("Appearance", { exact: true })).toBeVisible();
 	await page.getByRole("row", { name: "Dark", exact: true }).click();
 	await expect(page.locator("html")).toHaveClass(/dark/);
@@ -46,6 +46,8 @@ test("editor loads video, switches tools and edits export options", async ({ pag
 	});
 	await page.getByRole("row", { name: "Light", exact: true }).click();
 	await expect(page.locator("html")).not.toHaveClass(/dark/);
+	await page.getByRole("dialog", { name: "Application settings", exact: true })
+		.getByRole("button", { name: "Close", exact: true }).click();
 	await page.getByRole("radio", { name: "Scene", exact: true }).click();
 	await page.getByRole("button", { name: "Export video", exact: true }).click();
 	await expect(page.getByRole("grid", { name: "Format", exact: true })).toBeVisible();

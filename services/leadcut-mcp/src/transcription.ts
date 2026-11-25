@@ -8,9 +8,10 @@ import { z } from "zod";
 import { mutate, readProjectSnapshot, reply } from "./mutation.js";
 import { TIMELINE_MODEL } from "./sequence.js";
 import { normalizeTranscript, parseExternalTranscript } from "./transcriptModel.js";
+import { transcribeWithWhisper } from "./whisperTranscription.js";
 
 const run = promisify(execFile);
-const engineArg = z.enum(["faster-whisper", "qwen3-asr"]);
+const engineArg = z.enum(["whisper.cpp", "faster-whisper", "qwen3-asr"]);
 const time = z.number().int().finite().nonnegative();
 const projectArg = z.string().min(1);
 
@@ -35,7 +36,7 @@ function qwenLanguage(language: string) {
 
 export function registerTranscriptionTools(server: McpServer) {
 	server.tool("transcribe_audio",
-		"Run local word-timestamp ASR using preinstalled weights. Uses LEADCUT_ASR_ENGINE or faster-whisper by default. Output is source video seconds with microphone delay applied once.",
+		"Run local ASR using downloaded weights. Installed LeadCut uses its bundled whisper.cpp by default. The microphone delay is applied once.",
 		{
 			audioPath: z.string().min(1),
 			modelPath: z.string().min(1).optional().describe("Required local model directory for faster-whisper. Qwen can use its configured model."),
@@ -44,21 +45,26 @@ export function registerTranscriptionTools(server: McpServer) {
 			device: z.enum(["cpu", "cuda", "auto"]).default("auto"),
 			startDelayMs: z.number().finite().optional(),
 			engine: engineArg.optional(),
-		}, async ({ audioPath, modelPath, outputPath, language, device, startDelayMs, engine }) => {
-			const selected = engineArg.parse(engine ?? process.env.LEADCUT_ASR_ENGINE ?? "faster-whisper");
+		}, async ({ audioPath, modelPath, outputPath, language, device, startDelayMs, engine }, extra) => {
+			const selected = engineArg.parse(engine ?? process.env.LEADCUT_ASR_ENGINE ??
+				(process.env.WHISPER_CPP_PATH ? "whisper.cpp" : "faster-whisper"));
+			const delay = await audioStartDelay(audioPath, startDelayMs);
+			if (selected === "whisper.cpp") {
+				const result = await transcribeWithWhisper({ audioPath, modelPath, outputPath, language: language ?? "zh", delayMs: delay, signal: extra.signal });
+				return reply({ ...result, engine: selected, startDelayMs: delay, timeBasis: "source milliseconds; delay already included" });
+			}
 			const qwen = selected === "qwen3-asr";
 			const script = qwen ? process.env.LEADCUT_ASR_SCRIPT : fileURLToPath(new URL("../scripts/transcribe.py", import.meta.url));
 			const python = qwen ? process.env.LEADCUT_ASR_PYTHON : process.env.PYTHON_PATH ?? "python";
 			if (!script || !python) throw new Error("Configure LEADCUT_ASR_SCRIPT and LEADCUT_ASR_PYTHON for qwen3-asr.");
 			if (!qwen && !modelPath) throw new Error("Supply modelPath for faster-whisper.");
-			const delay = await audioStartDelay(audioPath, startDelayMs);
 			const locale = qwen ? qwenLanguage(language ?? "Chinese") : language ?? "zh";
 			const { stdout } = await run(python, [
 				"-X", "utf8", path.resolve(script), "--audio", path.resolve(audioPath),
 				"--output", path.resolve(outputPath), "--delay-ms", String(delay),
 				"--language", locale, "--device", device,
 				...(modelPath ? ["--model-path", path.resolve(modelPath)] : []),
-			], { windowsHide: true, maxBuffer: 1024 * 1024, timeout: 3600000 });
+			], { windowsHide: true, maxBuffer: 1024 * 1024, timeout: 3600000, signal: extra.signal });
 			return reply({ result: stdout.trim(), engine: selected, startDelayMs: delay, timeBasis: "source video seconds; delay already included" });
 		},
 	);
@@ -70,7 +76,7 @@ export function registerTranscriptionTools(server: McpServer) {
 		}, async ({ project, transcriptPath, dryRun, expectedRevision }) =>
 			mutate(project, dryRun, expectedRevision, async data => {
 				const transcript = parseExternalTranscript(await fs.readFile(path.resolve(transcriptPath), "utf8"));
-				if (!transcript) throw new Error("Invalid or incomplete transcript. Choose completed faster-whisper or Qwen3-ASR JSON.");
+				if (!transcript) throw new Error("Invalid or incomplete transcript. Choose a completed LeadCut, faster-whisper, or Qwen3-ASR transcript.");
 				const words = transcript.segments.reduce((total, segment) => total + segment.words.length, 0);
 				return {
 					project: { ...data, editor: { ...data.editor, transcript } },

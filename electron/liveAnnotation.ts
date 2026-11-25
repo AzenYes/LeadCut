@@ -1,4 +1,5 @@
-import { ipcMain, type BrowserWindow, type WebContents } from "electron";
+import { handleTrustedIpc, onTrustedIpc } from "./trustedIpc";
+import { type BrowserWindow, type WebContents } from "electron";
 import {
 	DEFAULT_LIVE_ANNOTATION_OPTIONS, normalizeLiveAnnotationOptions,
 	type LiveAnnotationCommand, type LiveAnnotationOptions,
@@ -116,12 +117,12 @@ function isSender(window: BrowserWindow | null, contents: WebContents) {
 }
 
 export function registerLiveAnnotationIpc() {
-	ipcMain.handle("get-live-annotation-state", getLiveAnnotationState);
-	ipcMain.handle("toggle-live-annotation", ({ sender }) => {
+	handleTrustedIpc("get-live-annotation-state", getLiveAnnotationState);
+	handleTrustedIpc("toggle-live-annotation", ({ sender }) => {
 		if (!isSender(getHudOverlayWindow(), sender) && !isSender(toolbar, sender)) return getLiveAnnotationState();
 		return toggleLiveAnnotation();
 	});
-	ipcMain.handle("live-annotation-set-tool", ({ sender }, supplied: unknown) => {
+	handleTrustedIpc("live-annotation-set-tool", ({ sender }, supplied: unknown) => {
 		if (!active || !isSender(toolbar, sender)) return false;
 		const next = normalizeLiveAnnotationOptions(supplied);
 		if (!next) return false;
@@ -129,19 +130,19 @@ export function registerLiveAnnotationIpc() {
 		if (canvasReady) send(canvas, "live-annotation-options", options);
 		return true;
 	});
-	ipcMain.handle("live-annotation-command", ({ sender }, command: LiveAnnotationCommand) => {
+	handleTrustedIpc("live-annotation-command", ({ sender }, command: LiveAnnotationCommand) => {
 		if (!active || !isSender(toolbar, sender) || !["undo", "redo", "clear"].includes(command)) return false;
 		send(canvas, "live-annotation-command", command);
 		return true;
 	});
-	ipcMain.handle("live-annotation-text-focus", ({ sender }, focused: unknown) => {
+	handleTrustedIpc("live-annotation-text-focus", ({ sender }, focused: unknown) => {
 		if (!canvas || !active || !isSender(canvas, sender) || typeof focused !== "boolean") return false;
 		canvas.setFocusable(focused);
 		if (focused) canvas.focus();
 		else canvas.blur();
 		return true;
 	});
-	ipcMain.on("live-annotation-canvas-ready", ({ sender }) => {
+	onTrustedIpc("live-annotation-canvas-ready", ({ sender }) => {
 		if (!isSender(canvas, sender)) return;
 		canvasReady = true;
 		send(canvas, "live-annotation-options", options);

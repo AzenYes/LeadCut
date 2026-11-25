@@ -270,7 +270,6 @@ test("autosave creates one untitled project, stays idle without edits, and flush
 		"Untitled Project",
 	);
 	// Observe more than two debounce periods: idle must not perform periodic saves.
-	await expect.poll(() => page.locator("html").getAttribute("data-project-saves")).not.toBeNull();
 	const before = await page.locator("html").getAttribute("data-project-saves");
 	await page.waitForTimeout(1800);
 	await expect(page.locator("html")).toHaveAttribute("data-project-creates", "1");

@@ -44,8 +44,7 @@ export default function VideoEditor() {
 		appPlatform,
 		isPlaying,
 		setIsPlaying,
-		currentTime,
-		setCurrentTime,
+		playbackClock,
 		duration,
 		setDuration,
 		sessionShowCursorOverride,
@@ -137,6 +136,7 @@ export default function VideoEditor() {
 		experimentalNvidiaCudaExport,
 		setExperimentalNvidiaCudaExport,
 	} = useNvidiaCudaExportOptIn({
+		exportMenuOpen: exportSession.showExportDropdown,
 		onEnabled: enableModernExportPipeline,
 	});
 	const hasCaptionsForSidecar = autoCaptionSettings.enabled && autoCaptions.length > 0;
@@ -170,7 +170,6 @@ export default function VideoEditor() {
 		appearance,
 		timeline,
 		videoPlaybackRef,
-		currentTime,
 		effectiveShowCursor,
 	});
 	const handleShowCursorChange = useCallback((nextShowCursor: boolean) => {
@@ -200,10 +199,6 @@ export default function VideoEditor() {
 		};
 	}, []);
 
-	useEffect(() => {
-		void refreshProjectLibrary();
-	}, [refreshProjectLibrary]);
-
 	const exportDimensions = useExportDimensions({
 		videoPlaybackRef,
 		isPreviewReady,
@@ -228,8 +223,7 @@ export default function VideoEditor() {
 		setVideoPath,
 		videoSourcePath,
 		setVideoSourcePath,
-		currentTime,
-		setCurrentTime,
+		setCurrentTime: playbackClock.setTime,
 		setIsPlaying,
 		setActiveEffectSection: ui.setActiveEffectSection,
 		setDuration,
@@ -261,7 +255,6 @@ export default function VideoEditor() {
 		applySessionPresentation,
 		refreshProjectLibrary,
 		captureProjectThumbnail,
-		remountPreview,
 	});
 	const {
 		snapshot: { currentSourcePath },
@@ -282,7 +275,7 @@ export default function VideoEditor() {
 		currentSourcePath,
 		duration,
 		frameRate: mp4FrameRate,
-		currentTime,
+		playbackClock,
 		isPlaying,
 		previewVolume,
 		loading,
@@ -320,7 +313,6 @@ export default function VideoEditor() {
 	const { effectiveSpeedRegions, effectiveZoomRegions } = projection;
 
 	const exportController = useEditorExportController({
-		t,
 		projectDisplayName: projectController.snapshot.projectDisplayName,
 		timelineDuration: projection.timelineDuration,
 		reviewChapters: () => setActiveEffectSection("chapters"),
@@ -372,7 +364,7 @@ export default function VideoEditor() {
 		autoCaptionController,
 		effectiveShowCursor,
 		handleShowCursorChange,
-		currentTime,
+		playbackClock,
 		isPlaying,
 		aspectRatio,
 		setAspectRatio,

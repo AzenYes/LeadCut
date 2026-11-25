@@ -56,7 +56,7 @@ export function useProjectVersionHistory({
 
 	async function preserveCurrentEdits() {
 		if (selected || !hasUnsavedChanges) return;
-		if (!(await saveActions.saveProject(false, { remountPreviewAfterSave: false }))) {
+		if (!(await saveActions.saveProject(false))) {
 			throw new Error(text("versionHistorySaveFailed"));
 		}
 	}

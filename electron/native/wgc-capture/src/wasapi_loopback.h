@@ -21,7 +21,8 @@ public:
     bool start();
     bool pause();
     bool resume();
-    void stop();
+    void stop(uint64_t minimumDurationMs = 0);
+    bool hasFailed() const { return failed_.load(); }
     int64_t firstPacketQpcHns() const { return firstPacketQpcHns_.load(); }
     uint64_t capturedDurationMs() const;
     uint64_t totalDataBytes() const { return totalDataBytes_.load(); }
@@ -48,6 +49,7 @@ private:
     std::string outputPath_;
     std::thread thread_;
     std::atomic<bool> capturing_{false};
+    std::atomic<bool> failed_{false};
     std::atomic<bool> paused_{false};
     HANDLE outputFile_ = INVALID_HANDLE_VALUE;
     std::atomic<uint64_t> totalDataBytes_{0};

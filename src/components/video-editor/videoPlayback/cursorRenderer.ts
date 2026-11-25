@@ -153,6 +153,7 @@ export const DEFAULT_CURSOR_CONFIG: CursorRenderConfig = {
 	style: DEFAULT_CURSOR_STYLE,
 };
 let cursorAssetsPromise: Promise<void> | null = null;
+const cursorStylePromises = new Map<CursorStyle, Promise<void>>();
 let cursorPackAssetsPromise: Promise<void> | null = null;
 let loadedCursorPackSourcesSignature = "";
 let loadedCursorAssets: Partial<Record<CursorAssetKey, LoadedCursorAsset>> = {};
@@ -553,83 +554,63 @@ async function ensureCursorPackAssetsLoaded() {
 	await cursorPackAssetsPromise;
 }
 
-export async function preloadCursorAssets() {
+async function loadCursorSet(style: keyof typeof cursorSetAssets) {
+	const entries = await Promise.all(SUPPORTED_CURSOR_KEYS.map(async key => {
+		const sourceAsset = cursorSetAssets[style][key];
+		if (!sourceAsset?.url) {
+			console.warn(`[CursorRenderer] No cursor image for: ${style}/${key}`);
+			return null;
+		}
+		try {
+			const asset = await createRasterizedCursorAsset(sourceAsset.url, sourceAsset.fallbackAnchor, {
+				preserveCanvas: sourceAsset.preserveCanvas,
+			});
+			return [key, asset] as const;
+		} catch (error) {
+			console.warn(`[CursorRenderer] Failed to load cursor image for: ${style}/${key}`, error);
+			return null;
+		}
+	}));
+	return Object.fromEntries(entries.filter(entry => entry !== null)) as Partial<Record<CursorAssetKey, LoadedCursorAsset>>;
+}
+
+export async function preloadCursorAssets(style: CursorStyle = DEFAULT_CURSOR_STYLE) {
 	if (!cursorAssetsPromise) {
 		cursorAssetsPromise = (async () => {
-			async function loadCursorSet(
-				style: keyof typeof cursorSetAssets,
-			): Promise<Partial<Record<CursorAssetKey, LoadedCursorAsset>>> {
-				const entries = await Promise.all(
-					SUPPORTED_CURSOR_KEYS.map(async (key) => {
-						const sourceAsset = cursorSetAssets[style][key];
-						if (!sourceAsset?.url) {
-							console.warn(`[CursorRenderer] No cursor image for: ${style}/${key}`);
-							return null;
-						}
-
-						try {
-							const asset = await createRasterizedCursorAsset(
-								sourceAsset.url,
-								sourceAsset.fallbackAnchor,
-								{ preserveCanvas: sourceAsset.preserveCanvas },
-							);
-
-							return [key, asset] as const;
-						} catch (error) {
-							console.warn(
-								`[CursorRenderer] Failed to load cursor image for: ${style}/${key}`,
-								error,
-							);
-							return null;
-						}
-					}),
-				);
-
-				return Object.fromEntries(
-					entries.filter(Boolean).map((entry) => entry!),
-				) as Partial<Record<CursorAssetKey, LoadedCursorAsset>>;
-			}
-
-			const [macosAssets, tahoeAssets, windows11Assets] = await Promise.all([
-				loadCursorSet("macos"),
-				loadCursorSet("tahoe"),
-				loadCursorSet("windows11"),
-			]);
-
-			const invertedEntries = await Promise.all(
-				(Object.entries(tahoeAssets) as Array<[CursorAssetKey, LoadedCursorAsset]>).map(
-					async ([key, asset]) => [key, await createInvertedCursorAsset(asset)] as const,
-				),
-			);
-
-			loadedCursorSetAssets = {
-				macos: macosAssets,
-				tahoe: tahoeAssets,
-				windows11: windows11Assets,
-				"tahoe-inverted": Object.fromEntries(invertedEntries) as Partial<
-					Record<CursorAssetKey, LoadedCursorAsset>
-				>,
-			};
-			loadedCursorAssets = tahoeAssets;
-
-			const customStyleEntries = await Promise.all(
-				(["dot", "figma"] as const).map(
-					async (style) => [style, await createCursorStyleAsset(style)] as const,
-				),
-			);
-
-			loadedCursorStyleAssets = Object.fromEntries(customStyleEntries) as Partial<
-				Record<SingleCursorStyle, LoadedCursorAsset>
-			>;
-
-			if (!loadedCursorAssets.arrow) {
+			const [tahoeAssets, figma] = await Promise.all([loadCursorSet("tahoe"), createCursorStyleAsset("figma")]);
+			if (!tahoeAssets.arrow) {
 				throw new Error("Failed to initialize the fallback arrow cursor asset");
 			}
-		})();
+			loadedCursorAssets = loadedCursorSetAssets.tahoe = tahoeAssets;
+			loadedCursorStyleAssets.figma = figma;
+		})().catch(error => { cursorAssetsPromise = null; throw error; });
 	}
 
-	await cursorAssetsPromise;
-	await ensureCursorPackAssetsLoaded();
+	if (style === "tahoe" || style === "figma") return cursorAssetsPromise;
+	if (!isStatefulCursorStyle(style) && !isSingleCursorStyle(style)) {
+		await Promise.all([cursorAssetsPromise, ensureCursorPackAssetsLoaded()]);
+		return;
+	}
+	let stylePromise = cursorStylePromises.get(style);
+	if (!stylePromise) {
+		stylePromise = (async () => {
+			if (style === "tahoe-inverted") {
+				await cursorAssetsPromise;
+				const entries = await Promise.all(Object.entries(loadedCursorAssets).map(
+					async ([key, asset]) => [key, await createInvertedCursorAsset(asset)] as const,
+				));
+				loadedCursorSetAssets[style] = Object.fromEntries(entries);
+			} else if (style === "dot") {
+				loadedCursorStyleAssets.dot = await createCursorStyleAsset("dot");
+			} else if (style === "macos" || style === "windows11") {
+				const assets = await loadCursorSet(style);
+				if (!assets.arrow) throw new Error(`Failed to initialize the ${style} arrow cursor asset`);
+				loadedCursorSetAssets[style] = assets;
+			}
+		})().catch(error => { cursorStylePromises.delete(style); throw error; });
+		cursorStylePromises.set(style, stylePromise);
+	}
+	await Promise.all([cursorAssetsPromise, stylePromise]);
 }
 
 function getNativeCursorAtlasAsset(style: CursorStyle, key: CursorAssetKey) {
@@ -651,7 +632,7 @@ export async function buildNativeCursorAtlas(
 		return null;
 	}
 
-	await preloadCursorAssets();
+	await preloadCursorAssets(style);
 
 	const entries: NativeCursorAtlasEntry[] = [];
 	const packedAssets = SUPPORTED_CURSOR_KEYS.map((key, index) => {

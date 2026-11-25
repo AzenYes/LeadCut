@@ -309,7 +309,7 @@ describe("FrameRenderer webcam export path", () => {
 		await renderer.renderFrame(null, 0, 0, 33333, 1500000);
 		expect(camera.visible).toBe(false);
 		expect(updateAnimationState).toHaveBeenCalledWith(1500, 0);
-		expect(syncLayers).toHaveBeenCalledWith(1500, expect.objectContaining({ regions: [] }));
+		expect(syncLayers).toHaveBeenCalledWith(1500, expect.objectContaining({ regions: [] }), expect.any(AbortSignal));
 		expect(app.renderer.render).toHaveBeenCalledWith(app.stage);
 		expect(composite).toHaveBeenCalledWith(false);
 	});

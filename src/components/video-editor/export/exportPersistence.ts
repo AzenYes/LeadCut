@@ -1,4 +1,5 @@
 import { uiText } from "@/i18n/uiText";
+import { isExportStorageFull } from "@/lib/exporter/exportStorageError";
 export interface PendingExportSave {
 	fileName: string;
 	arrayBuffer?: ArrayBuffer;
@@ -93,8 +94,9 @@ export async function saveExportBlob(
 			};
 		}
 	} catch (error) {
-		streamError = error;
 		console.warn("[export] Temp-file blob save failed", error);
+		if (isExportStorageFull(error)) throw new Error(uiText("exportStorageFull"));
+		streamError = error;
 	}
 
 	if (!canUseInMemoryExportSaveFallback({ blobSize: blob.size, extension, hasExportStreamApi })) {

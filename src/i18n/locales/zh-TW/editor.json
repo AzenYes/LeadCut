@@ -266,7 +266,15 @@
     "record": "錄製螢幕，或開啟影片和現有專案。",
     "edit": "剪輯片段，調整縮放與背景，產生或匯入字幕。",
     "save": "儲存可編輯專案，將影片匯出為 MP4 或 GIF。",
-    "start": "開始使用"
+    "start": "開始使用",
+    "stepCount": "第 {{current}} 步，共 {{total}} 步",
+    "splitHint": "將播放頭移到剪輯位置，再把目前片段切成兩段。",
+    "zoomHint": "在播放頭處加入縮放，突顯錄製畫面中需要說明的位置。",
+    "captionsHint": "開啟字幕，從音訊辨識字幕，或匯入 SRT 檔案。",
+    "exportHint": "選擇 MP4 或 GIF，再選擇儲存影片的位置。",
+    "previous": "上一步",
+    "next": "下一步",
+    "skip": "跳過導覽"
   },
   "media": {
     "addingVideo": "正在新增影片…",

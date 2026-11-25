@@ -45,7 +45,7 @@ export function KeyboardShortcutsHelp() {
 
 					<div className="mt-1 space-y-1.5 border-t border-separator pt-1.5">
 						{FIXED_SHORTCUTS.map(shortcut => (
-							<div key={shortcut.label} className="flex items-center justify-between">
+							<div key={shortcut.action} className="flex items-center justify-between">
 								<span className="text-muted-foreground">{shortcut.label}</span>
 								<Kbd>{formatFixedShortcut(shortcut, isMac)}</Kbd>
 							</div>

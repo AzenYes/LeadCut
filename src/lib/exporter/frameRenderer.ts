@@ -72,6 +72,7 @@ import {
 } from "@/lib/mediaTiming";
 import {
 	destroyPixiApplication,
+	getPixiRendererBackend,
 	initializePixiApplicationWithTimeout,
 } from "@/lib/pixiApplicationLifecycle";
 import { isVideoWallpaperSource } from "@/lib/wallpapers";
@@ -163,14 +164,6 @@ type PixiRendererAttempt = {
 const PIXI_RENDERER_INIT_TIMEOUT_MS = 8_000;
 const BACKGROUND_MEDIA_ELEMENT_READY_TIMEOUT_MS = 5_000;
 
-function isCanvasRenderer(renderer: Application): boolean {
-	const rendererName = renderer?.renderer?.constructor?.name?.toLowerCase();
-	return Boolean(
-		rendererName &&
-			(rendererName.includes("canvasrenderer") || rendererName.includes("canvas")),
-	);
-}
-
 function toErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error ?? "Unknown renderer init error");
 }
@@ -229,6 +222,7 @@ function configureHighQuality2DContext(
 // Renders video frames with all effects (background, zoom, crop, blur, shadow) to an offscreen canvas for export.
 
 export class FrameRenderer {
+	private readonly mediaAbort = new AbortController();
 	private videoLayers = new VideoLayerCompositor();
 	private app: Application | null = null;
 	private cameraContainer: Container | null = null;
@@ -340,12 +334,13 @@ export class FrameRenderer {
 					(typeof performance === "undefined" ? Date.now() : performance.now()) -
 						initStarted,
 				);
-				if (isCanvasRenderer(app)) {
+				const initializedBackend = getPixiRendererBackend(app);
+				if (!initializedBackend) {
 					throw new Error(
-						`Renderer initialized with unsupported fallback backend after ${elapsed}ms: ${app.renderer.constructor?.name ?? "unknown"}`,
+						`Renderer initialized with unsupported fallback backend after ${elapsed}ms: ${app.renderer.name || "unknown"}`,
 					);
 				}
-				return { app, backend };
+				return { app, backend: initializedBackend };
 			} catch (error) {
 				const elapsed = Math.round(
 					(typeof performance === "undefined" ? Date.now() : performance.now()) -
@@ -367,16 +362,11 @@ export class FrameRenderer {
 	}
 
 	async initialize(): Promise<void> {
-		let cursorOverlayEnabled = true;
-		try {
-			await preloadCursorAssets();
-		} catch (error) {
-			cursorOverlayEnabled = false;
-			console.warn(
-				"[FrameRenderer] Native cursor assets are unavailable; continuing export without cursor overlay.",
-				error,
-			);
-		}
+		const cursorAssetsReady = this.config.showCursor !== false && this.config.cursorTelemetry?.length
+			? preloadCursorAssets(this.config.cursorStyle).then(() => true, error => {
+				console.warn("[FrameRenderer] Native cursor assets are unavailable; continuing export without cursor overlay.", error);
+				return false;
+			}) : false;
 
 		// Create canvas for rendering
 		const canvas = document.createElement("canvas");
@@ -408,7 +398,7 @@ export class FrameRenderer {
 		this.cameraContainer.addChild(this.cursorContainer);
 		this.videoEffectsContainer.addChild(this.videoContainer);
 
-		if (cursorOverlayEnabled) {
+		if (await cursorAssetsReady) {
 			this.cursorOverlay = new PixiCursorOverlay({
 				dotRadius: DEFAULT_CURSOR_CONFIG.dotRadius * (this.config.cursorSize ?? 1.4),
 				style: this.config.cursorStyle ?? "tahoe",
@@ -536,7 +526,7 @@ export class FrameRenderer {
 				}
 
 				try {
-					const frameSource = new ForwardFrameSource();
+					const frameSource = new ForwardFrameSource(this.mediaAbort.signal);
 					const metadata = await frameSource.initialize(videoSrc);
 					this.backgroundForwardFrameSource = frameSource;
 					this.backgroundForwardFrameSourceUrl = videoSrc;
@@ -552,6 +542,7 @@ export class FrameRenderer {
 					this.backgroundSprite = bgCanvas;
 					return;
 				} catch (error) {
+					this.mediaAbort.signal.throwIfAborted();
 					console.warn(
 						"[FrameRenderer] Decoder-backed video wallpaper unavailable during export; falling back to media element sync:",
 						error,
@@ -737,7 +728,7 @@ export class FrameRenderer {
 			return;
 		}
 
-		const nextSource = new ForwardFrameSource();
+		const nextSource = new ForwardFrameSource(this.mediaAbort.signal);
 		const metadata = await nextSource.initialize(sourceUrl);
 		const previousSource = this.backgroundForwardFrameSource;
 
@@ -770,6 +761,7 @@ export class FrameRenderer {
 				try {
 					await this.restartBackgroundForwardFrameSource();
 				} catch (error) {
+					this.mediaAbort.signal.throwIfAborted();
 					console.warn(
 						"[FrameRenderer] Unable to restart looping video wallpaper decoder during export:",
 						error,
@@ -782,6 +774,7 @@ export class FrameRenderer {
 				decodedFrame =
 					await this.backgroundForwardFrameSource.getFrameAtTime(normalizedTargetTime);
 			} catch (error) {
+				this.mediaAbort.signal.throwIfAborted();
 				console.warn(
 					"[FrameRenderer] Decoder-backed video wallpaper failed during export; falling back to media element sync:",
 					error,
@@ -822,6 +815,7 @@ export class FrameRenderer {
 					}
 					return;
 				} catch (error) {
+					this.mediaAbort.signal.throwIfAborted();
 					console.warn(
 						"[FrameRenderer] Unable to wrap looping video wallpaper at decoded EOF during export:",
 						error,
@@ -1161,7 +1155,7 @@ export class FrameRenderer {
 		this.cleanupWebcamSource = null;
 
 		try {
-			const frameSource = new ForwardFrameSource();
+			const frameSource = new ForwardFrameSource(this.mediaAbort.signal);
 			await frameSource.initialize(webcamUrl);
 			this.webcamForwardFrameSource = frameSource;
 			this.webcamVideoElement = null;
@@ -1171,6 +1165,7 @@ export class FrameRenderer {
 			this.lastSyncedWebcamTime = null;
 			return;
 		} catch (error) {
+			this.mediaAbort.signal.throwIfAborted();
 			console.warn(
 				"[FrameRenderer] Decoder-backed webcam source unavailable during export; falling back to media element sync:",
 				error,
@@ -1407,7 +1402,7 @@ export class FrameRenderer {
 		this.cameraContainer.visible = videoFrame !== null;
 		if (!videoFrame) {
 			this.updateAnimationState(backgroundTimelineTimestamp / 1000, cursorTimestamp / 1000);
-			await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale });
+			await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale }, this.mediaAbort.signal);
 			if (this.backgroundForwardFrameSource || this.backgroundVideoElement) {
 				await this.syncBackgroundFrame(backgroundTimelineTimestamp / 1_000_000);
 			}
@@ -1498,7 +1493,7 @@ export class FrameRenderer {
 		});
 
 		// Render the PixiJS stage to its canvas (video only, transparent background)
-		await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale });
+		await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale }, this.mediaAbort.signal);
 		this.app.renderer.render(this.app.stage);
 
 		// Composite with shadows to final output canvas
@@ -1986,7 +1981,12 @@ export class FrameRenderer {
 		return this.compositeCanvas;
 	}
 
+	cancelPendingMedia(): void {
+		this.mediaAbort.abort();
+	}
+
 	destroy(): void {
+		this.cancelPendingMedia();
 		this.videoLayers.destroy();
 		if (this.videoSprite) {
 			const videoTexture = this.videoSprite.texture;

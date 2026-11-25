@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { chapterSequenceDuration, type ChapterSequence } from "../../../services/leadcut-mcp/src/chapterModel";
+import { agentBackupLinkPath, PROJECT_HISTORY_RETENTION, pruneHistoryFiles } from "../../../services/leadcut-mcp/src/projectHistoryRetention";
 import {
 	hasKnownProjectExtension,
 	LEGACY_PROJECT_FILE_EXTENSIONS,
@@ -15,9 +16,7 @@ export type { ProjectVersionEntry } from "../../../src/types/projectVersion";
 
 type VersionFile = Omit<ProjectVersionEntry, "durationMs" | "sizeBytes">;
 const HISTORY_DIRECTORIES = [".mcp-backups", ".leadcut-history"] as const;
-const DEFAULT_RETENTION = { keepLast: 30, maxAgeDays: 30 };
 const APP_SNAPSHOT_INTERVAL_MS = 10 * 60_000;
-const DAY_MS = 86_400_000;
 
 function filesystemKey(filePath: string) {
 	return process.platform === "win32" ? filePath.toLowerCase() : filePath;
@@ -133,12 +132,11 @@ export async function snapshotProjectVersion(projectPath: string, source: "app" 
 	}
 }
 
-export async function pruneProjectVersions(projectPath: string, options = DEFAULT_RETENTION) {
-	const cutoff = Date.now() - options.maxAgeDays * DAY_MS;
-	const expired = (await listVersionFiles(projectPath)).slice(options.keepLast)
-		.filter(version => version.createdAt < cutoff);
-	for (const version of expired) await fs.rm(version.path, { force: true });
-	return expired.length;
+export async function pruneProjectVersions(
+	projectPath: string,
+	options: Parameters<typeof pruneHistoryFiles>[1] = PROJECT_HISTORY_RETENTION,
+) {
+	return pruneHistoryFiles(await listVersionFiles(projectPath, [HISTORY_DIRECTORIES[1]]), options);
 }
 
 export async function snapshotAppVersionIfDue(projectPath: string) {
@@ -168,20 +166,31 @@ export async function restoreProjectVersion(
 	const content = await fs.readFile(await verifiedVersionPath(projectPath, versionPath), "utf8");
 	const project = parseProject(content);
 	await verifyContents?.(project);
-	return guardedSaveProject({
+	const result = await guardedSaveProject({
 		projectPath,
 		content,
 		expectedRevision,
 		beforeCommit: async () => { await snapshotProjectVersion(projectPath, "before-restore"); },
 	});
+	if (result.success) await pruneProjectVersions(projectPath).catch(error => console.warn("Could not prune project history:", error));
+	return result;
 }
 
 export async function deleteProjectVersion(
 	projectPath: string,
 	versionPath: string,
-	remove: (file: string) => Promise<void> = fs.unlink,
+	remove: (file: string) => Promise<void>,
 ) {
-	await remove(await verifiedVersionPath(projectPath, versionPath));
+	const version = await verifiedVersionPath(projectPath, versionPath);
+	await remove(version);
+	const link = agentBackupLinkPath(version);
+	if (link) {
+		try {
+			if ((await fs.lstat(link)).isFile()) await remove(link);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
 }
 
 export async function projectVersionPaths(projectPath: string) {

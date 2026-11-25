@@ -144,9 +144,14 @@ test("embedded speech waveform is automatic, silence stays flat, and clicking se
 	page,
 }) => {
 	await installDesktopBridge(page, "waveform.mp4");
+	const sidecarRequests: string[] = [];
+	page.on("request", request => {
+		if (/waveform\.(system|mic)\./.test(request.url())) sidecarRequests.push(request.url());
+	});
 	await page.goto("/?windowType=editor");
 	const waveform = page.locator("[data-source-audio-clip]");
 	await expect(waveform).toBeVisible({ timeout: 20000 });
+	expect(sidecarRequests).toEqual([]);
 	await expect.poll(() => inkAt(waveform, 0.1)).toBeGreaterThan(8);
 	await expect.poll(() => inkAt(waveform, 0.25)).toBe(0);
 	await expect.poll(() => waveform.evaluate(element => Math.abs(element.getBoundingClientRect().width - element.parentElement!.getBoundingClientRect().width))).toBeLessThan(1);

@@ -5,6 +5,7 @@ import { normalizeProjectEditor } from "../projectPersistence";
 import type { CursorTelemetryPoint } from "../types";
 
 const ignore = () => undefined;
+const PREVIEW_DURATION_SECONDS = 5;
 /** One muted five-second pass through the saved timeline using the editor renderer. */
 export function ProjectHoverPreview({
 	data,
@@ -51,13 +52,18 @@ export function ProjectHoverPreview({
 	}, [data.project.videoPath]);
 	const updateTime = useCallback(
 		(seconds: number) => {
-			if (seconds >= 5) {
+			if (seconds >= PREVIEW_DURATION_SECONDS) {
 				playback.current?.pause();
 				onFinish();
 			} else setTime(seconds);
 		},
 		[onFinish],
 	);
+	useEffect(() => {
+		if (!playing) return;
+		const timeout = window.setTimeout(onFinish, PREVIEW_DURATION_SECONDS * 1000);
+		return () => window.clearTimeout(timeout);
+	}, [onFinish, playing]);
 	const updatePlaying = useCallback(
 		(value: boolean) => {
 			setPlaying(value);

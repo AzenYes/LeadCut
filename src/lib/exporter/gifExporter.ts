@@ -1,100 +1,41 @@
-import GIF from "gif.js";
-import type {
-	AnnotationRegion,
-	AutoCaptionSettings,
-	CaptionCue,
-	CursorClickEffectStyle,
-	CropRegion,
-	CursorStyle,
-	CursorTelemetryPoint,
-	Padding,
-	SpeedRegion,
-	TrimRegion,
-	WebcamOverlaySettings,
-	ZoomMotionBlurTuning,
-	ZoomRegion,
-	ZoomTransitionEasing,
-} from "@/components/video-editor/types";
-import { FrameRenderer } from "./frameRenderer";
-import { StreamingVideoDecoder } from "./streamingDecoder";
+import { streamExportBlobToTempFile } from "@/components/video-editor/export/exportPersistence";
+import type { AudioRegion, Padding, TrimRegion } from "@/components/video-editor/types";
+import { buildExportFrameRendererConfig, type ExportSceneOptions } from "./exportFrameRendererConfig";
+import { GifFrameSink } from "./gifFrameSink";
+import type { FrameRenderer } from "./modernFrameRenderer";
+import { renderExportFrames } from "./renderExportFrames";
+import { getMinimumMediaTimelineDurationMs, StreamingVideoDecoder } from "./streamingDecoder";
 import type {
 	ExportProgress,
 	ExportResult,
+	ExportRouteChange,
 	GIF_SIZE_PRESETS,
 	GifFrameRate,
 	GifSizePreset,
 } from "./types";
 
-const GIF_WORKER_URL = new URL("gif.js/dist/gif.worker.js", import.meta.url).toString();
+export { getGifRepeat } from "./gifFrameSink";
+export { getGifFrameDelayMs } from "./gifTiming";
 
 const PROGRESS_SAMPLE_WINDOW_MS = 1_000;
+const GIF_FRAME_BUDGET_BYTES = 1024 ** 3;
 
-interface GifExporterConfig {
-	clipRegions?: import("@/components/video-editor/types").ClipRegion[];
+export function getGifFrameLimit(width: number, height: number): number {
+	return Math.floor(GIF_FRAME_BUDGET_BYTES / (width * height * 4));
+}
+
+interface GifExporterConfig extends ExportSceneOptions {
 	videoUrl: string;
-	width: number;
-	height: number;
 	frameRate: GifFrameRate;
 	loop: boolean;
 	sizePreset: GifSizePreset;
-	wallpaper: string;
-	zoomRegions: ZoomRegion[];
 	trimRegions?: TrimRegion[];
-	speedRegions?: SpeedRegion[];
-	showShadow: boolean;
-	shadowIntensity: number;
-	backgroundBlur: number;
-	zoomMotionBlur?: number;
-	zoomMotionBlurTuning?: ZoomMotionBlurTuning;
-	connectZooms?: boolean;
-	zoomInDurationMs?: number;
-	zoomInOverlapMs?: number;
-	zoomOutDurationMs?: number;
-	connectedZoomGapMs?: number;
-	connectedZoomDurationMs?: number;
-	zoomInEasing?: ZoomTransitionEasing;
-	zoomOutEasing?: ZoomTransitionEasing;
-	connectedZoomEasing?: ZoomTransitionEasing;
-	borderRadius?: number;
-	padding?: Padding | number;
 	videoPadding?: Padding | number;
-	cropRegion: CropRegion;
-	webcam?: WebcamOverlaySettings;
-	webcamUrl?: string | null;
-	annotationRegions?: AnnotationRegion[];
-	videoRegions?: import("@/components/video-editor/videoTracks").VideoRegion[];
-	chapterProgress?: import("@/components/video-editor/chapterProgress").ChapterProgress;
-	keystrokes?: import("@/components/video-editor/keystrokes/keystrokeLayout").KeystrokePresentation;
-	videoTracks?: import("@/components/video-editor/videoTracks").VideoTrack[];
-	autoCaptions?: CaptionCue[];
-	autoCaptionSettings?: AutoCaptionSettings;
-	cursorTelemetry?: CursorTelemetryPoint[];
-	showCursor?: boolean;
-	cursorStyle?: CursorStyle;
-	cursorSize?: number;
-	cursorSmoothing?: number;
-	cursorSpringStiffnessMultiplier?: number;
-	cursorSpringDampingMultiplier?: number;
-	cursorSpringMassMultiplier?: number;
-	cameraSpringStiffnessMultiplier?: number;
-	cameraSpringDampingMultiplier?: number;
-	cameraSpringMassMultiplier?: number;
-	zoomSmoothness?: number;
-	zoomClassicMode?: boolean;
-	cursorMotionBlur?: number;
-	cursorClickEffect?: CursorClickEffectStyle;
-	cursorClickEffectColor?: string;
-	cursorClickEffectScale?: number;
-	cursorClickEffectOpacity?: number;
-	cursorClickEffectDurationMs?: number;
-	cursorClickBounce?: number;
-	cursorClickBounceDuration?: number;
-	cursorSway?: number;
-	previewWidth?: number;
-	previewHeight?: number;
+	audioRegions?: AudioRegion[];
 	maxDecodeQueue?: number;
 	maxPendingFrames?: number;
 	onProgress?: (progress: ExportProgress) => void;
+	onRouteChange?: (notice: ExportRouteChange) => void;
 }
 
 /**
@@ -131,81 +72,13 @@ export function calculateOutputDimensions(
 	};
 }
 
-export function getGifRepeat(loop: boolean): 0 | 1 {
-	return loop ? 0 : 1;
-}
-
-export function buildGifFrameRendererConfig(
-	config: GifExporterConfig,
-	videoInfo: { width: number; height: number },
-) {
-	return {
-		width: config.width,
-		timelineEffects: config.clipRegions !== undefined,
-		height: config.height,
-		wallpaper: config.wallpaper,
-		zoomRegions: config.zoomRegions,
-		showShadow: config.showShadow,
-		shadowIntensity: config.shadowIntensity,
-		backgroundBlur: config.backgroundBlur,
-		zoomMotionBlur: config.zoomMotionBlur,
-		zoomMotionBlurTuning: config.zoomMotionBlurTuning,
-		connectZooms: config.connectZooms,
-		zoomInDurationMs: config.zoomInDurationMs,
-		zoomInOverlapMs: config.zoomInOverlapMs,
-		zoomOutDurationMs: config.zoomOutDurationMs,
-		connectedZoomGapMs: config.connectedZoomGapMs,
-		connectedZoomDurationMs: config.connectedZoomDurationMs,
-		zoomInEasing: config.zoomInEasing,
-		zoomOutEasing: config.zoomOutEasing,
-		connectedZoomEasing: config.connectedZoomEasing,
-		borderRadius: config.borderRadius,
-		padding: config.padding,
-		cropRegion: config.cropRegion,
-		webcam: config.webcam,
-		webcamUrl: config.webcamUrl,
-		videoWidth: videoInfo.width,
-		videoHeight: videoInfo.height,
-		annotationRegions: config.annotationRegions,
-		videoRegions: config.videoRegions,
-		chapterProgress: config.chapterProgress,
-		keystrokes: config.keystrokes,
-		videoTracks: config.videoTracks,
-		autoCaptions: config.autoCaptions,
-		autoCaptionSettings: config.autoCaptionSettings,
-		speedRegions: config.speedRegions,
-		previewWidth: config.previewWidth,
-		previewHeight: config.previewHeight,
-		cursorTelemetry: config.cursorTelemetry,
-		showCursor: config.showCursor,
-		cursorStyle: config.cursorStyle,
-		cursorSize: config.cursorSize,
-		cursorSmoothing: config.cursorSmoothing,
-		cursorSpringStiffnessMultiplier: config.cursorSpringStiffnessMultiplier,
-		cursorSpringDampingMultiplier: config.cursorSpringDampingMultiplier,
-		cursorSpringMassMultiplier: config.cursorSpringMassMultiplier,
-		cameraSpringStiffnessMultiplier: config.cameraSpringStiffnessMultiplier,
-		cameraSpringDampingMultiplier: config.cameraSpringDampingMultiplier,
-		cameraSpringMassMultiplier: config.cameraSpringMassMultiplier,
-		zoomSmoothness: config.zoomSmoothness,
-		zoomClassicMode: config.zoomClassicMode,
-		cursorMotionBlur: config.cursorMotionBlur,
-		cursorClickEffect: config.cursorClickEffect,
-		cursorClickEffectColor: config.cursorClickEffectColor,
-		cursorClickEffectScale: config.cursorClickEffectScale,
-		cursorClickEffectOpacity: config.cursorClickEffectOpacity,
-		cursorClickEffectDurationMs: config.cursorClickEffectDurationMs,
-		cursorClickBounce: config.cursorClickBounce,
-		cursorClickBounceDuration: config.cursorClickBounceDuration,
-		cursorSway: config.cursorSway,
-	};
-}
-
 export class GifExporter {
+	private videoExporter: { cancel(): void } | null = null;
+	private gifConversionId: string | null = null;
 	private config: GifExporterConfig;
 	private streamingDecoder: StreamingVideoDecoder | null = null;
 	private renderer: FrameRenderer | null = null;
-	private gif: GIF | null = null;
+	private frameSink: GifFrameSink | null = null;
 	private cancelled = false;
 	private exportStartTimeMs = 0;
 	private progressSampleStartTimeMs = 0;
@@ -220,6 +93,10 @@ export class GifExporter {
 		try {
 			this.cleanup();
 			this.cancelled = false;
+			if (typeof window !== "undefined" && window.electronAPI?.convertExportToGif) {
+				return await this.exportGifOnDisk();
+			}
+
 			this.exportStartTimeMs = this.getNowMs();
 			this.progressSampleStartTimeMs = this.exportStartTimeMs;
 			this.progressSampleStartFrame = 0;
@@ -227,124 +104,78 @@ export class GifExporter {
 
 			// Initialize streaming decoder and load video metadata
 			this.streamingDecoder = new StreamingVideoDecoder({
-				minimumTimelineDurationMs: Math.max(0, ...(this.config.videoRegions ?? []).map((region) => region.endMs)),
+				minimumTimelineDurationMs: getMinimumMediaTimelineDurationMs(this.config.videoRegions, this.config.audioRegions),
 				maxDecodeQueue: this.config.maxDecodeQueue,
 				maxPendingFrames: this.config.maxPendingFrames,
 			});
 			const videoInfo = await this.streamingDecoder.loadMetadata(this.config.videoUrl);
+			if (this.cancelled) return { success: false, error: "Export cancelled" };
 
-			// Initialize frame renderer
-			this.renderer = new FrameRenderer(buildGifFrameRendererConfig(this.config, videoInfo));
-			await this.renderer.initialize();
-
-			// Initialize GIF encoder
-			// Loop: 0 = infinite loop, 1 = play once (no loop)
-			const repeat = getGifRepeat(this.config.loop);
-			const cores = navigator.hardwareConcurrency || 4;
-			const WORKER_COUNT = Math.max(1, Math.min(8, cores - 1));
-
-			this.gif = new GIF({
-				workers: WORKER_COUNT,
-				quality: 10,
-				width: this.config.width,
-				height: this.config.height,
-				workerScript: GIF_WORKER_URL,
-				repeat,
-				background: "#000000",
-				transparent: null,
-				dither: "FloydSteinberg",
-			});
-
-			// Calculate effective duration and frame count (excluding trim regions)
 			const effectiveDuration = this.streamingDecoder.getEffectiveDuration(
 				this.config.trimRegions,
 				this.config.speedRegions,
 				this.config.clipRegions,
 			);
 			const totalFrames = Math.ceil(effectiveDuration * this.config.frameRate);
+			const frameLimit = getGifFrameLimit(this.config.width, this.config.height);
+			const assertFrameBudget = (frameCount: number) => {
+				if (!Number.isFinite(frameCount) || frameCount > frameLimit) {
+					throw new Error("This GIF is too large to export. Shorten it, or lower the resolution or frame rate.");
+				}
+			};
+			assertFrameBudget(totalFrames);
 
-			// Calculate frame delay in milliseconds (gif.js uses ms)
-			const frameDelay = Math.round(1000 / this.config.frameRate);
+			// Initialize frame renderer
+			const { FrameRenderer } = await import("./modernFrameRenderer");
+			if (this.cancelled) return { success: false, error: "Export cancelled" };
+			this.renderer = new FrameRenderer({
+				...buildExportFrameRendererConfig(this.config, videoInfo),
+				// The in-memory encoder immediately reads each rendered frame back to the CPU.
+				preferredRenderBackend: "webgl",
+			});
+			await this.renderer.initialize();
+			if (this.cancelled) return { success: false, error: "Export cancelled" };
 
-			console.log("[GifExporter] Original duration:", videoInfo.duration, "s");
-			console.log("[GifExporter] Effective duration:", effectiveDuration, "s");
-			console.log("[GifExporter] Total frames to export:", totalFrames);
-			console.log("[GifExporter] Frame rate:", this.config.frameRate, "FPS");
-			console.log("[GifExporter] Frame delay:", frameDelay, "ms");
-			console.log("[GifExporter] Loop:", this.config.loop ? "infinite" : "once");
-			console.log("[GifExporter] Using streaming decode (web-demuxer + VideoDecoder)");
-
-			let frameIndex = 0;
-			const frameDurationUs = 1_000_000 / this.config.frameRate;
-
-			// Stream decode and process frames — no seeking!
-			await this.streamingDecoder.decodeAll(
-				this.config.frameRate,
-				this.config.trimRegions,
-				this.config.speedRegions,
-				async (videoFrame, _exportTimestampUs, sourceTimestampMs, cursorTimestampMs) => {
-					if (this.cancelled) {
-						return;
-					}
-
-					const sourceTimestampUs = sourceTimestampMs * 1000;
-					const cursorTimestampUs = cursorTimestampMs * 1000;
-					await this.renderer!.renderFrame(
-						videoFrame,
-						sourceTimestampUs,
-						cursorTimestampUs,
-						frameDurationUs,
-						frameIndex * frameDurationUs,
-					);
-
-					this.addRenderedGifFrame(frameDelay);
-					frameIndex++;
-					this.reportProgress(frameIndex, totalFrames);
-				},
-				this.config.clipRegions,
-			);
-
-			if (this.cancelled) {
-				return { success: false, error: "Export cancelled" };
-			}
-
-			// Update progress to show we're now in the finalizing phase
-			if (this.config.onProgress) {
-				this.config.onProgress({
+			const renderer = this.renderer;
+			const sink = new GifFrameSink({
+				width: this.config.width,
+				height: this.config.height,
+				frameRate: this.config.frameRate,
+				loop: this.config.loop,
+				getCanvas: () => renderer.getCanvas(),
+				checkFrameBudget: assertFrameBudget,
+				onFinalizing: renderProgress => this.config.onProgress?.({
 					currentFrame: totalFrames,
 					totalFrames,
 					percentage: 100,
 					estimatedTimeRemaining: 0,
 					phase: "finalizing",
 					renderFps: this.lastRenderFps,
-				});
-			}
+					renderProgress,
+				}),
+			});
+			this.frameSink = sink;
 
-			// Render the GIF
-			const blob = await new Promise<Blob>((resolve, _reject) => {
-				this.gif!.on("finished", (blob: Blob) => {
-					resolve(blob);
-				});
+			console.log("[GifExporter] Original duration:", videoInfo.duration, "s");
+			console.log("[GifExporter] Effective duration:", effectiveDuration, "s");
+			console.log("[GifExporter] Total frames to export:", totalFrames);
+			console.log("[GifExporter] Frame rate:", this.config.frameRate, "FPS");
+			console.log("[GifExporter] Loop:", this.config.loop ? "infinite" : "once");
+			console.log("[GifExporter] Using streaming decode (web-demuxer + VideoDecoder)");
 
-				// Track rendering progress
-				this.gif!.on("progress", (progress: number) => {
-					if (this.config.onProgress) {
-						this.config.onProgress({
-							currentFrame: totalFrames,
-							totalFrames,
-							percentage: 100,
-							estimatedTimeRemaining: 0,
-							phase: "finalizing",
-							renderFps: this.lastRenderFps,
-							renderProgress: Math.round(progress * 100),
-						});
-					}
-				});
-
-				// gif.js doesn't have a typed 'error' event, but we can catch errors in the try/catch
-				this.gif!.render();
+			const blob = await renderExportFrames({
+				decoder: this.streamingDecoder,
+				renderer,
+				sink,
+				frameRate: this.config.frameRate,
+				trimRegions: this.config.trimRegions,
+				speedRegions: this.config.speedRegions,
+				clipRegions: this.config.clipRegions,
+				isCancelled: () => this.cancelled,
+				onFrameWritten: framesWritten => this.reportProgress(framesWritten, totalFrames),
 			});
 
+			if (!blob) return { success: false, error: "Export cancelled" };
 			return { success: true, blob };
 		} catch (error) {
 			console.error("GIF Export error:", error);
@@ -357,9 +188,49 @@ export class GifExporter {
 		}
 	}
 
-	private addRenderedGifFrame(frameDelay: number) {
-		const canvas = this.renderer!.getCanvas();
-		this.gif!.addFrame(canvas, { delay: frameDelay, copy: true });
+	private async exportGifOnDisk(): Promise<ExportResult> {
+		const bridge = window.electronAPI;
+		const { ModernVideoExporter } = await import("./modernVideoExporter");
+		if (this.cancelled) return { success: false, error: "Export cancelled" };
+		const { width, height, frameRate, loop, onProgress } = this.config;
+		const exporter = new ModernVideoExporter({
+			...this.config,
+			width: Math.ceil(width / 2) * 2,
+			height: Math.ceil(height / 2) * 2,
+			bitrate: Math.min(50_000_000, Math.max(1_000_000, Math.round(width * height * frameRate * 0.32))),
+			encodingMode: "quality",
+			omitAudio: true,
+			// The intermediate encoder reads rendered canvas frames.
+			preferredRenderBackend: "webgl",
+		});
+		this.videoExporter = exporter;
+		let videoPath: string | null = null;
+		try {
+			const video = await exporter.export();
+			if (video.tempFilePath) videoPath = video.tempFilePath;
+			if (this.cancelled) return { success: false, error: "Export cancelled" };
+			if (!video.success) return video;
+			if (!videoPath && video.blob) videoPath = await streamExportBlobToTempFile(video.blob, "mp4");
+			if (!videoPath) throw new Error("Could not prepare the temporary video for GIF export.");
+			if (this.cancelled) return { success: false, error: "Export cancelled" };
+			const totalFrames = video.metrics?.frameCount ?? 0;
+			onProgress?.({ currentFrame: totalFrames, totalFrames, percentage: 100, estimatedTimeRemaining: 0, renderProgress: 0, phase: "finalizing" });
+			if (this.cancelled) return { success: false, error: "Export cancelled" };
+			const runId = crypto.randomUUID();
+			this.gifConversionId = runId;
+			const result = await bridge.convertExportToGif!({
+				runId, videoPath, fps: frameRate, width, height, loop, frameCount: video.metrics?.frameCount,
+			});
+			if (this.cancelled) {
+				if (result.tempPath) await bridge.discardExportedTemp(result.tempPath).catch(() => undefined);
+				return { success: false, error: "Export cancelled" };
+			}
+			return { success: result.success, error: result.error, tempFilePath: result.tempPath };
+		} finally {
+			this.videoExporter = null;
+			this.gifConversionId = null;
+			if (videoPath) await bridge.discardExportedTemp(videoPath).catch(() => undefined);
+		}
 	}
 
 	private reportProgress(currentFrame: number, totalFrames: number) {
@@ -396,13 +267,13 @@ export class GifExporter {
 
 	cancel(): void {
 		this.cancelled = true;
+		this.renderer?.cancelPendingMedia();
+		this.videoExporter?.cancel();
+		if (this.gifConversionId) void window.electronAPI.cancelExportGif?.(this.gifConversionId).catch(() => undefined);
 		if (this.streamingDecoder) {
 			this.streamingDecoder.cancel();
 		}
-		if (this.gif) {
-			this.gif.abort();
-		}
-		this.cleanup();
+		this.frameSink?.abort();
 	}
 
 	private cleanup(): void {
@@ -424,6 +295,7 @@ export class GifExporter {
 			this.renderer = null;
 		}
 
-		this.gif = null;
+		this.frameSink?.abort();
+		this.frameSink = null;
 	}
 }

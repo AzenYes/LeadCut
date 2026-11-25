@@ -199,7 +199,6 @@ describe("resolveBrowserCaptureCursorPolicy", () => {
 	it("preserves the existing hidden-cursor browser policy by default", () => {
 		expect(resolveBrowserCaptureCursorPolicy()).toEqual({
 			streamCursor: "never",
-			hideOsCursorBeforeRecording: true,
 			hideEditorOverlayCursorByDefault: true,
 		});
 	});
@@ -209,7 +208,6 @@ describe("resolveBrowserCaptureCursorPolicy", () => {
 			resolveBrowserCaptureCursorPolicy({ nativeWindowsCaptureStartFailed: true }),
 		).toEqual({
 			streamCursor: "always",
-			hideOsCursorBeforeRecording: false,
 			hideEditorOverlayCursorByDefault: true,
 		});
 	});

@@ -1,14 +1,18 @@
 import { useCallback, useRef, useState } from "react";
 import type { ExportProgress } from "@/lib/exporter";
+import { createObservableValue } from "@/lib/observableValue";
 import { resolveSavingExportProgress } from "../exportProgressState";
 import type { PendingExportSave } from "./exportPersistence";
 import type { ExportPreflightIssue } from "./exportPreflight";
+import type { ExportPreview, PreparedExportPreview } from "./pausedExportPreview";
 
 export type CancelableExporter = { cancel(): void };
 
 export function useExportSession() {
 	const [isExporting, setIsExporting] = useState(false);
-	const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+	const [progress] = useState(() => createObservableValue<ExportProgress | null>(null));
+	const [preview] = useState(() => createObservableValue<ExportPreview | null>(null));
+	const preparedPreviewRef = useRef<Promise<PreparedExportPreview | null> | null>(null);
 	const [exportError, setExportError] = useState<string | null>(null);
 	const [preflightIssues, setPreflightIssues] = useState<ExportPreflightIssue[]>([]);
 	const [showExportDropdown, setShowExportDropdown] = useState(false);
@@ -29,14 +33,16 @@ export function useExportSession() {
 	}, []);
 
 	const markExportAsSaving = useCallback(() => {
-		setExportProgress(resolveSavingExportProgress);
-	}, []);
+		progress.set(resolveSavingExportProgress(progress.get()));
+	}, [progress]);
 
 	return {
 		isExporting,
 		setIsExporting,
-		exportProgress,
-		setExportProgress,
+		progress,
+		preview,
+		preparedPreviewRef,
+		setExportProgress: progress.set,
 		exportError,
 		setExportError,
 		preflightIssues,

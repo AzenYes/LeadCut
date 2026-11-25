@@ -4,12 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import ffmpeg from "ffmpeg-static";
-import { createBrowserRecordingStreamStore } from "./browserStream";
+import { createBrowserRecordingStreamStore, recoverBrowserRecordingPartial } from "./browserStream";
 
 const state = vi.hoisted(() => ({ directory: "" }));
 vi.mock("../../logger", () => ({ appLog: vi.fn() }));
 vi.mock("../../uiI18n", () => ({ uiText: (key: string) => key }));
 vi.mock("../utils", () => ({ getRecordingsDir: async () => state.directory }));
+vi.mock("../project/manager", () => ({ rememberApprovedLocalReadPath: vi.fn() }));
+vi.mock("../project/session", () => ({ persistRecordingSessionManifest: vi.fn() }));
+vi.mock("../state", () => ({ setCurrentRecordingSession: vi.fn() }));
 vi.mock("../ffmpeg/binary", () => ({ getFfmpegBinaryPath: () => ffmpeg }));
 vi.mock("./diagnostics", () => ({ validateRecordedVideo: async (file: string) => fs.stat(file) }));
 vi.mock("./mac", () => ({ finalizeStoredVideo: async (file: string) => ({ success: true, path: file }) }));
@@ -50,3 +53,17 @@ it("preserves a failed remux for recovery and removes a deliberately discarded c
 	await expect(store.finish(1, "recording-3.webm", true)).resolves.toBeNull();
 	await expect(fs.stat(path.join(state.directory, "recording-3.webm.partial"))).rejects.toMatchObject({ code: "ENOENT" });
 });
+
+it("remuxes and links the matching camera partial when recovering a browser recording", async () => {
+	const source = path.resolve("tests/ui/fixtures/waveform.mp4");
+	const pathFor = (name: string) => path.join(state.directory, name);
+	const videoPath = pathFor("recording-4.mp4");
+	const webcamPath = pathFor("recording-4-webcam.mp4");
+	await Promise.all(
+		[videoPath, webcamPath].map(file => fs.copyFile(source, `${file}.partial`)),
+	);
+	await expect(recoverBrowserRecordingPartial(`${videoPath}.partial`)).resolves.toMatchObject({
+		success: true, path: videoPath, webcamPath,
+	});
+	expect(await fs.readdir(state.directory)).toEqual(["recording-4-webcam.mp4", "recording-4.mp4"]);
+}, 10_000);

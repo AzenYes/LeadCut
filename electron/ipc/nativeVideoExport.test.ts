@@ -5,6 +5,7 @@ import {
 	buildNativeConcatArgs,
 	buildNativeCudaOverlayStaticLayoutArgs,
 	buildNativeCudaScaleCpuPadStaticLayoutArgs,
+	buildNativeH264StreamExportArgs,
 	buildNativePrecompositedStaticLayoutArgs,
 	buildNativeStaticBackgroundRenderArgs,
 	buildNativeStaticLayoutChunks,
@@ -12,8 +13,35 @@ import {
 	buildTrimmedSourceAudioFilter,
 	createNativeSquircleMaskPgmBuffer,
 	FFMPEG_BT709_VIDEO_COLOR_ARGS,
+	getNativeH264StreamAudioMuxOptions,
 	isNativeCudaOutOfMemory,
 } from "./nativeVideoExport";
+
+describe("buildNativeH264StreamExportArgs", () => {
+	it("keeps the encoded timing for fragmented MP4 fed through stdin", () => {
+		const mixedAudio = getNativeH264StreamAudioMuxOptions({ durationSec: 5, videoFrameCount: 150 });
+		const args = buildNativeH264StreamExportArgs({ frameRate: 30, outputPath: "output.mp4", mixedAudio, fragmentedMp4: true });
+		expect(args.slice(args.indexOf("-f"), args.indexOf("-f") + 4)).toEqual(["-f", "mp4", "-i", "pipe:0"]);
+		expect(args).not.toContain("-r");
+		expect(args).toContain("pipe:3");
+		expect(args).toContain("-moov_size");
+	});
+	it("opens two pipes and reserves leading MP4 metadata for mixed export", () => {
+		const mixedAudio = getNativeH264StreamAudioMuxOptions({ durationSec: 60, videoFrameCount: 1440 });
+		expect(mixedAudio?.moovReservedBytes).toBeGreaterThan(200_000);
+		const args = buildNativeH264StreamExportArgs({ frameRate: 24, outputPath: "output.mp4", mixedAudio });
+		expect(args.join(" ")).toContain("-f h264 -r 24 -i pipe:0 -thread_queue_size 16 -f wav -i pipe:3");
+		expect(args.join(" ")).toContain("-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac");
+		expect(args.slice(-3)).toEqual(["-moov_size", String(mixedAudio?.moovReservedBytes), "output.mp4"]);
+	});
+
+	it("uses faststart for a video-only final output and skips it for intermediate video", () => {
+		const config = { frameRate: 24, outputPath: "output.mp4" };
+		expect(buildNativeH264StreamExportArgs(config)).toContain("+faststart");
+		expect(buildNativeH264StreamExportArgs({ ...config, videoOnlyIntermediate: true })).not.toContain("+faststart");
+		expect(getNativeH264StreamAudioMuxOptions({ durationSec: Infinity, videoFrameCount: 1000 })).toBeUndefined();
+	});
+});
 
 describe("buildTrimmedSourceAudioFilter", () => {
 	it("concatenates trimmed source segments into a single output label", () => {

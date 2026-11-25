@@ -266,7 +266,15 @@
     "record": "录制屏幕，或打开视频和已有工程。",
     "edit": "剪辑片段，调整缩放与背景，生成或导入字幕。",
     "save": "保存可编辑工程，将成片导出为 MP4 或 GIF。",
-    "start": "开始使用"
+    "start": "开始使用",
+    "stepCount": "第 {{current}} 步，共 {{total}} 步",
+    "splitHint": "将播放头移到剪切位置，再把当前片段切成两段。",
+    "zoomHint": "在播放头处添加缩放，突出录制画面中需要讲解的位置。",
+    "captionsHint": "打开字幕，从音频识别字幕，或导入 SRT 文件。",
+    "exportHint": "选择 MP4 或 GIF，再选择保存视频的位置。",
+    "previous": "上一步",
+    "next": "下一步",
+    "skip": "跳过引导"
   },
   "media": {
     "addingVideo": "正在添加视频…",

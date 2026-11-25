@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { buildClipDecodeRuns, segmentFrameCount, segmentSourceTime } from "./videoTimelineSegments";
-import { requiresClipTimelineRendering } from "./clipTimeline";
+import { hasContinuousClipSourceAudio, requiresClipTimelineRendering } from "./clipTimeline";
 
 describe("explicit clip export timeline", () => {
+	it("keeps source audio continuous across splits without reinterpreting gaps, offsets or speed", () => {
+		const first = { id: "first", startMs: 0, endMs: 600, speed: 1 };
+		const next = { id: "next", startMs: 600, endMs: 1500, speed: 1 };
+		expect(hasContinuousClipSourceAudio([next, first])).toBe(true);
+		expect(hasContinuousClipSourceAudio([])).toBe(false);
+		expect(hasContinuousClipSourceAudio([first, { ...next, startMs: 601 }])).toBe(false);
+		expect(hasContinuousClipSourceAudio([first, { ...next, startMs: 599 }])).toBe(false);
+		expect(hasContinuousClipSourceAudio([first, { ...next, sourceStartMs: 1500 }])).toBe(false);
+		expect(hasContinuousClipSourceAudio([first, { ...next, sourceMaxMs: 1000 }])).toBe(false);
+		expect(hasContinuousClipSourceAudio([first, { ...next, speed: 2 }])).toBe(false);
+	});
+
 	it("preserves gaps and source in-points without starting another decode pass", () => {
 		const runs = buildClipDecodeRuns([
 			{ id: "a", startMs: 0, endMs: 1000, sourceStartMs: 0, speed: 3 },
@@ -21,6 +33,13 @@ describe("explicit clip export timeline", () => {
 			{ id: "a", startMs: 0, endMs: 1000, sourceStartMs: 5000, speed: 1 },
 		]);
 		expect(runs.map((run) => run[0].startSec)).toEqual([5, 0]);
+	});
+	it("skips a long unused stretch of source footage", () => {
+		const runs = buildClipDecodeRuns([
+			{ id: "a", startMs: 0, endMs: 2000, sourceStartMs: 3000, speed: 1 },
+			{ id: "b", startMs: 2000, endMs: 4000, sourceStartMs: 1_700_000, speed: 1 },
+		]);
+		expect(runs.map(run => run[0].startSec)).toEqual([3, 1700]);
 	});
 	it.each([
 		24, 30, 60, 59.94,

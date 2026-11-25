@@ -1,11 +1,22 @@
+import { randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { approvedLocalReadPaths } from "./ipc/state";
 import { getMediaContentType } from "./mediaTypes";
+import { getPackagedRendererBaseUrl } from "./rendererServer";
+import { listenForBrowserOnLoopback } from "./loopbackHttp";
 
 let mediaServerBaseUrl: string | null = null;
+const mediaAccessToken = randomBytes(32).toString("hex");
+let testRendererOrigin: string | undefined;
+
+function isTrustedMediaOrigin(origin: string) {
+	if (origin === "null" || origin === getPackagedRendererBaseUrl() || origin === testRendererOrigin) return true;
+	const devUrl = process.env["VITE_DEV_SERVER_URL"];
+	return devUrl ? origin === new URL(devUrl).origin : false;
+}
 let mediaServerStartPromise: Promise<string> | null = null;
 
 export function resolveHttpByteRange(
@@ -75,6 +86,13 @@ async function handleMediaRequest(
 			return;
 		}
 
+		const origin = request.headers.origin;
+		if (url.searchParams.get("token") !== mediaAccessToken || (origin && !isTrustedMediaOrigin(origin))) {
+			response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+			response.end("Forbidden");
+			return;
+		}
+
 		const rawPath = url.searchParams.get("path");
 		if (!rawPath) {
 			response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
@@ -102,8 +120,7 @@ async function handleMediaRequest(
 		const rangeHeader = request.headers.range;
 
 		const corsHeaders = {
-			"Access-Control-Allow-Origin": "*",
-			"Access-Control-Allow-Credentials": "false",
+			...(origin ? { "Access-Control-Allow-Origin": origin, Vary: "Origin" } : {}),
 			"Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
 		};
 
@@ -196,7 +213,8 @@ export function getMediaServerBaseUrl(): string | null {
 	return mediaServerBaseUrl;
 }
 
-export async function ensureMediaServer(): Promise<string> {
+export async function ensureMediaServer(rendererOrigin?: string): Promise<string> {
+	if (rendererOrigin) testRendererOrigin = new URL(rendererOrigin).origin;
 	if (mediaServerBaseUrl) {
 		return mediaServerBaseUrl;
 	}
@@ -205,33 +223,23 @@ export async function ensureMediaServer(): Promise<string> {
 		return mediaServerStartPromise;
 	}
 
-	mediaServerStartPromise = new Promise((resolve, reject) => {
-		const server = createServer((request, response) => {
-			void handleMediaRequest(request, response);
-		});
-
-		server.once("error", (error) => {
-			reject(error);
-		});
-
-		server.listen(0, "127.0.0.1", () => {
-			const address = server.address();
-			if (!address || typeof address === "string") {
-				server.close();
-				reject(new Error("Media server did not expose a TCP address"));
-				return;
-			}
-
-			mediaServerBaseUrl = `http://127.0.0.1:${address.port}`;
-			console.log(`[media-server] Listening at ${mediaServerBaseUrl}`);
-			resolve(mediaServerBaseUrl);
-		});
+	const server = createServer((request, response) => {
+		void handleMediaRequest(request, response);
+	});
+	mediaServerStartPromise = listenForBrowserOnLoopback(server).then(origin => {
+		mediaServerBaseUrl = origin;
+		console.log(`[media-server] Listening at ${origin}`);
+		return origin;
 	});
 
-	return mediaServerStartPromise;
+	try {
+		return await mediaServerStartPromise;
+	} finally {
+		mediaServerStartPromise = null;
+	}
 }
 
 export function buildMediaUrl(baseUrl: string, filePath: string): string {
 	const resolved = path.resolve(filePath);
-	return `${baseUrl}/video?path=${encodeURIComponent(resolved)}`;
+	return `${baseUrl}/video?path=${encodeURIComponent(resolved)}&token=${mediaAccessToken}`;
 }

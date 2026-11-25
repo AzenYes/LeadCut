@@ -3,18 +3,18 @@ import { uiText } from "./uiI18n";
 import fs from "node:fs";
 import path from "node:path";
 import type { MessageBoxOptions, MessageBoxReturnValue } from "electron";
-import { app, BrowserWindow, dialog } from "electron";
+import { app, BrowserWindow, dialog, net, shell } from "electron";
 import { autoUpdater } from "electron-updater";
 import { USER_DATA_PATH } from "./appPaths";
 import { readAppSetting, writeAppSetting } from "./appSettingsStore";
-import { EXPERIMENTAL_UPDATE_DESCRIPTION_KEY, getUpdateChannelConfiguration } from "./updateChannel";
+import { EXPERIMENTAL_UPDATE_DESCRIPTION_KEY, getNewerStableRelease, getUpdateChannelConfiguration } from "./updateChannel";
 
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const INITIAL_UPDATE_CHECK_DELAY_MS = 15 * 1000;
 export const UPDATE_REMINDER_DELAY_MS = 3 * 60 * 60 * 1000;
 const DISMISSED_READY_REMINDER_DELAY_MS = 5 * 60 * 1000;
-// Official releases would replace the custom waveform edition.
-const AUTO_UPDATES_DISABLED = true;
+const AUTO_UPDATES_DISABLED = process.platform !== "win32";
+const RELEASE_PAGE = "https://github.com/AzenYes/LeadCut/releases";
 const UPDATE_FEED_URL_OVERRIDE = readAppEnv("UPDATE_FEED_URL")?.trim() ?? "";
 const UPDATER_LOG_PATH =
 	readAppEnv("UPDATER_LOG_PATH")?.trim() || path.join(USER_DATA_PATH, "updater.log");
@@ -72,6 +72,7 @@ type UpdateToastSender = (
 ) => boolean;
 
 let updaterInitialized = false;
+let publishStableReleaseResult: ((version: string | null) => void) | null = null;
 let updateCheckInProgress = false;
 let manualCheckRequested = false;
 let periodicCheckTimer: NodeJS.Timeout | null = null;
@@ -458,6 +459,16 @@ export async function downloadAvailableUpdate(
 		return { success: false, message: uiText("noUpdateIsReadyToDownload") };
 	}
 
+	if (!UPDATE_FEED_URL_OVERRIDE) {
+		try {
+			await shell.openExternal(`${RELEASE_PAGE}/tag/v${encodeURIComponent(availableVersion)}`);
+			clearVisibleUpdateToast(sendToRenderer);
+			return { success: true };
+		} catch (error) {
+			return { success: false, message: String(error) };
+		}
+	}
+
 	if (pendingDownloadedVersion === availableVersion) {
 		return { success: false, message: uiText("thisUpdateHasAlreadyBeenDownloaded") };
 	}
@@ -697,6 +708,33 @@ async function showUpdateErrorDialog(
 	});
 }
 
+function fetchLatestStableReleaseTag(): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const request = net.request({ url: `${RELEASE_PAGE}/latest`, method: "HEAD", redirect: "manual" });
+		const timeout = setTimeout(() => {
+			reject(new Error("GitHub release check timed out."));
+			request.abort();
+		}, 15_000);
+		request.once("redirect", (_status, _method, target) => {
+			clearTimeout(timeout);
+			const tagPrefix = `${RELEASE_PAGE}/tag/`;
+			if (target.startsWith(tagPrefix)) resolve(target.slice(tagPrefix.length));
+			else reject(new Error("GitHub did not provide a release tag."));
+			request.abort();
+		});
+		request.once("response", response => {
+			clearTimeout(timeout);
+			reject(new Error(`GitHub did not redirect to a release tag (HTTP ${response.statusCode}).`));
+			request.abort();
+		});
+		request.once("error", error => {
+			clearTimeout(timeout);
+			reject(error);
+		});
+		request.end();
+	});
+}
+
 export async function checkForAppUpdates(
 	getMainWindow: () => BrowserWindow | null,
 	options?: { manual?: boolean },
@@ -730,7 +768,12 @@ export async function checkForAppUpdates(
 	writeUpdaterLog(`Starting ${manualCheckRequested ? "manual" : "automatic"} update check.`);
 
 	try {
-		await autoUpdater.checkForUpdates();
+		if (!UPDATE_FEED_URL_OVERRIDE && !getExperimentalUpdatesEnabled() && publishStableReleaseResult) {
+			const tag = await fetchLatestStableReleaseTag();
+			publishStableReleaseResult(getNewerStableRelease(tag, app.getVersion()));
+		} else {
+			await autoUpdater.checkForUpdates();
+		}
 		writeUpdaterLog("Update check request completed.");
 	} catch (error) {
 		updateCheckInProgress = false;
@@ -774,7 +817,7 @@ export function setupAutoUpdates(
 		writeUpdaterLog("electron-updater emitted checking-for-update.");
 	});
 
-	autoUpdater.on("update-available", (info) => {
+	const onUpdateAvailable = (info: { version: string }) => {
 		writeUpdaterLog(`Update available: version=${info.version}`);
 		updateCheckInProgress = false;
 		availableVersion = info.version;
@@ -800,9 +843,10 @@ export function setupAutoUpdates(
 
 		void showAvailableUpdateDialog(getMainWindow, info.version, sendToRenderer);
 		manualCheckRequested = false;
-	});
+	};
+	autoUpdater.on("update-available", onUpdateAvailable);
 
-	autoUpdater.on("update-not-available", () => {
+	const onUpdateNotAvailable = () => {
 		writeUpdaterLog("No update available.");
 		updateCheckInProgress = false;
 		availableVersion = null;
@@ -817,7 +861,9 @@ export function setupAutoUpdates(
 		});
 		clearVisibleUpdateToast(sendToRenderer);
 		manualCheckRequested = false;
-	});
+	};
+	autoUpdater.on("update-not-available", onUpdateNotAvailable);
+	publishStableReleaseResult = version => version ? onUpdateAvailable({ version }) : onUpdateNotAvailable();
 
 	autoUpdater.on("download-progress", (progress) => {
 		if (!availableVersion) {

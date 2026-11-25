@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { cn } from "@/lib/utils";
 import type { CropRegion } from "./types";
 import {
@@ -6,6 +6,7 @@ import {
 	isWebcamMediaSynchronized,
 } from "./videoPlayback/webcamSync";
 import { normalizeWebcamCropRegion } from "./webcamOverlay";
+import { createPlaybackClock, type PlaybackClock } from "./videoPlayback/playbackClock";
 
 type CropHandle = "move" | "nw" | "ne" | "sw" | "se";
 
@@ -21,7 +22,8 @@ interface WebcamCropControlProps {
 	cropRegion: CropRegion;
 	mirrored?: boolean;
 	previewSrc?: string | null;
-	previewCurrentTime?: number;
+	previewClock?: PlaybackClock;
+	previewTimeFromTimeline?: (seconds: number) => number;
 	previewPlaying?: boolean;
 	previewTimeOffsetMs?: number | null;
 	onCropChange: (cropRegion: CropRegion, previewFrame?: PreviewFrame | null) => void;
@@ -120,15 +122,20 @@ function resizeCrop(cropRegion: CropRegion, handle: CropHandle, deltaX: number, 
 	});
 }
 
+const idleClock = createPlaybackClock();
+
 export function WebcamCropControl({
 	cropRegion,
 	mirrored = false,
 	previewSrc = null,
-	previewCurrentTime = 0,
+	previewClock = idleClock,
+	previewTimeFromTimeline,
 	previewPlaying = false,
 	previewTimeOffsetMs = 0,
 	onCropChange,
 }: WebcamCropControlProps) {
+	const timelineTime = useSyncExternalStore(previewClock.subscribe, previewClock.getTime);
+	const previewCurrentTime = previewTimeFromTimeline?.(timelineTime) ?? timelineTime;
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const previewVideoRef = useRef<HTMLVideoElement | null>(null);
 	const dragStateRef = useRef<DragState | null>(null);

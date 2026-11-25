@@ -187,9 +187,18 @@ test('B8: stale enabled chapters can be disabled and remain off after saving', a
 });
 
 test('B9: library errors retain cached entries and can be retried', async ({ page }) => {
-  await page.evaluate(() => { window.audit.list = window.electronAPI.listProjectFiles; window.electronAPI.listProjectFiles = async () => ({ success: false, error: 'AUDIT: disk unavailable' }); });
-  await page.getByRole('button', { name: 'Home', exact: true }).click();
+  const home = page.getByRole('button', { name: 'Home', exact: true });
   const dialog = page.getByRole('dialog', { name: 'Projects dashboard' });
+  const project = dialog.getByRole('button', { name: 'Audit', exact: true });
+  await page.evaluate(() => {
+    window.electronAPI.openProjectFileAtPath = window.electronAPI.loadCurrentProjectFile;
+  });
+  await home.click();
+  await expect(project).toBeVisible();
+  await dialog.getByRole('textbox', { name: 'Search projects', exact: true }).press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await page.evaluate(() => { window.audit.list = window.electronAPI.listProjectFiles; window.electronAPI.listProjectFiles = async () => ({ success: false, error: 'AUDIT: disk unavailable' }); });
+  await home.click();
   await expect(dialog.getByRole('alert')).toContainText('AUDIT: disk unavailable');
   await expect(dialog.getByRole('button', { name: 'Audit', exact: true })).toBeVisible();
   await page.evaluate(() => { window.electronAPI.listProjectFiles = window.audit.list; });

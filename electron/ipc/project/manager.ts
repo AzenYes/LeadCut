@@ -2,6 +2,9 @@ import { uiText } from "../../uiI18n";
 import { appLog } from "../../logger";
 import { hasKnownProjectExtension, hasLegacyProjectExtension, stripProjectExtension } from "../../../src/lib/projectFileExtensions";
 import { assertProjectNotOpen } from "../../../services/leadcut-mcp/src/editorLock";
+import { readAgentRevisionHistory } from "../../../services/leadcut-mcp/src/agentRevisionLink";
+import { assertProjectFormatWritable, requiresNewerProjectReader } from "../../../services/leadcut-mcp/src/projectFormat";
+import type { LeadcutProject } from "../../../services/leadcut-mcp/src/projectStore";
 import { acquireEditorLock, releaseEditorLock } from "./editorLock";
 import { convertLegacyProjectFile } from "./convertLegacyProject";
 import { createHash, randomUUID } from "node:crypto";
@@ -10,7 +13,7 @@ import { createProjectFirstFrameThumbnail } from "./firstFrameThumbnail";
 import { createUntitledProject } from "./createUntitledProject";
 import { computeProjectRevision } from "./projectRevision";
 import { collectMissingProjectMedia } from "./relinkMediaFiles";
-import { guardedSaveProject } from "./guardedSave";
+import { guardedSaveProject, verifyProjectRevision } from "./guardedSave";
 import { snapshotAppVersionIfDue } from "./versionHistory";
 import { relinkProjectMedia, type MediaRelinkMapping } from "../../../src/components/video-editor/projectRelink";
 import { buildMediaUrl, getMediaServerBaseUrl } from "../../mediaServer";
@@ -31,6 +34,8 @@ import { recordingPreferencesStore } from "../settings/recordingPreferencesStore
 import {
 	approvedLocalReadPaths,
 	currentProjectPath,
+	currentProjectRevision,
+	projectHandedToAgent,
 	setCurrentProjectPath,
 	setCurrentRecordingSession,
 	setCurrentVideoPath,
@@ -110,10 +115,6 @@ export function isAllowedLocalReadPath(candidatePath: string) {
 	);
 }
 
-// Keep loopback media-server access restricted to allowlisted or explicitly
-// approved files. Direct renderer-side read-local-file calls can be more
-// permissive, but URL-based serving must stay scoped so arbitrary paths do not
-// become fetchable inside the app.
 export async function isAllowedLocalMediaPath(candidatePath: string) {
 	const normalizedCandidatePath = normalizePath(candidatePath);
 	return isAllowedLocalReadPath(normalizedCandidatePath);
@@ -341,6 +342,13 @@ export async function rememberRecentProject(projectPath: string) {
 }
 
 export type ProjectThumbnailReady = { path: string; thumbnailPath: string; updatedAt: number };
+
+async function projectThumbnailForRenderer(thumbnailPath: string) {
+	const base = getMediaServerBaseUrl();
+	if (!base) return thumbnailPath;
+	await rememberApprovedLocalReadPath(thumbnailPath);
+	return buildMediaUrl(base, thumbnailPath);
+}
 const thumbnailJobs = new Map<string, Promise<ProjectThumbnailReady | null>>();
 
 function sameProjectRevision(left: Stats, right: Stats) {
@@ -434,7 +442,15 @@ export async function buildProjectLibraryEntry(
 		if (!thumbnailExists) {
 			void refreshProjectThumbnail(normalizedPath, stats)
 				.then((ready) => {
-					if (ready) onThumbnailReady?.(ready);
+					if (ready && onThumbnailReady) {
+						if (!getMediaServerBaseUrl()) {
+							onThumbnailReady(ready);
+							return;
+						}
+						void projectThumbnailForRenderer(ready.thumbnailPath)
+							.then(thumbnailPath => onThumbnailReady({ ...ready, thumbnailPath }))
+							.catch(() => undefined);
+					}
 				})
 				.catch(() => undefined);
 		}
@@ -445,7 +461,7 @@ export async function buildProjectLibraryEntry(
 			isLegacyFormat: hasLegacyProjectExtension(normalizedPath),
 			updatedAt: stats.mtimeMs,
 			createdAt: stats.birthtimeMs || stats.ctimeMs,
-			thumbnailPath: thumbnailExists ? thumbnailPath : null,
+			thumbnailPath: thumbnailExists ? await projectThumbnailForRenderer(thumbnailPath) : null,
 			isCurrent: Boolean(
 				currentProjectPath && normalizePath(currentProjectPath) === normalizedPath,
 			),
@@ -505,6 +521,7 @@ function isLoadableProjectData(projectData: unknown) {
 
 	const candidate = projectData as {
 		version?: unknown;
+		minReaderVersion?: unknown;
 		projectId?: unknown;
 		videoPath?: unknown;
 		editor?: unknown;
@@ -601,6 +618,7 @@ export async function convertLegacyLibraryProject(
 	const normalizedPath = normalizePath(projectPath);
 	const source = options.source ?? await readValidatedProject(normalizedPath);
 	if (!source.success) throw new Error(source.message);
+	assertProjectFormatWritable(source.project);
 	const active = currentProjectPath && normalizePath(currentProjectPath) === normalizedPath;
 	await acquireEditorLock(normalizedPath);
 	let loaded = source;
@@ -651,6 +669,10 @@ async function approveProjectMedia({ project, mediaSources }: ValidatedProject) 
 		mediaSources.videoPath,
 		mediaSources.webcamPath,
 	];
+	if (typeof editorObj?.wallpaper === "string" && path.isAbsolute(editorObj.wallpaper) &&
+		/\.(?:png|jpe?g|webp|avif|bmp|gif|mp4|webm|mov)$/i.test(editorObj.wallpaper)) {
+		approvedProjectPaths.push(editorObj.wallpaper);
+	}
 	if (Array.isArray(audioTracks)) {
 		for (const track of audioTracks) {
 			if (typeof track?.sourcePath === "string") {
@@ -679,14 +701,15 @@ export async function prepareProjectVersion(project: unknown, approveMedia: bool
 	if (approveMedia) await approveProjectMedia(result);
 }
 
-export async function loadProjectFromPath(projectPath: string) {
+export async function loadProjectFromPath(projectPath: string, includeAgentHistory = false) {
 	let normalizedPath = normalizePath(projectPath);
+	const reviewFromRevision = includeAgentHistory && currentProjectPath === normalizedPath ? currentProjectRevision : null;
 	const source = await readValidatedProject(normalizedPath, true);
 	if (!source.success) return source;
 	let loaded = source;
 	let convertedFrom: string | undefined;
 	let conversionFailed = false;
-	if (hasLegacyProjectExtension(normalizedPath)) {
+	if (hasLegacyProjectExtension(normalizedPath) && !requiresNewerProjectReader(source.project)) {
 		try {
 			const converted = await convertLegacyLibraryProject(normalizedPath, { source });
 			loaded = converted;
@@ -698,6 +721,23 @@ export async function loadProjectFromPath(projectPath: string) {
 		}
 	}
 	const { project, revision, mediaSources } = loaded;
+	let agentReviewHistory: LeadcutProject[] | undefined;
+	if (reviewFromRevision && !convertedFrom) {
+		try {
+			agentReviewHistory = await readAgentRevisionHistory(normalizedPath, revision, reviewFromRevision);
+		} catch (error) {
+			console.warn("Could not read Agent revision history:", error);
+		}
+	}
+	if (projectHandedToAgent !== normalizedPath && !requiresNewerProjectReader(project)) {
+		try {
+			await acquireEditorLock(normalizedPath);
+			await verifyProjectRevision(normalizedPath, revision);
+		} catch (error) {
+			if (currentProjectPath !== normalizedPath) await releaseEditorLock(normalizedPath).catch(() => undefined);
+			return { success: false, message: error instanceof Error ? error.message : String(error) };
+		}
+	}
 	await approveProjectMedia(loaded);
 	if (!convertedFrom) await rememberRecentProject(normalizedPath);
 
@@ -714,6 +754,7 @@ export async function loadProjectFromPath(projectPath: string) {
 		path: normalizedPath,
 		revision,
 		project,
+		...(agentReviewHistory?.length ? { agentReviewHistory } : {}),
 		convertedFrom,
 		conversionFailed,
 	};

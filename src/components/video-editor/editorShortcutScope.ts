@@ -2,12 +2,15 @@
 // the event target and visible overlays before allowing editor-wide shortcuts.
 export function isEditorShortcutBlocked(target: EventTarget | null): boolean {
 	const selector = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [aria-modal="true"], [data-recording-library]';
-	if ((target as HTMLElement | null)?.closest?.(selector)) return true;
+	const element = target as HTMLElement | null;
+	if (element?.closest?.(selector)) return true;
 	if (typeof document === "undefined" || !document.querySelectorAll) return false;
 	if (document.querySelector?.("[data-version-preview]")) return true;
+	const targetsControl = element?.ownerDocument === document && element !== document.body && element !== document.documentElement;
 	const overlays = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [aria-modal="true"]';
 	return Array.from(document.querySelectorAll<HTMLElement>(overlays)).some(
-		(element) => element.getAttribute("aria-modal") !== "false" && !element.hidden && element.getAttribute("data-state") !== "closed" && element.getClientRects().length > 0,
+		(overlay) => overlay.getAttribute("aria-modal") !== "false" && !overlay.hidden && overlay.getAttribute("data-state") !== "closed" &&
+			!(targetsControl && overlay.closest('[data-exiting="true"]')) && overlay.getClientRects().length > 0,
 	);
 }
 

@@ -5,7 +5,7 @@ import type { TimelineRegion } from "../core/timelineTypes";
 
 interface UseTimelineSelectionParams {
 	totalMs: number;
-	currentTimeMs: number;
+	getCurrentTimeMs: () => number;
 	zoomRegions: TimelineRegion[];
 	clipRegions: ClipRegion[];
 	markers: TimelineMarker[];
@@ -31,7 +31,7 @@ interface UseTimelineSelectionParams {
 
 export function useTimelineSelection({
 	totalMs,
-	currentTimeMs,
+	getCurrentTimeMs,
 	zoomRegions,
 	clipRegions,
 	markers,
@@ -61,12 +61,12 @@ export function useTimelineSelection({
 
 	const addKeyframe = useCallback(() => {
 		if (!onMarkersChange || totalMs === 0) return;
-		const time = Math.max(0, Math.min(currentTimeMs, totalMs));
+		const time = Math.max(0, Math.min(getCurrentTimeMs(), totalMs));
 		if (keyframes.some((kf) => Math.abs(kf.time - time) < 1)) return;
 		const sourceTimeMs = mapTimelineTimeToSourceTime(time, clipRegions);
 		const marker: TimelineMarker = { id: globalThis.crypto.randomUUID(), sourceTimeMs, origin: "editor" };
 		onMarkersChange((previous) => previous.some((item) => item.sourceTimeMs === sourceTimeMs) ? previous : [...previous, marker]);
-	}, [clipRegions, currentTimeMs, totalMs, keyframes, onMarkersChange]);
+	}, [clipRegions, getCurrentTimeMs, totalMs, keyframes, onMarkersChange]);
 
 	const deleteSelectedKeyframe = useCallback(() => {
 		if (!onMarkersChange || !selectedKeyframeId) return;
@@ -212,6 +212,7 @@ export function useTimelineSelection({
 
 	const cycleAnnotationsAtCurrentTime = useCallback(
 		(backward = false) => {
+			const currentTimeMs = getCurrentTimeMs();
 			const overlapping = annotationRegions
 				.filter((a) => currentTimeMs >= a.startMs && currentTimeMs <= a.endMs)
 				.sort((a, b) => a.zIndex - b.zIndex);
@@ -231,7 +232,7 @@ export function useTimelineSelection({
 			onSelectAnnotation?.(overlapping[nextIndex].id);
 			return true;
 		},
-		[annotationRegions, currentTimeMs, selectedAnnotationId, onSelectAnnotation],
+		[annotationRegions, getCurrentTimeMs, selectedAnnotationId, onSelectAnnotation],
 	);
 
 	return {

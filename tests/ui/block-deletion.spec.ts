@@ -55,6 +55,8 @@ test("annotation deletion works from its inspector without deleting while typing
 });
 
 test("audio deletion works after changing inspector focus", async ({ page }) => {
+	const closingMenu = '[data-slot="dropdown-popover"][data-exiting="true"]';
+	await page.addStyleTag({ content: `${closingMenu} { animation-duration: 5s !important; }` });
 	await page.locator('[data-variant="clip"]').click({ position: { x: 100, y: 20 } });
 	await page.evaluate(() => {
 		window.electronAPI.openAudioFilePicker = async () => ({
@@ -69,6 +71,8 @@ test("audio deletion works after changing inspector focus", async ({ page }) => 
 	await audio.click();
 	const remove = page.getByRole("button", { name: "Delete Audio", exact: true });
 	await remove.focus();
+	await expect(remove).toBeFocused();
+	await expect(page.locator(closingMenu)).toBeVisible();
 	await page.keyboard.press("Backspace");
 	await expect(audio).toHaveCount(0);
 	await expect(page.locator('[data-variant="clip"]')).toHaveCount(1);

@@ -8,6 +8,7 @@ import type { VideoPlaybackRef } from "../VideoPlayback";
 import type { useExportSession } from "./useExportSession";
 import type { useExportSettings } from "./useExportSettings";
 import type { useExportPreflight } from "./useExportPreflight";
+import { capturePausedExportPreview } from "./pausedExportPreview";
 
 type ExportSession = ReturnType<typeof useExportSession>;
 type ExportSettingsState = ReturnType<typeof useExportSettings>;
@@ -45,11 +46,25 @@ export function useExportDialogActions({
 			);
 			return;
 		}
-		session.setShowExportDropdown(true);
-		session.setExportProgress(null);
-		session.setExportError(null);
-		session.setExportedFilePath(undefined);
-	}, [uiText, videoPath, session]);
+		const open = () => {
+			session.setShowExportDropdown(true);
+			session.setExportProgress(null);
+			session.setExportError(null);
+			session.setExportedFilePath(undefined);
+		};
+		const playback = videoPlaybackRef.current;
+		if (!session.isExporting && playback && /^win/i.test(navigator.platform) &&
+			settings.exportFormat === "mp4" && settings.exportPipelineModel === "modern") {
+			const capture = capturePausedExportPreview(playback);
+			session.preparedPreviewRef.current = capture;
+			void capture.then(() => {
+				if (session.preparedPreviewRef.current === capture) open();
+			});
+			return;
+		}
+		session.preparedPreviewRef.current = null;
+		open();
+	}, [uiText, videoPath, videoPlaybackRef, settings.exportFormat, settings.exportPipelineModel, session]);
 
 	const resolveCurrentSettings = useCallback(
 		(exportFormat: ExportFormat = settings.exportFormat) => {
@@ -87,6 +102,7 @@ export function useExportDialogActions({
 	);
 
 	const handleStartExportFromDropdown = useCallback(() => {
+		if (session.isExporting) return;
 		const resolvedSettings = resolveCurrentSettings();
 		if (!resolvedSettings) return;
 		session.setExportError(null);
@@ -96,21 +112,25 @@ export function useExportDialogActions({
 	}, [resolveCurrentSettings, session, preflight]);
 
 	const handleCancelExport = useCallback(() => {
-		if (!session.isExporting) return;
-		session.cancelledExportRunIdRef.current = session.exportRunIdRef.current;
+		if (!session.isExporting || session.cancelledExportRunIdRef.current !== null) return;
+		const cancelledRun = session.exportRunIdRef.current;
+		session.cancelledExportRunIdRef.current = cancelledRun;
 		session.exportRunIdRef.current += 1;
 		session.exporterRef.current?.cancel();
 		session.exporterRef.current = null;
 		toast.info(uiText("exportCanceled"));
 		session.clearPendingExportSave();
 		session.setShowExportDropdown(false);
-		session.setIsExporting(false);
+		window.setTimeout(() => {
+			if (session.cancelledExportRunIdRef.current === cancelledRun) session.setIsExporting(false);
+		}, 5000);
 		session.setExportProgress(null);
 		session.setExportError(null);
 		session.setExportedFilePath(undefined);
 	}, [uiText, session]);
 
 	const handleExportDropdownClose = useCallback(() => {
+		session.preparedPreviewRef.current = null;
 		preflight.reset();
 		session.clearPendingExportSave();
 		session.setShowExportDropdown(false);

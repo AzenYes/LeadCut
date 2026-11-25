@@ -1,3 +1,4 @@
+import { handleTrustedIpc } from "../../trustedIpc";
 import { readAppEnv } from "../../envCompat";
 import { uiText } from "../../uiI18n";
 import { hasLegacyProjectExtension, stripProjectExtension } from "../../../src/lib/projectFileExtensions";
@@ -13,7 +14,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { BrowserWindow, dialog, shell } from "electron";
 import { RECORDINGS_DIR } from "../../appPaths";
 import { buildMediaUrl, getMediaServerBaseUrl } from "../../mediaServer";
 import { LEGACY_PROJECT_FILE_EXTENSIONS, PROJECT_FILE_EXTENSION } from "../constants";
@@ -60,6 +61,8 @@ import {
 	currentVideoPath,
 	setCurrentProjectPath,
 	setCurrentRecordingSession,
+	projectHandedToAgent,
+	setProjectHandedToAgent,
 	setCurrentVideoPath,
 } from "../state";
 import {
@@ -241,9 +244,9 @@ async function ensureNamedProjectSaveDoesNotOverwriteDifferentProject(
 	}
 }
 
-export function registerProjectHandlers() {
+export function registerProjectHandlers(takeStartupProject?: (senderId: number) => string | undefined) {
 	registerProjectRelinkHandlers();
-	ipcMain.handle("save-cut-review-handoff", async (event, markdown: unknown, projectName: unknown) => {
+	handleTrustedIpc("save-cut-review-handoff", async (event, markdown: unknown, projectName: unknown) => {
 		if (typeof markdown !== "string" || !markdown.trim()) return { success: false };
 		try {
 			const name = normalizeProjectSaveName(typeof projectName === "string" ? projectName : null) ?? "LeadCut";
@@ -265,7 +268,7 @@ export function registerProjectHandlers() {
 		}
 	});
 	const handleProjectVersion = (channel: string, action: (projectPath: string, ...args: string[]) => Promise<object>) => {
-		ipcMain.handle(channel, async (_, ...args: string[]) => {
+		handleTrustedIpc(channel, async (_, ...args: string[]) => {
 			try {
 				if (!currentProjectPath) throw new Error(uiText("noActiveProject"));
 				return await action(currentProjectPath, ...args);
@@ -300,7 +303,7 @@ export function registerProjectHandlers() {
 		success: true,
 		deleted: await pruneProjectVersions(projectPath),
 	}));
-	ipcMain.handle("convert-legacy-project-files", async () => {
+	handleTrustedIpc("convert-legacy-project-files", async () => {
 		const converted: { from: string; to: string }[] = [];
 		const errors: { path: string; message: string }[] = [];
 		const { entries } = await listProjectLibraryEntries();
@@ -316,7 +319,7 @@ export function registerProjectHandlers() {
 		}
 		return { converted, errors };
 	});
-	ipcMain.handle("rename-library-project", async (_, source: string, name: string) => {
+	handleTrustedIpc("rename-library-project", async (_, source: string, name: string) => {
 		try {
 			const entries = await listProjectLibraryEntries();
 			const projectPaths = entries.entries.map((entry) => entry.path);
@@ -350,7 +353,7 @@ export function registerProjectHandlers() {
 			},
 		);
 	};
-	ipcMain.handle("finish-recording-import", async (event, keepPath: string, commit = false) => {
+	handleTrustedIpc("finish-recording-import", async (event, keepPath: string, commit = false) => {
 		if (imports.has(event.sender.id))
 			return { success: false, error: "Import is still running" };
 		const outputs = pendingImports.get(event.sender.id);
@@ -368,32 +371,32 @@ export function registerProjectHandlers() {
 			return { success: false, error: String(error) };
 		}
 	});
-	ipcMain.handle("cancel-recording-import", (event) => {
+	handleTrustedIpc("cancel-recording-import", (event) => {
 		imports.get(event.sender.id)?.abort();
 		return { success: true };
 	});
-	ipcMain.handle("get-recording-thumbnail", async (_, file: string) => {
+	handleTrustedIpc("get-recording-thumbnail", async (_, file: string) => {
 		try {
 			return { success: true, value: await getRecordingThumbnail(file) };
 		} catch (error) {
 			return { success: false, error: String(error) };
 		}
 	});
-	ipcMain.handle("get-project-preview", async (_, projectPath: string) => {
+	handleTrustedIpc("get-project-preview", async (_, projectPath: string) => {
 		try {
 			return { success: true, value: await readProjectPreview(projectPath) };
 		} catch (error) {
 			return { success: false, error: String(error) };
 		}
 	});
-	ipcMain.handle("list-recordings", async (_, includeSources?: boolean) => {
+	handleTrustedIpc("list-recordings", async (_, includeSources?: boolean) => {
 		try {
 			return { success: true, value: await listRecordings(includeSources === true) };
 		} catch (error) {
 			return { success: false, error: String(error) };
 		}
 	});
-	ipcMain.handle("set-recordings-removed", async (_, paths: string[], removed: boolean) => {
+	handleTrustedIpc("set-recordings-removed", async (_, paths: string[], removed: boolean) => {
 		try {
 			await setRecordingsRemoved(paths, removed);
 			return { success: true, value: null };
@@ -401,7 +404,7 @@ export function registerProjectHandlers() {
 			return { success: false, error: String(error) };
 		}
 	});
-	ipcMain.handle(
+	handleTrustedIpc(
 		"import-recording",
 		async (
 			event,
@@ -444,7 +447,7 @@ export function registerProjectHandlers() {
 			}
 		},
 	);
-	ipcMain.handle("reveal-in-folder", async (_, filePath: string) => {
+	handleTrustedIpc("reveal-in-folder", async (_, filePath: string) => {
 		try {
 			// shell.showItemInFolder doesn't return a value, it throws on error
 			shell.showItemInFolder(filePath);
@@ -468,7 +471,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("open-recordings-folder", async () => {
+	handleTrustedIpc("open-recordings-folder", async () => {
 		try {
 			const recordingsDir = await getRecordingsDir();
 			const openPathResult = await shell.openPath(recordingsDir);
@@ -491,7 +494,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("get-recordings-directory", async () => {
+	handleTrustedIpc("get-recordings-directory", async () => {
 		try {
 			const recordingsDir = await getRecordingsDir();
 			return {
@@ -509,7 +512,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("choose-recordings-directory", async () => {
+	handleTrustedIpc("choose-recordings-directory", async () => {
 		try {
 			const current = await getRecordingsDir();
 			const result = await dialog.showOpenDialog({
@@ -541,7 +544,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle(
+	handleTrustedIpc(
 		"save-project-file",
 		async (
 			_,
@@ -563,6 +566,7 @@ export function registerProjectHandlers() {
 						: null;
 
 				if (trustedExistingProjectPath) {
+					if (trustedExistingProjectPath === projectHandedToAgent) return { success: false, message: uiText("projectAgentEditing") };
 					const revision = expectedRevision ?? (isTrustedProjectPath(trustedExistingProjectPath) ? currentProjectRevision : null);
 					if (!revision) return projectSaveConflict(null);
 					const saved = await guardedSaveProject({
@@ -648,7 +652,7 @@ export function registerProjectHandlers() {
 		},
 	);
 
-	ipcMain.handle(
+	handleTrustedIpc(
 		"save-project-file-named",
 		async (
 			_,
@@ -671,6 +675,7 @@ export function registerProjectHandlers() {
 
 				const projectsDir = await getProjectsDir();
 				const namedSaveMode = normalizeNamedProjectSaveMode(mode);
+				if (currentProjectPath && currentProjectPath === projectHandedToAgent) return { success: false, message: uiText("projectAgentEditing") };
 				let activeProjectPath = isTrustedProjectPath(currentProjectPath)
 					? currentProjectPath
 					: null;
@@ -786,7 +791,7 @@ export function registerProjectHandlers() {
 		},
 	);
 
-	ipcMain.handle("load-project-file", async () => {
+	handleTrustedIpc("load-project-file", async () => {
 		try {
 			const projectsDir = await getProjectsDir();
 			const result = await dialog.showOpenDialog({
@@ -818,24 +823,28 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("load-current-project-file", async () => {
+	handleTrustedIpc("load-current-project-file", async (event) => {
+		const startupPath = takeStartupProject?.(event.sender.id);
+		const projectPath = startupPath ?? currentProjectPath;
 		try {
-			if (!currentProjectPath) {
+			if (!projectPath) {
 				return { success: false, message: uiText("noActiveProject") };
 			}
 
-			return await loadProjectFromPath(currentProjectPath);
+			const result = await loadProjectFromPath(projectPath);
+			return startupPath ? { ...result, startupOpen: true } : result;
 		} catch (error) {
 			console.error("Failed to load current project file:", error);
 			return {
 				success: false,
 				message: uiText("failedToLoadCurrentProjectFile"),
 				error: String(error),
+				startupOpen: Boolean(startupPath),
 			};
 		}
 	});
 
-	ipcMain.handle("get-projects-directory", async () => {
+	handleTrustedIpc("get-projects-directory", async () => {
 		try {
 			return {
 				success: true,
@@ -849,7 +858,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle(
+	handleTrustedIpc(
 		"create-project-file",
 		async (_, projectData: unknown, thumbnailDataUrl?: string | null) => {
 			try {
@@ -872,7 +881,7 @@ export function registerProjectHandlers() {
 			}
 		},
 	);
-	ipcMain.handle("trash-project-files", async (_, paths: unknown) => {
+	handleTrustedIpc("trash-project-files", async (_, paths: unknown) => {
 		try {
 			const result = await trashLibraryProjects(paths, {
 				list: listProjectLibraryEntries,
@@ -897,7 +906,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("list-project-files", async (event) => {
+	handleTrustedIpc("list-project-files", async (event) => {
 		try {
 			const library = await listProjectLibraryEntries((ready) => {
 				if (!event.sender.isDestroyed())
@@ -918,9 +927,9 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("open-project-file-at-path", async (_, filePath: string) => {
+	handleTrustedIpc("open-project-file-at-path", async (_, filePath: string, includeAgentHistory?: boolean) => {
 		try {
-			return await loadProjectFromPath(filePath);
+			return await loadProjectFromPath(filePath, includeAgentHistory === true);
 		} catch (error) {
 			console.error("Failed to open project file at path:", error);
 			return {
@@ -931,7 +940,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("open-projects-directory", async () => {
+	handleTrustedIpc("open-projects-directory", async () => {
 		try {
 			const projectsDir = await getProjectsDir();
 			const openPathResult = await shell.openPath(projectsDir);
@@ -953,7 +962,7 @@ export function registerProjectHandlers() {
 			};
 		}
 	});
-	ipcMain.handle(
+	handleTrustedIpc(
 		"set-current-video-path",
 		async (
 			_,
@@ -988,11 +997,8 @@ export function registerProjectHandlers() {
 				]);
 			}
 
-			if (nextSession.webcamPath) {
-				await persistRecordingSessionManifest(nextSession);
-			}
-
 			if (!options?.preserveProjectPath) {
+				if (nextSession.webcamPath) await persistRecordingSessionManifest(nextSession);
 				setCurrentProjectPath(null);
 			}
 
@@ -1006,20 +1012,49 @@ export function registerProjectHandlers() {
 		},
 	);
 
-	ipcMain.handle(
+	handleTrustedIpc(
 		"set-current-recording-session",
 		async (
-			_,
+			event,
 			session: {
 				videoPath: string;
 				webcamPath?: string | null;
 				timeOffsetMs?: number;
 				hideOverlayCursorByDefault?: boolean;
 			},
-			options?: { preserveProjectPath?: boolean },
+			options?: { preserveProjectPath?: boolean; background?: "camera" | "audio" },
 		) => {
 			const normalizedVideoPath =
 				normalizeVideoSourcePath(session.videoPath) ?? session.videoPath;
+			if (options?.background) {
+				if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) return { success: false };
+				if (options.background === "camera") {
+					const [videoPath, webcamPath] = await Promise.all([
+						resolveApprovedLocalMediaPath(normalizedVideoPath),
+						session.webcamPath ? resolveApprovedLocalMediaPath(session.webcamPath) : null,
+					]);
+					if (!videoPath || !webcamPath || path.dirname(videoPath) !== path.dirname(webcamPath) ||
+						!/^recording-\d+\.(mp4|webm)$/.test(path.basename(videoPath)) ||
+						!/^recording-\d+-webcam\.(mp4|webm)$/.test(path.basename(webcamPath))) return { success: false };
+					const completedSession = {
+						videoPath: normalizedVideoPath,
+						webcamPath,
+						timeOffsetMs: normalizeRecordingTimeOffsetMs(session.timeOffsetMs),
+						hideOverlayCursorByDefault: normalizeBoolean(session.hideOverlayCursorByDefault),
+					};
+					await persistRecordingSessionManifest(completedSession);
+					if (currentVideoPath !== normalizedVideoPath || currentProjectPath) return { success: true };
+					setCurrentRecordingSession(completedSession);
+				}
+				if (currentVideoPath === normalizedVideoPath && currentRecordingSession) {
+					for (const window of BrowserWindow.getAllWindows()) {
+						if (!window.isDestroyed()) {
+							window.webContents.send("recording-session-changed", currentRecordingSession, options.background);
+						}
+					}
+				}
+				return { success: true };
+			}
 			setCurrentVideoPath(normalizedVideoPath);
 			setCurrentRecordingSession({
 				videoPath: normalizedVideoPath,
@@ -1029,10 +1064,11 @@ export function registerProjectHandlers() {
 			});
 			await rememberApprovedLocalReadPath(currentRecordingSession!.videoPath);
 			await rememberApprovedLocalReadPath(currentRecordingSession!.webcamPath);
+			// A project can pair its own camera with the same source recording.
 			if (!options?.preserveProjectPath) {
 				setCurrentProjectPath(null);
+				await persistRecordingSessionManifest(currentRecordingSession!);
 			}
-			await persistRecordingSessionManifest(currentRecordingSession!);
 
 			for (const window of BrowserWindow.getAllWindows()) {
 				if (!window.isDestroyed()) {
@@ -1044,7 +1080,7 @@ export function registerProjectHandlers() {
 		},
 	);
 
-	ipcMain.handle("get-current-recording-session", () => {
+	handleTrustedIpc("get-current-recording-session", () => {
 		if (!currentRecordingSession) {
 			return { success: false };
 		}
@@ -1055,11 +1091,11 @@ export function registerProjectHandlers() {
 		};
 	});
 
-	ipcMain.handle("get-current-video-path", () => {
+	handleTrustedIpc("get-current-video-path", () => {
 		return currentVideoPath ? { success: true, path: currentVideoPath } : { success: false };
 	});
 
-	ipcMain.handle("release-current-project", async () => {
+	handleTrustedIpc("release-current-project", async () => {
 		const releasedPath = currentProjectPath;
 		if (releasedPath) await releaseEditorLock(releasedPath);
 		setCurrentProjectPath(null);
@@ -1068,13 +1104,36 @@ export function registerProjectHandlers() {
 		return { success: true, path: releasedPath };
 	});
 
-	ipcMain.handle("clear-current-video-path", () => {
+	handleTrustedIpc("set-project-agent-handoff", async (event, expectedPath: unknown, handedOff: unknown) => {
+		if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame ||
+			typeof handedOff !== "boolean" || typeof expectedPath !== "string" || expectedPath !== currentProjectPath) {
+			return { success: false, message: uiText("failedToLoadProject") };
+		}
+		try {
+			if (handedOff) {
+				const revision = currentProjectRevision;
+				if (!revision) return { success: false, message: uiText("projectChangedOnDisk") };
+				await verifyProjectRevision(expectedPath, revision);
+				setProjectHandedToAgent(expectedPath);
+				try { await releaseEditorLock(expectedPath); }
+				catch (error) { setProjectHandedToAgent(null); throw error; }
+			} else {
+				await acquireEditorLock(expectedPath);
+				setProjectHandedToAgent(null);
+			}
+			return { success: true };
+		} catch (error) {
+			return { success: false, message: error instanceof Error ? error.message : String(error) };
+		}
+	});
+
+	handleTrustedIpc("clear-current-video-path", () => {
 		setCurrentVideoPath(null);
 		setCurrentRecordingSession(null);
 		return { success: true };
 	});
 
-	ipcMain.handle("delete-recording-file", async (_, filePath: string) => {
+	handleTrustedIpc("delete-recording-file", async (_, filePath: string) => {
 		try {
 			if (!filePath) {
 				return { success: false, error: "Only auto-generated recordings can be deleted" };
@@ -1104,7 +1163,7 @@ export function registerProjectHandlers() {
 		}
 	});
 
-	ipcMain.handle("get-local-media-url", async (_, filePath: string) => {
+	handleTrustedIpc("get-local-media-url", async (_, filePath: string) => {
 		const baseUrl = getMediaServerBaseUrl();
 		if (!baseUrl || !filePath) {
 			return { success: false as const };

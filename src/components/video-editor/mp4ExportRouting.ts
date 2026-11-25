@@ -30,20 +30,18 @@ export function resolveMp4ExportRouting({
 	const pipelineModel = useSmokeRouting
 		? (smokeExportConfig.pipelineModel ?? "modern")
 		: (settings.pipelineModel ?? exportPipelineModel);
-	const useExperimentalNativeExport =
-		pipelineModel === "modern" &&
-		(!useSmokeRouting || smokeExportConfig.useNativeExport);
-	const useExperimentalNvidiaCudaExport =
-		useExperimentalNativeExport && experimentalNvidiaCudaExport && nvidiaCudaExportAvailable;
 	const backendPreference =
 		pipelineModel === "legacy"
 			? "webcodecs"
 			: useSmokeRouting
 				? (smokeExportConfig.backendPreference ??
 					(smokeExportConfig.useNativeExport ? "breeze" : "webcodecs"))
-				: useExperimentalNativeExport
-					? "auto"
-					: (settings.backendPreference ?? exportBackendPreference);
+				: (settings.backendPreference ?? exportBackendPreference);
+	const useExperimentalNativeExport = pipelineModel === "modern" &&
+		backendPreference !== "webcodecs" &&
+		(!useSmokeRouting || smokeExportConfig.useNativeExport);
+	const useExperimentalNvidiaCudaExport =
+		useExperimentalNativeExport && experimentalNvidiaCudaExport && nvidiaCudaExportAvailable;
 
 	return {
 		pipelineModel,

@@ -11,7 +11,7 @@ import type {
 } from "dnd-timeline";
 import { TimelineContext } from "dnd-timeline";
 import type { Dispatch, ReactNode, SetStateAction } from "react";
-import { useCallback, useRef } from "react";
+import { useCallback, useLayoutEffect, useRef } from "react";
 import type { ClipSequenceSpan, TimelineRegionSpan } from "../../core/timelineTypes";
 import { clampRange, resolveDragEnd, resolveResizeEnd } from "../../dnd/engine";
 
@@ -61,6 +61,11 @@ export default function TimelineWrapper({
 		useSensor(KeyboardSensor),
 	);
 	const totalMs = Math.max(0, Math.round(videoDuration * 1000));
+	// Handler changes alone should not replace the resize context for every item.
+	const onItemSpanChangeRef = useRef(onItemSpanChange);
+	useLayoutEffect(() => {
+		onItemSpanChangeRef.current = onItemSpanChange;
+	}, [onItemSpanChange]);
 
 	const onResizeEnd = useCallback(
 		(event: ResizeEndEvent) => {
@@ -76,9 +81,9 @@ export default function TimelineWrapper({
 				hasOverlap,
 			});
 			if (!resolvedSpan) return;
-			onItemSpanChange(activeItemId, resolvedSpan);
+			onItemSpanChangeRef.current(activeItemId, resolvedSpan);
 		},
-		[allRegionSpans, hasOverlap, minItemDurationMs, onItemSpanChange, totalMs],
+		[allRegionSpans, hasOverlap, minItemDurationMs, totalMs],
 	);
 
 	const onDragEnd = useCallback(
@@ -102,13 +107,12 @@ export default function TimelineWrapper({
 				resolveTargetRowId,
 			);
 			if (!resolved) return;
-			onItemSpanChange(activeItemId, resolved.span, resolved.rowId);
+			onItemSpanChangeRef.current(activeItemId, resolved.span, resolved.rowId);
 		},
 		[
 			allRegionSpans,
 			hasOverlap,
 			minItemDurationMs,
-			onItemSpanChange,
 			resolveTargetRowId,
 			totalMs,
 		],

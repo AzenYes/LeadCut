@@ -156,6 +156,17 @@ describe("resolveExportStatusModel", () => {
 		expect(status.runtimeLabel).toBe("VideoEncoder");
 	});
 
+	it("displays the selected route before there is a concrete encoder label", () => {
+		const status = resolveExportStatusModel({
+			isExporting: true,
+			exportProgress: progress({ exportRoute: "breeze-stream" }),
+			exportFormat: "mp4",
+			exportPipelineModel: "modern",
+		});
+
+		expect(status.runtimeLabel).toBe("Breeze");
+	});
+
 	it("prefers multiple native skip reasons over the single legacy reason", () => {
 		const status = resolveExportStatusModel({
 			isExporting: true,

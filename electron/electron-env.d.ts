@@ -22,10 +22,12 @@ declare namespace NodeJS {
 }
 
 interface ProjectLoadResult {
+	startupOpen?: boolean;
 	success: boolean;
 	path?: string;
 	revision?: string;
 	project?: unknown;
+	agentReviewHistory?: unknown[];
 	convertedFrom?: string;
 	conversionFailed?: boolean;
 	message?: string;
@@ -82,6 +84,8 @@ interface UpdateStatusSummary {
 type RendererRecordingSessionData = import("./ipc/types").RecordingSessionData;
 
 interface RendererFfmpegAudioMuxMetrics {
+	inlineEditedAudioBytes?: number;
+	ffmpegMuxOutputWriteBytes?: number;
 	tempVideoWriteMs?: number;
 	tempEditedAudioWriteMs?: number;
 	ffmpegExecMs?: number;
@@ -104,6 +108,7 @@ interface RendererWindowsGpuExportSummary {
 	cursorOverlay?: boolean;
 	zoomOverlay?: boolean;
 	surfacePoolSize?: number;
+	surfacePoolLimit?: number;
 	adapterIndex?: number;
 	adapterVendorId?: number;
 	adapterDeviceId?: number;
@@ -126,6 +131,11 @@ interface RendererWindowsGpuExportSummary {
 	clearMs?: number;
 	videoProcessMs?: number;
 	writeSampleMs?: number;
+	surfaceWaitMs?: number;
+	surfaceWaitMaxMs?: number;
+	surfaceWaitOver1ms?: number;
+	gpuStageTiming?: import("../src/lib/exporter/types").D3D11GpuStageTiming;
+	mediaFoundationOutputTiming?: import("../src/lib/exporter/types").MediaFoundationOutputTiming;
 	finalizeMs?: number;
 	realtimeMultiplier?: number;
 }
@@ -154,6 +164,8 @@ interface RendererNativeStaticLayoutMetrics extends RendererFfmpegAudioMuxMetric
 	staticAssetExecMs?: number;
 	fallbackChunkCount: number;
 	videoOnlyBytes?: number;
+	exportRoutePlan?: import("../src/lib/exporter/backendPolicy").ExportRoutePlan<import("../src/lib/exporter/backendPolicy").NativeStaticExportRoute>;
+	exportRoute?: import("../src/lib/exporter/backendPolicy").NativeStaticExportRoute;
 	chunks: RendererNativeStaticLayoutChunkMetric[];
 }
 
@@ -255,6 +267,7 @@ interface Window {
 			enabled: boolean,
 		) => Promise<{ success: boolean; enabled: boolean }>;
 		getAssetBasePath: () => Promise<string | null>;
+		resolveNativeBundledImagePath: (asset: string) => Promise<string | null>;
 		listLocalFontFamilies: (refresh?: boolean) => Promise<string[]>;
 		getSources: (opts: Electron.SourcesOptions) => Promise<ProcessedDesktopSource[]>;
 		onCaptureSourceListFailed: (callback: () => void) => () => void;
@@ -283,7 +296,7 @@ interface Window {
 			userNotified?: boolean;
 			microphoneFallbackRequired?: boolean;
 		}>;
-		stopNativeScreenRecording: () => Promise<{
+		stopNativeScreenRecording: (discard?: boolean) => Promise<{
 			success: boolean;
 			path?: string;
 			message?: string;
@@ -334,12 +347,16 @@ interface Window {
 		finishRecordingChunks: (name: string, discard: boolean) => Promise<{
 			success: boolean; path?: string; message?: string; error?: string; partialPath?: string;
 		} | null>;
+		recoverBrowserRecording?: () => Promise<{ success: boolean; path?: string; webcamPath?: string }>;
 		storeRecordedVideo: (
 			videoData: ArrayBuffer,
 			fileName: string,
 		) => Promise<{ success: boolean; path?: string; message?: string }>;
+		prepareMicrophoneStream: (input: { startDelayMs: number; profile?: string }) => Promise<string>;
+		writeMicrophoneChunk: (streamId: string, bytes: ArrayBuffer) => Promise<void>;
+		discardMicrophoneStream: (streamId: string) => Promise<void>;
 		storeMicrophoneSidecar: (
-			audioData: ArrayBuffer,
+			streamId: string,
 			videoPath: string,
 			options?: {
 				startDelayMs?: number;
@@ -459,6 +476,7 @@ interface Window {
 			}>;
 			chunkDurationSec?: number;
 			experimentalWindowsGpuCompositor?: boolean;
+			measureGpuStages?: boolean;
 			experimentalNvidiaCudaExport?: boolean;
 			audioOptions?: {
 				audioMode?: "none" | "copy-source" | "trim-source" | "edited-track";
@@ -491,13 +509,23 @@ interface Window {
 			frameRate: number;
 			bitrate: number;
 			encodingMode: "fast" | "balanced" | "quality";
-			inputMode?: "rawvideo" | "h264-stream";
+		inputMode?: "rawvideo" | "h264-stream" | "mp4-stream";
+			videoOnlyIntermediate?: boolean;
+			mixedAudio?: { durationSec: number; videoFrameCount: number };
+			sourceAudio?: import("./ipc/nativeVideoExport").NativeH264StreamSourceAudioOptions;
+			destinationPath?: string;
 		}) => Promise<{
 			success: boolean;
 			sessionId?: string;
 			encoderName?: string;
+			mixedAudio?: boolean;
 			error?: string;
 		}>;
+		nativeVideoExportWriteWav?: (
+			sessionId: string,
+			chunk: Uint8Array | null,
+		) => Promise<{ success: boolean; error?: string }>;
+		nativeVideoExportEndVideoInput?: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
 		nativeVideoExportWriteFrame: (
 			sessionId: string,
 			frameData: Uint8Array,
@@ -514,6 +542,7 @@ interface Window {
 				audioSourceCodec?: string | null;
 				audioSourceSampleRate?: number;
 				outputDurationSec?: number;
+				outputVideoFrameCount?: number;
 				trimSegments?: Array<{ startMs: number; endMs: number }>;
 				editedTrackStrategy?: "filtergraph-fast-path" | "offline-render-fallback";
 				editedTrackSegments?: Array<{ startMs: number; endMs: number; speed: number }>;
@@ -538,6 +567,7 @@ interface Window {
 				audioSourceCodec?: string | null;
 				audioSourceSampleRate?: number;
 				outputDurationSec?: number;
+				outputVideoFrameCount?: number;
 				trimSegments?: Array<{ startMs: number; endMs: number }>;
 				editedTrackStrategy?: "filtergraph-fast-path" | "offline-render-fallback";
 				editedTrackSegments?: Array<{ startMs: number; endMs: number; speed: number }>;
@@ -558,6 +588,8 @@ interface Window {
 				audioSourceCodec?: string | null;
 				audioSourceSampleRate?: number;
 				outputDurationSec?: number;
+				outputVideoFrameCount?: number;
+				reuseVideoMp4?: boolean;
 				trimSegments?: Array<{ startMs: number; endMs: number }>;
 				editedTrackStrategy?: "filtergraph-fast-path" | "offline-render-fallback";
 				editedTrackSegments?: Array<{ startMs: number; endMs: number; speed: number }>;
@@ -570,12 +602,24 @@ interface Window {
 			error?: string;
 			metrics?: RendererFfmpegAudioMuxMetrics;
 		}>;
-		openExportStream: (options?: { extension?: string }) => Promise<{
+		openExportStream: (options?: { extension?: string; destinationPath?: string }) => Promise<{
 			success: boolean;
 			streamId?: string;
 			tempPath?: string;
 			error?: string;
 		}>;
+		openExportAacStream?: () => Promise<{
+			success: boolean;
+			streamId?: string;
+			tempPath?: string;
+			error?: string;
+		}>;
+		startExportAudioAppend?: (videoPath: string, durationSec: number) => Promise<{ success: boolean; runId?: string; error?: string }>;
+		writeExportAudioAppend?: (runId: string, chunk: Uint8Array) => Promise<{ success: boolean; error?: string }>;
+		finishExportAudioAppend?: (
+			runId: string,
+			disposition: import("./ipc/nativeVideoExport").ExportAudioAppendDisposition,
+		) => Promise<import("./ipc/nativeVideoExport").ExportAudioAppendResult>;
 		writeExportStreamChunk: (
 			streamId: string,
 			position: number,
@@ -613,6 +657,7 @@ interface Window {
 		getVideoAudioFallbackPaths: (videoPath: string) => Promise<{
 			success: boolean;
 			paths: string[];
+			sidecarPaths?: string[];
 			startDelayMsByPath?: Record<string, number>;
 			error?: string;
 		}>;
@@ -630,6 +675,7 @@ interface Window {
 		setRecordingPaused: (paused: boolean) => void;
 		onRecordingShortcut: (callback: (action: import("../src/lib/recordingShortcuts").RecordingShortcutAction) => void) => () => void;
 		onRecordingDiskLow: (callback: (status: import("./ipc/recording/diskEstimate").RecordingDiskStatus) => void) => () => void;
+		onRecordingFinalization: (callback: (status: import("./ipc/types").NativeRecordingFinalization) => void) => () => void;
 		addRecordingMarker: (kind: import("./ipc/types").RecordingMarkerKind) =>
 			Promise<import("./ipc/types").RecordingMarkerAdded | { success: false }>;
 		getRecordingMarkers: (videoPath?: string) =>
@@ -675,8 +721,9 @@ interface Window {
 			callback: (state: { recording: boolean; sourceName: string }) => void,
 		) => () => void;
 		onRecordingSessionChanged: (
-			callback: (session: RendererRecordingSessionData | null) => void,
+			callback: (session: RendererRecordingSessionData | null, background?: "camera" | "audio") => void,
 		) => () => void;
+		onRecordingAudioLost?: (callback: (track: "mic" | "system") => void) => () => void;
 		onRecordingInterrupted: (
 			callback: (state: { reason: string; message: string }) => void,
 		) => () => void;
@@ -716,8 +763,22 @@ interface Window {
 			},
 		) => Promise<{ success: boolean; path?: string; message?: string; canceled?: boolean; error?: string }>;
 		chooseExportPath: (fileName: string) => Promise<{ success: boolean; path?: string; canceled?: boolean; error?: string }>;
+		captureExportPreview: (rect: { x: number; y: number; width: number; height: number }) => Promise<string | null>;
 		getExportDiskSpace: (outputPath: string) => Promise<{ targetFreeBytes: number | null; tempFreeBytes: number | null }>;
 		prepareExportAudioSource: (filePath: string) => Promise<string | null>;
+		prepareExportAudioPcm?: (filePath: string, window?: { startSec: number; endSec: number }, useMemoryWindows?: boolean) =>
+			Promise<({
+				frames: number; channels: number; sampleRate: number;
+				firstFrame?: number; sourceDurationSec?: number;
+			} & ({ path: string; url: string } | { pcm: Uint8Array } | { memoryWindows: true })) | null>;
+		openExportAudioPcmReader?: () => Promise<string>;
+		closeExportAudioPcmReader?: (readerId: string) => Promise<void>;
+		readExportAudioPcmWindow?: (
+			filePath: string, window: { firstFrame: number; endFrame: number; channels: number; sampleRate: number },
+			readerId?: string,
+		) => Promise<Uint8Array>;
+		cancelExportAudioPcm?: () => Promise<void>;
+		encodeExportAudioAac?: (filePath: string) => Promise<string | null>;
 		writeExportedVideoToPath: (
 			videoData: ArrayBuffer,
 			outputPath: string,
@@ -759,8 +820,10 @@ interface Window {
 			path?: string | null;
 			error?: string;
 		}>;
+		cancelWhisperModelDownload?: () => Promise<void>;
 		downloadWhisperSmallModel: () => Promise<{
 			success: boolean;
+			canceled?: boolean;
 			path?: string;
 			alreadyDownloaded?: boolean;
 			error?: string;
@@ -793,6 +856,8 @@ interface Window {
 			cues?: AutoCaptionCue[];
 			errorCode?: string;
 		}>;
+		cancelAutoCaptions?: () => Promise<void>;
+		onAutoCaptionProgress?: (onProgress: (percentage: number) => void) => () => void;
 		generateAutoCaptions: (options: {
 			videoPath: string;
 			whisperExecutablePath?: string;
@@ -800,6 +865,7 @@ interface Window {
 			language?: string;
 		}) => Promise<{
 			success: boolean;
+			canceled?: boolean;
 			cues?: AutoCaptionCue[];
 			transcript?: import("../src/components/video-editor/transcript").ProjectTranscript | null;
 			message?: string;
@@ -819,7 +885,7 @@ interface Window {
 				timeOffsetMs?: number;
 				hideOverlayCursorByDefault?: boolean;
 			},
-			options?: { preserveProjectPath?: boolean },
+			options?: { preserveProjectPath?: boolean; background?: "camera" | "audio" },
 		) => Promise<{ success: boolean }>;
 		getCurrentRecordingSession: () => Promise<{
 			success: boolean;
@@ -923,6 +989,7 @@ interface Window {
 		deleteProjectVersion: (versionPath: string) => Promise<{ success: boolean; message?: string }>;
 		pruneProjectVersions: () => Promise<{ success: boolean; deleted?: number; message?: string }>;
 		releaseCurrentProject: () => Promise<{ success: boolean; path: string | null }>;
+		setProjectAgentHandoff: (projectPath: string, handedOff: boolean) => Promise<{ success: boolean; message?: string }>;
 		getProjectsDirectory: () => Promise<{
 			success: boolean;
 			path?: string;
@@ -969,7 +1036,7 @@ interface Window {
 			}>;
 			error?: string;
 		}>;
-		openProjectFileAtPath: (filePath: string) => Promise<ProjectLoadResult>;
+		openProjectFileAtPath: (filePath: string, includeAgentHistory?: boolean) => Promise<ProjectLoadResult>;
 		openProjectsDirectory: () => Promise<{
 			success: boolean;
 			path?: string;
@@ -1039,6 +1106,7 @@ interface Window {
 		getShortcuts: () => Promise<Record<string, unknown> | null>;
 		saveShortcuts: (shortcuts: unknown) => Promise<{ success: boolean; error?: string }>;
 		getAppSetting: (key: string) => unknown;
+		patchEditorPreferences?: (changes: Record<string, unknown>, flush?: boolean) => Promise<boolean>;
 		getPreviewDisplayBounds: () => import("../src/components/video-editor/layout/previewWindowPlacement").PreviewWindowBounds[];
 		writeAppLog: (level: "info" | "warn" | "error", scope: string, message: string, detail?: string) => void;
 		exportDiagnosticsBundle: () => Promise<{ success: boolean; path?: string; canceled?: boolean; message?: string }>;
@@ -1049,6 +1117,7 @@ interface Window {
 		setDetachedPreviewFullscreen: (fullscreen: boolean) => Promise<boolean>;
 		onDetachedPreviewFullscreenChanged: (callback: (fullscreen: boolean) => void) => () => void;
 		setAppSetting: (key: string, value: unknown) => boolean;
+		setAppSettingAsync?: (key: string, value: unknown) => Promise<boolean>;
 		onAppLocaleChanged: (callback: (locale: string) => void) => () => void;
 		setHasUnsavedChanges: (hasChanges: boolean) => void;
 		onExternalProjectOpen: (callback: (filePath: string) => Promise<unknown>) => () => void;
@@ -1063,9 +1132,11 @@ interface Window {
 		}>;
 		/** Returns the app version from package.json */
 		getAppVersion: () => Promise<string>;
+		convertExportToGif?: (input: import("./ipc/export/gif").GifConversionRequest) =>
+			Promise<{ success: boolean; tempPath?: string; error?: string }>;
+		cancelExportGif?: (runId: string) => Promise<void>;
+		configureLeadCutAgent: (agent: "codex" | "claude") => Promise<{ success: boolean; error?: string }>;
 		/** Returns the configured remote announcement feed, or null when unavailable. */
-		/** Hide the OS cursor before browser capture starts. */
-		hideOsCursor: () => Promise<{ success: boolean }>;
 		/** Recording preferences (mic, system audio, webcam) */
 		getRecordingPreferences: () => Promise<{
 			success: boolean;

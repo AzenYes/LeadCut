@@ -1,8 +1,11 @@
 import { chapterCaptionSettings, drawChapterProgress } from "./chapterRenderer";
+import { ScreenOverlaySprites } from "./screenOverlaySprites";
+import { ExportVideoTexture } from "./exportVideoTexture";
+import { WebGpuNv12Readback } from "./webGpuNv12Readback";
 import { drawKeystrokes, getVisibleKeystrokes, type KeystrokePresentation } from "@/components/video-editor/keystrokes/keystrokeLayout";
 import { uiText } from "@/i18n/uiText";
 import { VideoLayerCompositor } from "../videoLayerCompositor";
-import { Application, BlurFilter, Container, Graphics, Rectangle, Sprite, Texture } from "pixi.js";
+import { Application, BlurFilter, Container, Graphics, NineSliceSprite, Rectangle, Sprite, Texture } from "pixi.js";
 import { MotionBlurFilter } from "pixi-filters/motion-blur";
 import { ZoomBlurFilter } from "pixi-filters/zoom-blur";
 import { getActiveCaptionLayout, prepareCaptionLayout } from "@/components/video-editor/captionLayout";
@@ -84,6 +87,7 @@ import {
 } from "@/lib/mediaTiming";
 import {
 	destroyPixiApplication,
+	getPixiRendererBackend,
 	initializePixiApplicationWithTimeout,
 } from "@/lib/pixiApplicationLifecycle";
 import { isVideoWallpaperSource } from "@/lib/wallpapers";
@@ -103,7 +107,7 @@ import {
 } from "./shadowProfile";
 import type { ExportRenderBackend } from "./types";
 
-interface FrameRenderConfig {
+export interface FrameRenderConfig {
 	videoRegions?: import("@/components/video-editor/videoTracks").VideoRegion[];
 	chapterProgress?: import("@/components/video-editor/chapterProgress").ChapterProgress;
 	keystrokes?: KeystrokePresentation;
@@ -112,6 +116,7 @@ interface FrameRenderConfig {
 	width: number;
 	height: number;
 	preferredRenderBackend?: ExportRenderBackend;
+	useGpuFramePipeline?: boolean;
 	wallpaper: string;
 	zoomRegions: ZoomRegion[];
 	showShadow: boolean;
@@ -197,7 +202,7 @@ interface MutableVideoTextureSource {
 
 interface ShadowLayer {
 	container: Container;
-	sprite: Sprite | null;
+	sprite: NineSliceSprite | null;
 	canvas: HTMLCanvasElement | null;
 	context: CanvasRenderingContext2D | null;
 	textureSource: MutableVideoTextureSource | null;
@@ -260,14 +265,6 @@ const NO_RENDERER_HINT = "no available renderer";
 const PIXI_RENDERER_INIT_TIMEOUT_MS = 8_000;
 const BACKGROUND_MEDIA_ELEMENT_READY_TIMEOUT_MS = 5_000;
 const WEBCAM_MEDIA_ELEMENT_READY_TIMEOUT_MS = 5_000;
-
-function isCanvasRenderer(application: Application): boolean {
-	const rendererName = application?.renderer?.constructor?.name?.toLowerCase();
-	return Boolean(
-		rendererName &&
-			(rendererName.includes("canvasrenderer") || rendererName.includes("canvas")),
-	);
-}
 
 function toErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error ?? "Unknown renderer init error");
@@ -372,7 +369,16 @@ function areNearlyEqual(first: number, second: number, epsilon = 0.01): boolean 
 
 // Renders video frames with all effects directly into a GPU-backed Pixi scene for export.
 export class FrameRenderer {
-	private videoLayers = new VideoLayerCompositor();
+	private readonly mediaAbort = new AbortController();
+	// Independent B-roll is drawn directly into the full-size output canvas.
+	// The render target already clips cover-fit sprites at its edges.
+	private videoLayers = new VideoLayerCompositor({
+		outputClipsVideoLayers: true,
+		webcamMipRenderer: () => {
+			const renderer = this.app?.renderer;
+			if (this.config.useGpuFramePipeline && renderer && "gpu" in renderer) return renderer;
+		},
+	});
 	private app: Application | null = null;
 	private rendererBackend: ExportRenderBackend = "webgl";
 	private backgroundContainer: Container | null = null;
@@ -388,6 +394,7 @@ export class FrameRenderer {
 	private videoSprite: Sprite | null = null;
 	private videoTextureSource: MutableVideoTextureSource | null = null;
 	private backgroundSprite: Sprite | null = null;
+	private compactSolidBackground: NineSliceSprite | null = null;
 	private backgroundTextureSource: MutableVideoTextureSource | null = null;
 	private videoMaskGraphics: Graphics | null = null;
 	private webcamMaskGraphics: Graphics | null = null;
@@ -415,6 +422,9 @@ export class FrameRenderer {
 	private webcamSeekPromise: Promise<void> | null = null;
 	private webcamFrameCacheCanvas: HTMLCanvasElement | null = null;
 	private webcamFrameCacheCtx: CanvasRenderingContext2D | null = null;
+	private webcamFrameCacheVideoFrame: VideoFrame | null = null;
+	private webcamUploadedFrame: { frame: VideoFrame; source: CanvasImageSource | VideoFrame } | null =
+		null;
 	private sceneVideoFrameStagingCanvas: HTMLCanvasElement | null = null;
 	private sceneVideoFrameStagingCtx: CanvasRenderingContext2D | null = null;
 	private backgroundVideoFrameStagingCanvas: HTMLCanvasElement | null = null;
@@ -430,6 +440,7 @@ export class FrameRenderer {
 	private captionSprite: Sprite | null = null;
 	private captionTextureSource: MutableVideoTextureSource | null = null;
 	private captionRenderKey: string | null = null;
+	private screenOverlays?: ScreenOverlaySprites;
 	private exportCompositeCanvas: ExportCompositeCanvasState | null = null;
 	private outputCanvasOverride: HTMLCanvasElement | null = null;
 	private config: FrameRenderConfig;
@@ -447,6 +458,8 @@ export class FrameRenderer {
 	private webcamRenderMode: "hidden" | "live" | "cached" = "hidden";
 	private webcamLayoutCache: WebcamLayoutCache | null = null;
 	private videoTextureUsesStartupStaging = false;
+	private exportVideoTexture: ExportVideoTexture | undefined;
+	private nv12Readback: WebGpuNv12Readback | null = null;
 	private webcamTextureUsesStartupStaging = false;
 	private retainedSceneSourceFrame: VideoFrame | null = null;
 	private retainedSceneTextureFrame: VideoFrame | null = null;
@@ -475,6 +488,25 @@ export class FrameRenderer {
 		return (this.config.zoomMotionBlur ?? 0) > 0;
 	}
 
+	private shouldAntialiasWebGpuOutput(): boolean {
+		const { width, height, showCursor, cursorTelemetry, webcam, videoRegions, videoTracks, chapterProgress, keystrokes } = this.config;
+		if (width * height < 3840 * 2160 || !this.shouldUseZoomMotionBlur() ||
+			(showCursor !== false && cursorTelemetry?.length)) return true;
+
+		const hasCameraTracksOnly = !videoRegions?.some(region =>
+			(region.kind ?? videoTracks?.find(track => track.id === region.trackId)?.kind) !== "webcam");
+		const hasMaskedWebcam = webcam?.enabled && Boolean(this.config.webcamUrl);
+		// Independent camera textures already carry antialiased edges.
+		// A direct webcam source still uses the Pixi graphics mask.
+		if (this.config.useGpuFramePipeline && width >= 3840 && width % 4 === 0 && height % 2 === 0 &&
+			!hasMaskedWebcam && !(this.config.borderRadius && this.config.borderRadius > 0) &&
+			!this.config.annotationRegions?.length && !this.config.autoCaptions?.length && hasCameraTracksOnly) return false;
+
+		// The scene filters draw the masked video into a separate target. Keep
+		// multisampling on the output when it also carries independent overlays.
+		return Boolean(webcam?.enabled || videoRegions?.length || chapterProgress?.enabled || keystrokes?.items.length);
+	}
+
 	private updateVideoEffectsFilterState(): void {
 		if (!this.videoEffectsContainer) {
 			return;
@@ -488,16 +520,11 @@ export class FrameRenderer {
 	}
 
 	async initialize(): Promise<void> {
-		let cursorOverlayEnabled = true;
-		try {
-			await preloadCursorAssets();
-		} catch (error) {
-			cursorOverlayEnabled = false;
-			console.warn(
-				"[FrameRenderer] Native cursor assets are unavailable; continuing export without cursor overlay.",
-				error,
-			);
-		}
+		const cursorAssetsReady = this.config.showCursor !== false && this.config.cursorTelemetry?.length
+			? preloadCursorAssets(this.config.cursorStyle).then(() => true, error => {
+				console.warn("[FrameRenderer] Native cursor assets are unavailable; continuing export without cursor overlay.", error);
+				return false;
+			}) : false;
 
 		const canvas = document.createElement("canvas");
 		canvas.width = this.config.width;
@@ -517,6 +544,14 @@ export class FrameRenderer {
 		const application = await this.createPixiApplication(canvas);
 		this.app = application.app;
 		this.rendererBackend = application.backend;
+		if (this.config.useGpuFramePipeline && "gpu" in application.app.renderer) {
+			const readback = await WebGpuNv12Readback.create(application.app.renderer.gpu.device, this.config.width, this.config.height);
+			if (this.mediaAbort.signal.aborted) {
+				readback?.destroy();
+				this.mediaAbort.signal.throwIfAborted();
+			}
+			this.nv12Readback = readback;
+		}
 
 		this.backgroundContainer = new Container();
 		this.cameraContainer = new Container();
@@ -559,15 +594,20 @@ export class FrameRenderer {
 		this.cameraContainer.addChild(this.annotationContainer);
 		this.overlayContainer.addChild(this.captionContainer);
 
-		this.videoMaskGraphics = new Graphics();
-		this.videoEffectsContainer.addChild(this.videoMaskGraphics);
-		this.videoContainer.mask = this.videoMaskGraphics;
+		const { cropRegion, borderRadius = 0 } = this.config;
+		const { x, y, width, height } = cropRegion;
+		// An uncropped rectangular sprite already covers exactly the video bounds.
+		if (borderRadius > 0 || x !== 0 || y !== 0 || width !== 1 || height !== 1) {
+			this.videoMaskGraphics = new Graphics();
+			this.videoEffectsContainer.addChild(this.videoMaskGraphics);
+			this.videoContainer.mask = this.videoMaskGraphics;
+		}
 
 		this.webcamMaskGraphics = new Graphics();
 		this.webcamContainer.addChild(this.webcamMaskGraphics);
 		this.webcamContainer.mask = this.webcamMaskGraphics;
 
-		if (cursorOverlayEnabled) {
+		if (await cursorAssetsReady) {
 			this.cursorOverlay = new PixiCursorOverlay({
 				dotRadius: DEFAULT_CURSOR_CONFIG.dotRadius * (this.config.cursorSize ?? 1.4),
 				style: this.config.cursorStyle ?? "tahoe",
@@ -665,6 +705,7 @@ export class FrameRenderer {
 					{
 						...baseOptions,
 						preference: backend,
+						webgpu: { antialias: this.shouldAntialiasWebGpuOutput() },
 					},
 					PIXI_RENDERER_INIT_TIMEOUT_MS,
 					backend,
@@ -673,12 +714,13 @@ export class FrameRenderer {
 					(typeof performance === "undefined" ? Date.now() : performance.now()) -
 						initStarted,
 				);
-				if (isCanvasRenderer(app)) {
+				const initializedBackend = getPixiRendererBackend(app);
+				if (!initializedBackend) {
 					throw new Error(
-						`Renderer initialized with unsupported fallback backend after ${elapsed}ms: ${app.renderer.constructor?.name ?? "unknown"}`,
+						`Renderer initialized with unsupported fallback backend after ${elapsed}ms: ${app.renderer.name || "unknown"}`,
 					);
 				}
-				return { app, backend };
+				return { app, backend: initializedBackend };
 			} catch (error) {
 				const elapsed = Math.round(
 					(typeof performance === "undefined" ? Date.now() : performance.now()) -
@@ -756,7 +798,7 @@ export class FrameRenderer {
 			layer.textureSource = nextTexture.source as unknown as MutableVideoTextureSource;
 			previousTexture.destroy(true);
 		} else {
-			layer.sprite = new Sprite(nextTexture);
+			layer.sprite = new NineSliceSprite({ texture: nextTexture });
 			layer.container.addChild(layer.sprite);
 			layer.textureSource = nextTexture.source as unknown as MutableVideoTextureSource;
 		}
@@ -781,11 +823,16 @@ export class FrameRenderer {
 		}
 
 		const padding = getShadowFilterPadding(options.blur, options.offsetY);
-		this.ensureShadowLayerCanvas(
-			layer,
-			options.width + padding * 2,
-			options.height + padding * 2,
-		);
+		const fullWidth = Math.ceil(options.width + padding * 2);
+		const fullHeight = Math.ceil(options.height + padding * 2);
+		const radius = Math.min(Math.max(0, options.radius), options.width / 2, options.height / 2);
+		const cornerReach = Math.ceil(radius + options.blur * 3) + 2;
+		const horizontalEdge = padding + cornerReach;
+		const topEdge = horizontalEdge + Math.ceil(options.offsetY);
+		const bottomEdge = horizontalEdge - Math.floor(options.offsetY);
+		const compactWidth = Math.min(fullWidth, horizontalEdge * 2 + 1);
+		const compactHeight = Math.min(fullHeight, topEdge + bottomEdge + 1);
+		this.ensureShadowLayerCanvas(layer, compactWidth, compactHeight);
 
 		if (!layer.context || !layer.canvas || !layer.sprite) {
 			layer.container.visible = false;
@@ -799,14 +846,22 @@ export class FrameRenderer {
 		drawSquircleOnCanvas(layer.context, {
 			x: padding,
 			y: padding + options.offsetY,
-			width: options.width,
-			height: options.height,
-			radius: options.radius,
+			// Remove whole pixels so the opposite edges keep their subpixel alignment.
+			width: options.width - (fullWidth - compactWidth),
+			height: options.height - (fullHeight - compactHeight),
+			radius,
 		});
 		layer.context.fill();
 		layer.context.restore();
 
 		layer.sprite.position.set(options.x - padding, options.y - padding);
+		layer.sprite.width = fullWidth;
+		layer.sprite.height = fullHeight;
+		const horizontalSlice = compactWidth < fullWidth ? horizontalEdge : 0;
+		layer.sprite.leftWidth = horizontalSlice;
+		layer.sprite.rightWidth = horizontalSlice;
+		layer.sprite.topHeight = compactHeight < fullHeight ? topEdge : 0;
+		layer.sprite.bottomHeight = compactHeight < fullHeight ? bottomEdge : 0;
 		layer.textureSource?.update();
 		layer.container.alpha = 1;
 		layer.container.visible = true;
@@ -1100,6 +1155,10 @@ export class FrameRenderer {
 		this.backgroundSprite?.destroy({ texture: false, textureSource: false });
 		backgroundTexture?.destroy(true);
 
+		const compactTexture = this.compactSolidBackground?.texture;
+		this.compactSolidBackground?.destroy({ texture: false, textureSource: false });
+		compactTexture?.destroy(true);
+		this.compactSolidBackground = null;
 		this.backgroundSprite = null;
 		this.backgroundTextureSource = null;
 		this.backgroundBlurFilter = null;
@@ -1119,7 +1178,7 @@ export class FrameRenderer {
 				}
 
 				try {
-					const frameSource = new ForwardFrameSource();
+					const frameSource = new ForwardFrameSource(this.mediaAbort.signal);
 					const metadata = await frameSource.initialize(videoSrc);
 					this.backgroundForwardFrameSource = frameSource;
 					this.backgroundForwardFrameSourceUrl = videoSrc;
@@ -1134,6 +1193,7 @@ export class FrameRenderer {
 					this.lastSyncedBackgroundLoopTimeSec = null;
 					return;
 				} catch (error) {
+					this.mediaAbort.signal.throwIfAborted();
 					console.warn(
 						"[FrameRenderer] Decoder-backed video wallpaper unavailable during export; falling back to media element sync:",
 						error,
@@ -1145,6 +1205,8 @@ export class FrameRenderer {
 				}
 				return;
 			}
+
+			if (this.setupCompactSolidBackground(wallpaper)) return;
 
 			const bgCanvas = document.createElement("canvas");
 			bgCanvas.width = this.config.width;
@@ -1364,6 +1426,49 @@ export class FrameRenderer {
 		);
 	}
 
+	private setupCompactSolidBackground(wallpaper: string): boolean {
+		if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(wallpaper)) return false;
+		const { width, height, backgroundBlur } = this.config;
+		const { backgroundBlurPx } = getSceneEffectMetrics({
+			viewportWidth: width,
+			backgroundBlur,
+			shadowIntensity: 0,
+		});
+		// Preserve the original scale of the blurred edges and stretch only the uniform center.
+		const edge = backgroundBlurPx > 0 ? Math.ceil(backgroundBlurPx * 3) + 2 : 0;
+		const size = edge * 2 + 1;
+		if (size >= Math.min(width, height)) return false;
+
+		const tile = document.createElement("canvas");
+		tile.width = size;
+		tile.height = size;
+		const context = tile.getContext("2d");
+		if (!context) return false;
+		context.fillStyle = wallpaper;
+		context.fillRect(0, 0, size, size);
+		if (!edge) {
+			this.backgroundSprite = new Sprite(Texture.from(tile));
+			this.backgroundSprite.width = width;
+			this.backgroundSprite.height = height;
+			this.backgroundContainer?.addChild(this.backgroundSprite);
+			return true;
+		}
+
+		const blurred = this.createPreblurredBackgroundCanvas(tile);
+		if (!blurred) return false;
+		this.compactSolidBackground = new NineSliceSprite({
+			texture: Texture.from(blurred),
+			width,
+			height,
+			leftWidth: edge,
+			rightWidth: edge,
+			topHeight: edge,
+			bottomHeight: edge,
+		});
+		this.backgroundContainer?.addChild(this.compactSolidBackground);
+		return true;
+	}
+
 	private createPreblurredBackgroundCanvas(
 		sourceCanvas: HTMLCanvasElement,
 	): HTMLCanvasElement | null {
@@ -1411,7 +1516,7 @@ export class FrameRenderer {
 			return;
 		}
 
-		const nextSource = new ForwardFrameSource();
+		const nextSource = new ForwardFrameSource(this.mediaAbort.signal);
 		const metadata = await nextSource.initialize(sourceUrl);
 		const previousSource = this.backgroundForwardFrameSource;
 
@@ -1808,6 +1913,7 @@ export class FrameRenderer {
 				try {
 					await this.restartBackgroundForwardFrameSource();
 				} catch (error) {
+					this.mediaAbort.signal.throwIfAborted();
 					console.warn(
 						"[FrameRenderer] Unable to restart looping video wallpaper decoder during export:",
 						error,
@@ -1820,6 +1926,7 @@ export class FrameRenderer {
 				decodedFrame =
 					await this.backgroundForwardFrameSource.getFrameAtTime(normalizedTargetTime);
 			} catch (error) {
+				this.mediaAbort.signal.throwIfAborted();
 				console.warn(
 					"[FrameRenderer] Decoder-backed video wallpaper failed during export; falling back to media element sync:",
 					error,
@@ -1867,6 +1974,7 @@ export class FrameRenderer {
 					}
 					return;
 				} catch (error) {
+					this.mediaAbort.signal.throwIfAborted();
 					console.warn(
 						"[FrameRenderer] Unable to wrap looping video wallpaper at decoded EOF during export:",
 						error,
@@ -2292,6 +2400,8 @@ export class FrameRenderer {
 		this.clearWebcamMediaElement();
 		this.webcamFrameCacheCanvas = null;
 		this.webcamFrameCacheCtx = null;
+		this.webcamFrameCacheVideoFrame = null;
+		this.webcamUploadedFrame = null;
 		this.webcamLayoutCache = null;
 		this.webcamRenderMode = "hidden";
 		this.lastSyncedWebcamTime = null;
@@ -2299,7 +2409,7 @@ export class FrameRenderer {
 		if (!this.config.webcam?.enabled || !webcamUrl) return;
 
 		try {
-			const frameSource = new ForwardFrameSource();
+			const frameSource = new ForwardFrameSource(this.mediaAbort.signal);
 			await frameSource.initialize(webcamUrl);
 			this.webcamForwardFrameSource = frameSource;
 			this.webcamVideoElement = null;
@@ -2307,6 +2417,7 @@ export class FrameRenderer {
 			this.lastSyncedWebcamTime = null;
 			return;
 		} catch (error) {
+			this.mediaAbort.signal.throwIfAborted();
 			console.warn(
 				"[FrameRenderer] Decoder-backed webcam source unavailable during export; falling back to media element sync:",
 				error,
@@ -2323,6 +2434,24 @@ export class FrameRenderer {
 		sourceHeight: number,
 	): void {
 		if (!this.webcamContainer) {
+			return;
+		}
+
+		if (this.webcamRootContainer) {
+			this.webcamRootContainer.visible = sourceWidth > 0 && sourceHeight > 0;
+		}
+		const frame =
+			source === this.webcamFrameCacheCanvas
+				? this.webcamFrameCacheVideoFrame
+				: source === this.webcamDecodedFrame
+					? this.webcamDecodedFrame
+					: null;
+		if (
+			frame &&
+			this.webcamTextureSource &&
+			this.webcamUploadedFrame?.frame === frame &&
+			this.webcamUploadedFrame.source === source
+		) {
 			return;
 		}
 
@@ -2346,9 +2475,7 @@ export class FrameRenderer {
 			this.webcamTextureSource.update();
 		}
 
-		if (this.webcamRootContainer) {
-			this.webcamRootContainer.visible = sourceWidth > 0 && sourceHeight > 0;
-		}
+		this.webcamUploadedFrame = frame && this.webcamTextureSource ? { frame, source } : null;
 	}
 
 	private setWebcamRenderMode(nextMode: "hidden" | "live" | "cached"): void {
@@ -2379,6 +2506,7 @@ export class FrameRenderer {
 		}
 
 		this.webcamFrameCacheCanvas = document.createElement("canvas");
+		this.webcamFrameCacheVideoFrame = null;
 		this.webcamFrameCacheCanvas.width = targetWidth;
 		this.webcamFrameCacheCanvas.height = targetHeight;
 		this.webcamFrameCacheCtx = configureHighQuality2DContext(
@@ -2401,6 +2529,9 @@ export class FrameRenderer {
 		if (!this.webcamFrameCacheCanvas || !this.webcamFrameCacheCtx) {
 			return false;
 		}
+		if (source === this.webcamFrameCacheVideoFrame) {
+			return true;
+		}
 
 		this.webcamFrameCacheCtx.clearRect(
 			0,
@@ -2419,6 +2550,8 @@ export class FrameRenderer {
 			this.webcamFrameCacheCanvas.width,
 			this.webcamFrameCacheCanvas.height,
 		);
+		this.webcamFrameCacheVideoFrame =
+			source === this.webcamDecodedFrame ? this.webcamDecodedFrame : null;
 		return true;
 	}
 
@@ -2575,10 +2708,14 @@ export class FrameRenderer {
 		if (this.webcamForwardFrameSource) {
 			const clampedTime = clampMediaTimeToDuration(webcamTargetTime, null);
 			try {
-				const decodedFrame =
-					await this.webcamForwardFrameSource.getFrameAtTime(clampedTime);
-				this.closeWebcamDecodedFrame();
-				this.webcamDecodedFrame = decodedFrame;
+				const decodedFrame = await this.webcamForwardFrameSource.getFrameAtTime(
+					clampedTime,
+					this.webcamDecodedFrame,
+				);
+				if (decodedFrame !== this.webcamDecodedFrame) {
+					this.closeWebcamDecodedFrame();
+					this.webcamDecodedFrame = decodedFrame;
+				}
 				if (decodedFrame) {
 					this.lastSyncedWebcamTime = clampedTime;
 				}
@@ -2870,7 +3007,7 @@ export class FrameRenderer {
 		_frameDurationUs?: number,
 		backgroundTimelineTimestamp = timestamp,
 	): Promise<void> {
-		if (!this.app || !this.videoContainer || !this.cameraContainer || !this.videoMaskGraphics) {
+		if (!this.app || !this.videoContainer || !this.cameraContainer) {
 			throw new Error("Renderer not initialized");
 		}
 
@@ -2881,7 +3018,7 @@ export class FrameRenderer {
 		this.cameraContainer.visible = videoFrame !== null;
 		if (!videoFrame) {
 			this.updateAnimationState(backgroundTimelineTimestamp / 1000, cursorTimestamp / 1000);
-			await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale });
+			await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale }, this.mediaAbort.signal);
 			if (this.config.autoCaptions?.[0]?.timeBasis === "timeline") this.updateCaptionLayer(backgroundTimelineTimestamp / 1000);
 			if (this.backgroundForwardFrameSource || this.backgroundVideoElement) {
 				await this.syncBackgroundFrame(backgroundTimelineTimestamp / 1_000_000);
@@ -2889,37 +3026,12 @@ export class FrameRenderer {
 			if (this.webcamRootContainer) this.webcamRootContainer.visible = false;
 			if (this.captionContainer && this.config.autoCaptions?.[0]?.timeBasis !== "timeline") this.captionContainer.visible = false;
 			// Gap frames must bypass canvas annotation compositing as well as Pixi layers.
-			this.outputCanvasOverride = null;
-			this.app.render();
-			this.composeScreenOverlays(backgroundTimelineTimestamp / 1000);
+			this.renderSceneWithScreenOverlays(backgroundTimelineTimestamp / 1000);
 			return;
 		}
 		if (this.captionContainer) this.captionContainer.visible = true;
 
-		const resolvedVideoSource = await this.resolveDetachedVideoFrameSource(
-			videoFrame,
-			"scene",
-			this.config.videoWidth,
-			this.config.videoHeight,
-		);
-		const usesStartupStaging = resolvedVideoSource !== videoFrame;
-
-		if (!this.videoSprite) {
-			const texture = this.createTextureFromSource(resolvedVideoSource);
-			this.videoSprite = new Sprite(texture);
-			this.videoTextureSource = texture.source as unknown as MutableVideoTextureSource;
-			this.videoContainer.addChildAt(this.videoSprite, 0);
-			this.videoTextureUsesStartupStaging = usesStartupStaging;
-		} else if (this.videoTextureUsesStartupStaging !== usesStartupStaging) {
-			this.videoTextureSource = this.replaceSpriteTexture(
-				this.videoSprite,
-				resolvedVideoSource,
-			);
-			this.videoTextureUsesStartupStaging = usesStartupStaging;
-		} else if (this.videoTextureSource) {
-			this.videoTextureSource.resource = resolvedVideoSource;
-			this.videoTextureSource.update();
-		}
+		await this.updatePrimaryVideoTexture(videoFrame, this.app.renderer, this.videoContainer);
 
 		if (!this.layoutCache) {
 			this.updateLayout();
@@ -2975,16 +3087,67 @@ export class FrameRenderer {
 			motionBlurState: this.motionBlurState,
 			frameTimeMs: timeMs,
 		});
+		if (this.motionBlurFilter && this.zoomBlurFilter) {
+			const { x, y } = this.motionBlurFilter.velocity;
+			const hasZoomBlur = this.zoomBlurFilter.strength !== 0;
+			this.zoomBlurFilter.enabled = hasZoomBlur;
+			// Keep the directional filter as a passthrough when both effects are idle.
+			// This preserves the scene's separate render target and its bounds.
+			this.motionBlurFilter.enabled = !hasZoomBlur || x !== 0 || y !== 0;
+			this.zoomBlurFilter.padding = this.motionBlurFilter.enabled ? 0 : this.motionBlurFilter.padding;
+		}
 
 		this.updateAnnotationLayer(timeMs);
 		this.updateCaptionLayer(getCaptionTimeMs(this.config.autoCaptions ?? [], timestamp / 1000, backgroundTimelineTimestamp / 1000));
 		this.updateWebcamOverlay();
-		await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale });
+		await this.videoLayers.syncExport(backgroundTimelineTimestamp / 1000, { regions: this.config.videoRegions ?? [], tracks: this.config.videoTracks ?? [], webcam: this.config.webcam, width: this.config.width, height: this.config.height, zoomScale: this.animationState.appliedScale }, this.mediaAbort.signal);
 		await this.renderOutput(timeMs, backgroundTimelineTimestamp / 1000);
+	}
+
+	private async updatePrimaryVideoTexture(videoFrame: VideoFrame, renderer: Application["renderer"], layer: Container): Promise<void> {
+		if (this.config.useGpuFramePipeline && "gpu" in renderer) {
+			this.exportVideoTexture ??= new ExportVideoTexture(renderer);
+			const texture = await this.exportVideoTexture.upload(videoFrame, this.mediaAbort.signal);
+			if (texture) {
+				if (!this.videoSprite) {
+					this.videoSprite = new Sprite(texture);
+					layer.addChildAt(this.videoSprite, 0);
+				} else if (this.videoSprite.texture !== texture) {
+					const previous = this.videoSprite.texture;
+					this.videoSprite.texture = texture;
+					previous.destroy(true);
+				}
+				this.videoTextureSource = null;
+				this.closeRetainedBitmap("scene");
+				this.closeRetainedVideoFrame("scene");
+				return;
+			}
+		}
+
+		const source = await this.resolveDetachedVideoFrameSource(
+			videoFrame, "scene", this.config.videoWidth, this.config.videoHeight,
+		);
+		const usesStartupStaging = source !== videoFrame;
+		if (!this.videoSprite) {
+			const texture = this.createTextureFromSource(source);
+			this.videoSprite = new Sprite(texture);
+			this.videoTextureSource = texture.source as unknown as MutableVideoTextureSource;
+			layer.addChildAt(this.videoSprite, 0);
+			this.videoTextureUsesStartupStaging = usesStartupStaging;
+		} else if (this.exportVideoTexture?.usesTexture(this.videoSprite.texture) ||
+			this.videoTextureUsesStartupStaging !== usesStartupStaging) {
+			this.videoTextureSource = this.replaceSpriteTexture(this.videoSprite, source);
+			this.videoTextureUsesStartupStaging = usesStartupStaging;
+			this.exportVideoTexture?.forgetTexture();
+		} else if (this.videoTextureSource) {
+			this.videoTextureSource.resource = source;
+			this.videoTextureSource.update();
+		}
 	}
 
 	private async renderOutput(timeMs: number, chapterTimeMs = timeMs): Promise<void> {
 		if (this.hasActiveBlurAnnotations(timeMs)) {
+			this.screenOverlays?.setVisible(false);
 			const annotationContainerVisible = this.annotationContainer?.visible ?? true;
 			const captionContainerVisible = this.captionContainer?.visible ?? true;
 
@@ -3009,9 +3172,25 @@ export class FrameRenderer {
 			return;
 		}
 
+		this.renderSceneWithScreenOverlays(chapterTimeMs);
+	}
+
+	private renderSceneWithScreenOverlays(timeMs: number): void {
+		const app = this.app;
+		if (!app) return;
+
 		this.outputCanvasOverride = null;
-		this.app!.render();
-		this.composeScreenOverlays(chapterTimeMs);
+		const useScreenSprites = this.rendererBackend === "webgpu";
+		if (useScreenSprites && (this.config.chapterProgress?.enabled || this.config.keystrokes?.items.length)) {
+			this.screenOverlays ??= new ScreenOverlaySprites(app.stage, this.config);
+			this.screenOverlays.update(this.config.chapterProgress, this.config.keystrokes, timeMs);
+		}
+		app.render();
+		if (this.nv12Readback) {
+			const texture = (app.canvas as HTMLCanvasElement).getContext("webgpu")?.getCurrentTexture();
+			if (texture) this.nv12Readback.begin(texture);
+		}
+		if (!useScreenSprites) this.composeScreenOverlays(timeMs);
 	}
 
 	private composeScreenOverlays(timeMs: number): void {
@@ -3027,7 +3206,7 @@ export class FrameRenderer {
 	}
 
 	private updateLayout(): void {
-		if (!this.app || !this.videoSprite || !this.videoMaskGraphics) return;
+		if (!this.app || !this.videoSprite) return;
 
 		const {
 			width,
@@ -3058,15 +3237,17 @@ export class FrameRenderer {
 			borderRadius,
 		);
 
-		this.videoMaskGraphics.clear();
-		drawSquircleOnGraphics(this.videoMaskGraphics, {
-			x: layout.centerOffsetX,
-			y: layout.centerOffsetY,
-			width: layout.croppedDisplayWidth,
-			height: layout.croppedDisplayHeight,
-			radius: scaledBorderRadius,
-		});
-		this.videoMaskGraphics.fill({ color: 0xffffff });
+		if (this.videoMaskGraphics) {
+			this.videoMaskGraphics.clear();
+			drawSquircleOnGraphics(this.videoMaskGraphics, {
+				x: layout.centerOffsetX,
+				y: layout.centerOffsetY,
+				width: layout.croppedDisplayWidth,
+				height: layout.croppedDisplayHeight,
+				radius: scaledBorderRadius,
+			});
+			this.videoMaskGraphics.fill({ color: 0xffffff });
+		}
 
 		this.updateVideoShadowLayout({
 			maskX: layout.centerOffsetX,
@@ -3228,6 +3409,11 @@ export class FrameRenderer {
 		return this.outputCanvasOverride ?? (this.app.canvas as HTMLCanvasElement);
 	}
 
+	waitForGpuWork(): Promise<void> | undefined {
+		const renderer = this.app?.renderer;
+		return renderer && "gpu" in renderer ? renderer.gpu.device.queue.onSubmittedWorkDone() : undefined;
+	}
+
 	capturePixelsForNativeExport(): Uint8ClampedArray | null {
 		if (!this.app) {
 			return null;
@@ -3252,12 +3438,63 @@ export class FrameRenderer {
 		return this.rendererBackend;
 	}
 
+	takeGpuOutputFrame(timestamp: number, duration: number): Promise<VideoFrame> | undefined {
+		return this.nv12Readback?.takeFrame(timestamp, duration);
+	}
+
+	async recoverCanvasAfterGpuReadbackFailure(): Promise<boolean> {
+		const app = this.app;
+		const renderer = app?.renderer;
+		const signal = this.mediaAbort.signal;
+		if (!app || !renderer || !("gpu" in renderer) || !this.nv12Readback || signal.aborted) {
+			return false;
+		}
+
+		this.releaseGpuReadback();
+		const device = renderer.gpu.device;
+		const deadline = AbortSignal.any([signal, AbortSignal.timeout(500)]);
+		let onInterrupt: (() => void) | undefined;
+		const interrupted = new Promise<boolean>(resolve => {
+			onInterrupt = () => resolve(false);
+			deadline.addEventListener("abort", onInterrupt, { once: true });
+		});
+		try {
+			const ready = await Promise.race([
+				device.lost.then(() => false),
+				device.queue.onSubmittedWorkDone().then(() => true),
+				interrupted,
+			]);
+			if (!ready || deadline.aborted) return false;
+			// The presentation texture may have expired while waiting for the readback.
+			app.render();
+			return true;
+		} catch {
+			return false;
+		} finally {
+			if (onInterrupt) deadline.removeEventListener("abort", onInterrupt);
+		}
+	}
+
+	private releaseGpuReadback(): void {
+		this.nv12Readback?.destroy();
+		this.nv12Readback = null;
+	}
+
+	cancelPendingMedia(): void {
+		this.mediaAbort.abort();
+		this.releaseGpuReadback();
+	}
+
 	destroy(): void {
+		this.cancelPendingMedia();
 		this.videoLayers.destroy();
+		this.screenOverlays?.destroy();
+		this.screenOverlays = undefined;
 		const texturesToDestroy = new Set<Texture>();
 		for (const sprite of [
 			this.videoSprite,
 			this.backgroundSprite,
+			this.compactSolidBackground,
 			this.webcamSprite,
 			this.captionSprite,
 			...this.videoShadowLayers.map((layer) => layer.sprite),
@@ -3307,7 +3544,9 @@ export class FrameRenderer {
 		this.webcamContainer = null;
 		this.videoSprite = null;
 		this.videoTextureSource = null;
+		this.exportVideoTexture = undefined;
 		this.backgroundSprite = null;
+		this.compactSolidBackground = null;
 		this.backgroundTextureSource = null;
 		this.videoMaskGraphics = null;
 		this.webcamMaskGraphics = null;
@@ -3349,6 +3588,8 @@ export class FrameRenderer {
 		this.cleanupWebcamSource = null;
 		this.webcamFrameCacheCanvas = null;
 		this.webcamFrameCacheCtx = null;
+		this.webcamFrameCacheVideoFrame = null;
+		this.webcamUploadedFrame = null;
 		this.sceneVideoFrameStagingCanvas = null;
 		this.sceneVideoFrameStagingCtx = null;
 		this.webcamVideoFrameStagingCanvas = null;

@@ -22,7 +22,10 @@ function setup(bindings: Partial<ShortcutsConfig> = {}, repeatable?: ReadonlySet
 		removeEventListener: vi.fn(),
 	});
 	const actions = Object.fromEntries(SHORTCUT_ACTIONS.map(action => [action, vi.fn()])) as Record<ShortcutAction, ReturnType<typeof vi.fn>>;
-	useEditorShortcuts({ ...DEFAULT_SHORTCUTS, ...bindings }, true, actions, repeatable);
+	const fixedDelete = vi.fn(() => true);
+	useEditorShortcuts({ ...DEFAULT_SHORTCUTS, ...bindings }, true, actions, {
+		repeatable, fixedActions: { deleteSelection: fixedDelete },
+	});
 	const send = (type = "keydown", options: Record<string, unknown> = {}) => {
 		const event = {
 			key: " ",
@@ -40,7 +43,7 @@ function setup(bindings: Partial<ShortcutsConfig> = {}, repeatable?: ReadonlySet
 		handlers.get(type)!(event as unknown as KeyboardEvent);
 		return event;
 	};
-	return { send, actions };
+	return { send, actions, fixedDelete };
 }
 
 describe("editor playback shortcut", () => {
@@ -106,6 +109,14 @@ it("uses the new binding anywhere in the editor and ignores its previous key", (
 	expect(actions.splitClip).toHaveBeenCalledOnce();
 	send("keydown", { key: "b", code: "KeyB", metaKey: true, repeat: true });
 	expect(actions.splitClip).toHaveBeenCalledOnce();
+});
+
+it("dispatches fixed deletion once and lets the transcript grid own its deletion", () => {
+	const { send, fixedDelete } = setup();
+	expect(send("keydown", { key: "Delete" }).preventDefault).toHaveBeenCalledOnce();
+	const target = { matches: (selector: string) => selector === "[data-caption-transcript-grid]" };
+	expect(send("keydown", { key: "Delete", target }).preventDefault).not.toHaveBeenCalled();
+	expect(fixedDelete).toHaveBeenCalledOnce();
 });
 
 it("preserves source audio controls and limits repeating events to the allowed actions", () => {

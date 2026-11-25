@@ -2,33 +2,13 @@ import { useCallback, useEffect, useState } from "react";
 import { getVersionedAudioResourceUrl } from "@/components/video-editor/audio/audioResourceVersion";
 import { getLocalFilePath, resolveMediaResourceUrl } from "@/lib/exporter/localMediaSource";
 import { WaveformMediaNotFoundError, waveformGenerator } from "../../audio/waveform/WaveformGenerator";
-import { fromFileUrl } from "../../projectPersistence";
 import { WAVEFORM_DEFAULT_PEAK_COUNT } from "../core/constants";
 import type { AudioPeaksData } from "../core/timelineTypes";
 
 const EMPTY_FALLBACK_RESOURCES: string[] = [];
 let nextWaveformRequestId = 0;
 
-function buildSidecarAudioCandidates(sourcePath: string): string[] {
-	const normalized = sourcePath.replace(/\\/g, "/");
-	const lastSlash = normalized.lastIndexOf("/");
-	const dir = lastSlash >= 0 ? normalized.slice(0, lastSlash + 1) : "";
-	const fileName = lastSlash >= 0 ? normalized.slice(lastSlash + 1) : normalized;
-	const dotIndex = fileName.lastIndexOf(".");
-	const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
-
-	return [
-		`${dir}${baseName}.system.wav`,
-		`${dir}${baseName}.mic.wav`,
-		`${dir}${baseName}.system.m4a`,
-		`${dir}${baseName}.mic.m4a`,
-		`${dir}${baseName}.system.webm`,
-		`${dir}${baseName}.mic.webm`,
-	];
-}
-
 interface TimelineAudioPeaksOptions {
-	enableSourceSidecarFallback?: boolean;
 	fallbackResources?: string[];
 	optionalSource?: boolean;
 	peakCount?: number;
@@ -54,7 +34,6 @@ export function useTimelineAudioPeaks(
 	const [error, setError] = useState<string | null>(null);
 	const [attempt, setAttempt] = useState(0);
 	const retry = useCallback(() => setAttempt((current) => current + 1), []);
-	const enableSourceSidecarFallback = options.enableSourceSidecarFallback ?? false;
 	const fallbackResources = options.fallbackResources ?? EMPTY_FALLBACK_RESOURCES;
 	const optionalSource = options.optionalSource ?? false;
 	const peakCount = options.peakCount ?? WAVEFORM_DEFAULT_PEAK_COUNT;
@@ -101,12 +80,7 @@ export function useTimelineAudioPeaks(
 				}
 			};
 
-			const localPath = getLocalFilePath(mediaResource) || fromFileUrl(mediaResource);
-			const sourceSidecarCandidates = enableSourceSidecarFallback && localPath
-				? buildSidecarAudioCandidates(localPath) : EMPTY_FALLBACK_RESOURCES;
-			const candidates = Array.from(
-				new Set([mediaResource, ...fallbackResources, ...sourceSidecarCandidates]),
-			);
+			const candidates = [...new Set([mediaResource, ...fallbackResources])];
 			let failure: string | null = null;
 			for (const candidate of candidates) {
 				if (cancelled) return;
@@ -136,7 +110,7 @@ export function useTimelineAudioPeaks(
 			cancelled = true;
 			unsubscribe?.();
 		};
-	}, [mediaResource, enableSourceSidecarFallback, fallbackResources, optionalSource, peakCount, resourceVersion, attempt]);
+	}, [mediaResource, fallbackResources, optionalSource, peakCount, resourceVersion, attempt]);
 
 	return { peaks: result?.peaks ?? null, resource: result?.resource ?? null, loading, progress, error, retry };
 }

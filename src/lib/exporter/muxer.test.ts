@@ -183,4 +183,18 @@ describe("VideoMuxer target selection", () => {
 
 		expect(closeSpy).toHaveBeenCalledWith("stream-abort", { abort: true });
 	});
+
+	it("forwards the fragmented MP4 to the pipe and reports write failures on finalization", async () => {
+		const write = vi.fn<(_: Uint8Array) => Promise<void>>().mockResolvedValueOnce(undefined)
+			.mockRejectedValueOnce(new Error("Output disk full"));
+		const muxer = new VideoMuxer(baseConfig, false, write);
+		await muxer.initialize();
+		expect(muxer.getTargetMode()).toBe("pipe");
+		await muxer.finalizePipe();
+		expect(write).toHaveBeenCalledWith(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+
+		const failedMuxer = new VideoMuxer(baseConfig, false, write);
+		await failedMuxer.initialize();
+		await expect(failedMuxer.finalizePipe()).rejects.toThrow("Output disk full");
+	});
 });

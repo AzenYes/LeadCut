@@ -3,6 +3,15 @@ import type { ExportEncodeBackend, ExportEncodingMode } from "./types";
 const DEFAULT_ENCODING_MODE: ExportEncodingMode = "balanced";
 type WebCodecsLatencyMode = "quality" | "realtime";
 const BASELINE_PIXELS_PER_SECOND = 1280 * 720 * 60;
+const ENCODE_QUEUE_BUDGET_BYTES = 256 * 1024 * 1024;
+const LARGE_FRAME_BYTES = 24 * 1024 * 1024;
+const LARGE_FRAME_QUEUE_BYTES = 64 * 1024 * 1024;
+
+export function capEncodeQueueForFrameSize(limit: number, width: number, height: number): number {
+	const bytesPerFrame = Math.max(1, width) * Math.max(1, height) * 4;
+	const budget = bytesPerFrame >= LARGE_FRAME_BYTES ? LARGE_FRAME_QUEUE_BYTES : ENCODE_QUEUE_BUDGET_BYTES;
+	return Math.max(1, Math.min(limit, Math.floor(budget / bytesPerFrame)));
+}
 
 const LATENCY_MODE_PREFERENCES: Record<ExportEncodingMode, readonly WebCodecsLatencyMode[]> = {
 	fast: ["realtime", "quality"],
@@ -123,7 +132,20 @@ export function getExportBackpressureProfile(
 	const isHighCoreSystem = hardwareConcurrency >= 8;
 	const isHeavyWorkload = relativePixelRate >= 1.5;
 	const isExtremeWorkload = relativePixelRate >= 3;
-	const maxEncodeQueue = getWebCodecsEncodeQueueLimit(options.frameRate, options.encodingMode);
+	const maxEncodeQueue = capEncodeQueueForFrameSize(
+		getWebCodecsEncodeQueueLimit(options.frameRate, options.encodingMode),
+		options.width,
+		options.height,
+	);
+	if (options.width * options.height * 4 >= LARGE_FRAME_BYTES) {
+		return {
+			name: options.encodeBackend === "ffmpeg" ? "breeze-conservative" : "webcodecs-conservative",
+			maxEncodeQueue,
+			maxDecodeQueue: 3,
+			maxPendingFrames: 4,
+			maxInFlightNativeWrites: 1,
+		};
+	}
 
 	if (options.encodeBackend === "ffmpeg") {
 		if (isLowCoreSystem || isExtremeWorkload) {

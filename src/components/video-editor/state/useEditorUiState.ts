@@ -4,6 +4,7 @@ import type { loadEditorPreferences } from "../editorPreferences";
 import type { TimelineEditorHandle } from "../timeline/TimelineEditor";
 import type { CropRegion, EditorEffectSection } from "../types";
 import type { VideoPlaybackRef } from "../VideoPlayback";
+import { createPlaybackClock } from "../videoPlayback/playbackClock";
 
 type SessionPresentation = {
 	hideOverlayCursorByDefault?: boolean;
@@ -19,7 +20,7 @@ export function useEditorUiState(
 		typeof navigator !== "undefined" && /Mac/i.test(navigator.platform) ? "darwin" : "",
 	);
 	const [isPlaying, setIsPlaying] = useState(false);
-	const [currentTime, setCurrentTime] = useState(0);
+	const [playbackClock] = useState(createPlaybackClock);
 	const [duration, setDuration] = useState(0);
 	const [sessionShowCursorOverride, setSessionShowCursorOverride] = useState<boolean | null>(
 		null,
@@ -106,8 +107,7 @@ export function useEditorUiState(
 		appPlatform,
 		isPlaying,
 		setIsPlaying,
-		currentTime,
-		setCurrentTime,
+		playbackClock,
 		duration,
 		setDuration,
 		sessionShowCursorOverride,

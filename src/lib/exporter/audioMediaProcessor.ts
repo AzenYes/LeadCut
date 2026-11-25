@@ -1,9 +1,124 @@
 import { WebDemuxer } from "web-demuxer";
 import { AudioTimelineProcessor } from "./audioTimelineProcessor";
-import { DECODE_BACKPRESSURE_LIMIT, OFFLINE_AUDIO_SAMPLE_RATE } from "./audioProcessorShared";
+import { DECODE_BACKPRESSURE_LIMIT, OFFLINE_AUDIO_SAMPLE_RATE, type OfflineAudioInput } from "./audioProcessorShared";
+import { MAX_EXPORT_SOURCE_PCM_WINDOW_BYTES } from "./editedAudioWav";
 import { getLocalFilePath, resolveMediaElementSource } from "./localMediaSource";
 
 export class AudioMediaProcessor extends AudioTimelineProcessor {
+	private readonly offlineSourcePaths = new Set<string>();
+	private readonly offlineSourceAbort = new AbortController();
+	private offlinePcmReader?: Promise<string>;
+
+	constructor(private readonly useMemoryPcmWindows = false) {
+		super();
+	}
+
+	override cancel() {
+		super.cancel();
+		this.offlineSourceAbort.abort();
+		if (typeof window !== "undefined") {
+			void window.electronAPI?.cancelExportAudioPcm?.().catch(() => undefined);
+		}
+	}
+
+	protected async releaseOfflineAudioSources() {
+		const paths = [...this.offlineSourcePaths];
+		this.offlineSourcePaths.clear();
+		const reader = this.offlinePcmReader;
+		this.offlinePcmReader = undefined;
+		const pending: Promise<unknown>[] = paths.map(path => window.electronAPI.discardExportedTemp(path));
+		if (reader) pending.push(reader.then(id => window.electronAPI.closeExportAudioPcmReader?.(id)));
+		await Promise.allSettled(pending);
+	}
+
+	protected async loadOfflineAudioInput(
+		url: string,
+		windowBounds?: { startSec: number; endSec: number },
+	): Promise<OfflineAudioInput | null> {
+		const localPath = getLocalFilePath(url);
+		const bridge = typeof window === "undefined" ? null : window.electronAPI;
+		const readSourceWindow = this.useMemoryPcmWindows ? bridge?.readExportAudioPcmWindow : undefined;
+		const staged = localPath ? await (readSourceWindow
+			? bridge?.prepareExportAudioPcm?.(localPath, windowBounds, true)
+			: bridge?.prepareExportAudioPcm?.(localPath, windowBounds)) : null;
+		if (!staged) return this.cancelled ? null : this.decodeAudioFromUrl(url);
+		const { frames, channels, sampleRate, firstFrame: stagedFirstFrame = 0 } = staged;
+		if ("path" in staged) this.offlineSourcePaths.add(staged.path);
+		if (this.cancelled) return null;
+		const bytesPerFrame = 2 * channels;
+		const signal = this.offlineSourceAbort.signal;
+		const acquirePcmReader = () => {
+			if (bridge?.openExportAudioPcmReader && bridge.closeExportAudioPcmReader) {
+				this.offlinePcmReader ??= bridge.openExportAudioPcmReader();
+				return this.offlinePcmReader;
+			}
+		};
+		return {
+			duration: staged.sourceDurationSec ?? frames / sampleRate,
+			numberOfChannels: channels,
+			async readWindow(context, startSec, durationSec, paddingSec = 0) {
+				const firstFrame = Math.max(stagedFirstFrame, Math.floor((startSec - paddingSec) * sampleRate));
+				const requestedEndFrame = Math.ceil((startSec + durationSec + paddingSec) * sampleRate);
+				// A decoder may emit codec padding beyond the container's declared duration.
+				const endFrame = "memoryWindows" in staged ? requestedEndFrame : Math.min(stagedFirstFrame + frames, requestedEndFrame);
+				const frameCount = endFrame - firstFrame;
+				if (frameCount <= 0) throw new Error("Edited audio range is outside the staged source.");
+				const firstByte = (firstFrame - stagedFirstFrame) * bytesPerFrame;
+				const endByte = (endFrame - stagedFirstFrame) * bytesPerFrame;
+				const parts: Uint8Array[] = [];
+				if ("memoryWindows" in staged) {
+					if (!localPath || !readSourceWindow) throw new Error("The export PCM range reader is unavailable.");
+					signal.throwIfAborted();
+					const reader = acquirePcmReader();
+					const readerId = reader ? await reader : undefined;
+					const framesPerRead = Math.floor(MAX_EXPORT_SOURCE_PCM_WINDOW_BYTES / bytesPerFrame);
+					for (let from = firstFrame; from < endFrame;) {
+						signal.throwIfAborted();
+						const to = Math.min(from + framesPerRead, endFrame);
+						const range = { firstFrame: from, endFrame: to, channels, sampleRate };
+						const bytes = await (readerId ? readSourceWindow(localPath, range, readerId) : readSourceWindow(localPath, range));
+						if (bytes.byteLength > (to - from) * bytesPerFrame || bytes.byteLength % bytesPerFrame) {
+							throw new Error("Invalid PCM range from the native decoder.");
+						}
+						parts.push(bytes);
+						if (bytes.byteLength < (to - from) * bytesPerFrame) break;
+						from = to;
+					}
+				} else if ("pcm" in staged) {
+					parts.push(staged.pcm.subarray(firstByte, endByte));
+				} else {
+					const response = await fetch(staged.url, {
+						headers: { Range: `bytes=${firstByte}-${endByte - 1}` },
+						signal,
+					});
+					if (response.status !== 206) {
+						await response.body?.cancel();
+						throw new Error("Could not stream the edited audio source.");
+					}
+					parts.push(new Uint8Array(await response.arrayBuffer()));
+				}
+				const availableFrames = parts.reduce((sum, bytes) => sum + bytes.byteLength / bytesPerFrame, 0);
+				if (availableFrames === 0 || (!("memoryWindows" in staged) && availableFrames !== frameCount)) {
+					throw new Error("Incomplete audio source range.");
+				}
+				const buffer = context.createBuffer(channels, availableFrames, sampleRate);
+				let offset = 0;
+				for (const bytes of parts) {
+					const samples = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+					const framesInPart = bytes.byteLength / bytesPerFrame;
+					for (let channel = 0; channel < channels; channel++) {
+						const output = buffer.getChannelData(channel);
+						for (let frame = 0; frame < framesInPart; frame++) {
+							output[offset + frame] = samples.getInt16(frame * bytesPerFrame + channel * 2, true) / 32768;
+						}
+					}
+					offset += framesInPart;
+				}
+				return { buffer, offsetSec: Math.max(0, startSec - firstFrame / sampleRate) };
+			},
+		};
+	}
+
 	protected async decodeAudioFromUrl(url: string): Promise<AudioBuffer | null> {
 		const localPath = getLocalFilePath(url);
 		const bridge = window.electronAPI;

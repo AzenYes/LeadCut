@@ -15,6 +15,7 @@ import {
 	windowsNativeCaptureActive,
 } from "../state";
 import { validateRecordedVideo } from "./diagnostics";
+import { convertBrowserMicrophone, getBrowserMicrophonePartial } from "./browserMicrophone";
 import { finalizeStoredVideo } from "./mac";
 import {
 	type RecordingJournal,
@@ -47,6 +48,7 @@ function validateCapturePaths(recording: RecordingJournal) {
 	const allowedTemporaryStems = ["recordly-native", "leadcut-native"].map((prefix) =>
 		path.join(temporaryDirectory, `${prefix}-${startedAt}`),
 	);
+	allowedTemporaryStems.push(path.join(path.dirname(finalVideoPath), `.leadcut-native-${startedAt}`));
 	const validTemporary = (file: string, extension: string) =>
 		allowedTemporaryStems.some((stem) => file === `${stem}.${extension}`);
 	if (
@@ -118,6 +120,19 @@ export function recoverInterruptedRecording(startedAt?: number) {
 					console.warn("Could not repair interrupted WAV:", audioPath, error);
 				}
 			}
+			const browserMic = recording.browserMicrophone;
+			const browserMicPartial = getBrowserMicrophonePartial(videoPath);
+			if (browserMic && await findCaptureFile(browserMicPartial)) {
+				const destination = videoPath.replace(/\.mp4$/, ".mic.wav");
+				try {
+					await convertBrowserMicrophone(browserMicPartial, destination, browserMic.profile);
+					await fs.writeFile(`${destination}.json`, JSON.stringify({ startDelayMs: browserMic.startDelayMs }));
+					audioPaths.push(destination);
+					await fs.rm(browserMicPartial, { force: true });
+				} catch (error) {
+					console.warn("Could not recover the browser microphone track:", error);
+				}
+			}
 			await prepareSeekableMedia(videoPath, { replaceOriginal: true });
 			if (recording.cursorJournalPath) {
 				const samples = await rebuildCursorTelemetryFromJournal(
@@ -143,9 +158,10 @@ export function recoverInterruptedRecording(startedAt?: number) {
 	});
 }
 
-export function discardInterruptedRecording(startedAt: number) {
+export function discardInterruptedRecording(startedAt: number, stoppedProcess?: typeof windowsCaptureProcess) {
 	return enqueueRecovery(async () => {
-		const recording = await getRecoverableRecording();
+		const confirmingStoppedCapture = Boolean(stoppedProcess && stoppedProcess === windowsCaptureProcess && windowsCaptureStopRequested);
+		const recording = confirmingStoppedCapture ? await findInterruptedRecording() : await getRecoverableRecording();
 		if (!recording || recording.startedAt !== startedAt) return { success: false };
 		try {
 			validateCapturePaths(recording);
@@ -158,6 +174,7 @@ export function discardInterruptedRecording(startedAt: number) {
 			});
 			for (const file of [
 				...audioFiles,
+				recording.browserMicrophone ? getBrowserMicrophonePartial(finalVideoPath) : undefined,
 				cursorJournalPath,
 				keyJournalPath,
 				getTelemetryPathForVideo(tempVideoPath),

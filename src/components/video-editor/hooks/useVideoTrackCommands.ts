@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useI18n } from "@/contexts/I18nContext";
 import { toast } from "@/components/ui/toast";
 import { getRenderableVideoUrl } from "@/lib/assetPath";
@@ -6,13 +6,11 @@ import type { useTimelineState } from "../state/useTimelineState";
 import type { useAppearanceState } from "../state/useAppearanceState";
 import { createWebcamVideoRegions, DEFAULT_WEBCAM_TRACK_ID, splitVideoRegion, trimVideoRegion, type VideoRegion, type VideoTrack } from "../videoTracks";
 
-type Input = { timeline: ReturnType<typeof useTimelineState>; appearance: ReturnType<typeof useAppearanceState>; sourceDuration: number; currentTime: number };
+type Input = { timeline: ReturnType<typeof useTimelineState>; appearance: ReturnType<typeof useAppearanceState>; sourceDuration: number; getCurrentTime: () => number };
 
-export function useVideoTrackCommands({ timeline, appearance, sourceDuration, currentTime }: Input) {
+export function useVideoTrackCommands({ timeline, appearance, sourceDuration, getCurrentTime }: Input) {
 	const { t } = useI18n();
 	const [importing, setImporting] = useState(false);
-	const currentTimeRef = useRef(currentTime);
-	currentTimeRef.current = currentTime;
 	useEffect(() => {
 		const sourcePath = appearance.webcam.sourcePath;
 		if (!sourcePath || sourceDuration <= 0 || timeline.clipRegions.length === 0 || timeline.videoTracks.some((track) => track.kind === "webcam")) return;
@@ -34,7 +32,7 @@ export function useVideoTrackCommands({ timeline, appearance, sourceDuration, cu
 	}, [timeline.setSelectedVideoId, timeline.setSelectedRegionIds, timeline.setSelectedClipId, timeline.setSelectedZoomId, timeline.setSelectedAudioId, timeline.setSelectedAnnotationId, timeline.setSelectedCaptionId]);
 	const importVideo = useCallback(async (targetTrackId?: string) => {
 		if (importing) return;
-		const startMs = Math.max(0, Math.round(currentTimeRef.current * 1000));
+		const startMs = Math.max(0, Math.round(getCurrentTime() * 1000));
 		setImporting(true);
 		try {
 			const picked = await window.electronAPI.openVideoFilePicker();
@@ -61,7 +59,7 @@ export function useVideoTrackCommands({ timeline, appearance, sourceDuration, cu
 			select(region.id);
 		} catch (error) { toast.error(String(error instanceof Error ? error.message : error)); }
 		finally { setImporting(false); }
-	}, [importing, addTrack, timeline.videoTracks, timeline.videoRegions, timeline.setVideoRegions, select, t]);
+	}, [getCurrentTime, importing, addTrack, timeline.videoTracks, timeline.videoRegions, timeline.setVideoRegions, select, t]);
 	const changeSpan = useCallback((id: string, span: { start: number; end: number }, trackId?: string) => {
 		timeline.setVideoRegions((current) => current.map((region) => {
 			if (region.id !== id || timeline.videoTracks.find((track) => track.id === region.trackId)?.locked || timeline.videoTracks.find((track) => track.id === trackId)?.locked) return region;

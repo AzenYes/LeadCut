@@ -28,6 +28,12 @@ describe("exportTuning", () => {
 		expect(getWebCodecsKeyFrameInterval(60, "quality")).toBe(150);
 	});
 
+	it.each(["ffmpeg", "webcodecs"] as const)("caps the %s 4K encode backlog by frame size", (encodeBackend) => {
+		const profile = getExportBackpressureProfile({ encodeBackend, width: 3840, height: 2160, frameRate: 60 });
+		expect(profile.maxEncodeQueue).toBe(2);
+		expect(profile.maxPendingFrames).toBe(4);
+	});
+
 	it("uses shallower decode buffers for Breeze than for WebCodecs", () => {
 		const webCodecsProfile = getExportBackpressureProfile({
 			encodeBackend: "webcodecs",
@@ -77,7 +83,7 @@ describe("exportTuning", () => {
 		expect(breezeLowCoreProfile.maxInFlightNativeWrites).toBe(2);
 
 		expect(breezeHeavyProfile.name).toBe("breeze-conservative");
-		expect(breezeHeavyProfile.maxDecodeQueue).toBe(8);
-		expect(breezeHeavyProfile.maxPendingFrames).toBe(16);
+		expect(breezeHeavyProfile.maxDecodeQueue).toBe(3);
+		expect(breezeHeavyProfile.maxPendingFrames).toBe(4);
 	});
 });

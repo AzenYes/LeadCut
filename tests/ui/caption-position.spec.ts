@@ -62,6 +62,29 @@ test("drags captions vertically, commits once, and keeps inline editing", async 
 	await expect.poll(async () => Math.abs(Number(await html.getAttribute("data-horizontal-offset")) - 60 / frame.width * 100))
 		.toBeLessThan(1);
 	expect(Math.abs((await caption.boundingBox())!.x - before.x - 60)).toBeLessThan(3);
-	await caption.dblclick();
-	await expect(page.getByRole("textbox", { name: "Edit current caption", exact: true })).toBeFocused();
+	const editBox = (await caption.boundingBox())!;
+	const restoreFrames = await page.evaluateHandle(() => {
+		const request = window.requestAnimationFrame;
+		const held: FrameRequestCallback[] = [];
+		window.requestAnimationFrame = callback => -held.push(callback);
+		return () => {
+			window.requestAnimationFrame = request;
+			for (const callback of held) request.call(window, callback);
+		};
+	});
+	const input = page.getByRole("textbox", { name: "Edit current caption", exact: true });
+	try {
+		await page.mouse.dblclick(editBox.x + editBox.width / 2, editBox.y + editBox.height / 2);
+		await expect(input).toBeFocused();
+		await page.keyboard.press("ControlOrMeta+a");
+		await page.keyboard.insertText("Edit before the next frame");
+		await expect(input).toHaveValue("Edit before the next frame");
+	} finally {
+		await restoreFrames.evaluate(restore => restore());
+		await restoreFrames.dispose();
+	}
+	await input.press("Tab");
+	await expect(caption).toHaveText("Edit before the next frame");
+	await page.getByRole("button", { name: "Undo", exact: true }).click();
+	await expect(caption).toHaveText("Move this caption");
 });

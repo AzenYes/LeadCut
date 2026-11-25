@@ -8,6 +8,7 @@ interface SliderControlProps {
 	max: number;
 	step: number;
 	onChange: (value: number) => void;
+	onCommit?: (value: number) => void;
 	formatValue: (value: number) => string;
 	valueInput?: ReactNode;
 }
@@ -19,6 +20,7 @@ export const SliderControl = memo(function SliderControl({
 	max,
 	step,
 	onChange,
+	onCommit,
 	formatValue,
 	valueInput,
 }: SliderControlProps) {
@@ -30,6 +32,7 @@ export const SliderControl = memo(function SliderControl({
 			maxValue={max}
 			step={step}
 			onChange={(value) => onChange(Number(value))}
+			onChangeEnd={onCommit && ((value) => onCommit(Number(value)))}
 			className="my-1 w-full gap-y-2"
 		>
 			<Label className="text-xs">{label}</Label>

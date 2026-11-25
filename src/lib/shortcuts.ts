@@ -44,26 +44,29 @@ export interface ShortcutBinding {
 export type ShortcutsConfig = Record<ShortcutAction, ShortcutBinding>;
 
 export interface FixedShortcut {
+	action: "nextAnnotation" | "previousAnnotation" | "deleteSelection" | "panTimeline" | "zoomTimeline" | "selectAllZooms";
 	label: string;
 	display: string;
 	bindings: ShortcutBinding[];
 }
 
 export const FIXED_SHORTCUTS: FixedShortcut[] = [
-	{ get label() { return uiText("cycleAnnotationsForward"); }, display: "Tab", bindings: [{ key: "tab" }] },
+	{ action: "nextAnnotation", get label() { return uiText("cycleAnnotationsForward"); }, display: "Tab", bindings: [{ key: "tab" }] },
 	{
+		action: "previousAnnotation",
 		get label() { return uiText("cycleAnnotationsBackward"); },
 		display: "Shift + Tab",
 		bindings: [{ key: "tab", shift: true }],
 	},
 	{
+		action: "deleteSelection",
 		get label() { return uiText("deleteSelectedAlt"); },
 		display: "Del / ⌫",
 		bindings: [{ key: "delete" }, { key: "backspace" }],
 	},
-	{ get label() { return uiText("panTimeline"); }, get display() { return uiText("shiftScroll"); }, bindings: [] },
-	{ get label() { return uiText("zoomTimeline"); }, get display() { return uiText("ctrlScroll"); }, bindings: [] },
-	{ get label() { return uiText("selectAll"); }, display: "Ctrl + A", bindings: [{ key: "a", ctrl: true }] },
+	{ action: "panTimeline", get label() { return uiText("panTimeline"); }, get display() { return uiText("shiftScroll"); }, bindings: [] },
+	{ action: "zoomTimeline", get label() { return uiText("zoomTimeline"); }, get display() { return uiText("ctrlScroll"); }, bindings: [] },
+	{ action: "selectAllZooms", get label() { return uiText("selectAll"); }, display: "Ctrl + A", bindings: [{ key: "a", ctrl: true }] },
 ];
 
 export type ShortcutConflict =

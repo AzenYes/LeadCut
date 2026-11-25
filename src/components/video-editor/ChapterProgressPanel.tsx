@@ -5,8 +5,8 @@ import { CaptionFontPicker } from "./CaptionFontPicker";
 import { chapterProgressStatus, chapterSequenceDuration, confirmChapterProgress, normalizeChapterStyle, validateChapters, type ChapterProgress, type ChapterSequence, type ChapterStyle } from "./chapterProgress";
 import { formatTimelineTimecode, parseTimelineTimecode } from "./timeline/core/time";
 
-export function ChapterProgressPanel({ value, onChange, sequence, currentTimeMs, onSeek }: {
- value:ChapterProgress;onChange:(value:ChapterProgress)=>void;sequence:ChapterSequence;currentTimeMs:number;onSeek:(seconds:number)=>void;
+export function ChapterProgressPanel({ value, onChange, sequence, getCurrentTime, onSeek }: {
+ value:ChapterProgress;onChange:(value:ChapterProgress)=>void;sequence:ChapterSequence;getCurrentTime:()=>number;onSeek:(seconds:number)=>void;
 }) {
  const {t}=useI18n();const [message,setMessage]=useState('');
  const updateStyle = (patch: Partial<ChapterStyle>) => {
@@ -19,6 +19,7 @@ export function ChapterProgressPanel({ value, onChange, sequence, currentTimeMs,
   if(!durationMs)return;
   const title=t('editor.chapters.chapter','Chapter')+` ${value.chapters.length+1}`;
   if(!value.chapters.length){draft([{id:crypto.randomUUID(),title,startMs:0,endMs:durationMs}]);return;}
+  const currentTimeMs = getCurrentTime() * 1000;
   const index=value.chapters.findIndex(c=>currentTimeMs>c.startMs&&currentTimeMs<c.endMs);
   if(index<0){setMessage(t('editor.chapters.seekToSplit','Move the playhead inside a chapter to add a boundary.'));return;}
   const atMs=Math.round(currentTimeMs),current=value.chapters[index];draft(value.chapters.flatMap((c,i)=>i===index?[{...c,endMs:atMs},{id:crypto.randomUUID(),title,startMs:atMs,endMs:current.endMs}]:[c]));

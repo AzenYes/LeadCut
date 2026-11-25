@@ -8,9 +8,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const expectedTools = [
 	"add_zoom", "confirm_chapters", "copy_project", "cut_ranges", "delete_captions", "delete_zooms",
-	"detect_silence", "export_project", "get_key_events", "get_media_info", "get_paths", "get_recording_markers", "get_transcript", "list_captions",
-	"list_chapters", "list_change_log", "list_projects", "list_zooms", "open_project", "scan_frames",
-	"set_captions", "set_chapters", "set_transcript", "transcribe_audio", "update_caption", "update_caption_settings",
+	"detect_silence", "export_project", "get_capabilities", "get_captions", "get_clips", "get_key_events", "get_media_info", "get_paths", "get_recording_markers", "get_revision", "get_transcript", "list_captions",
+	"list_backups", "list_chapters", "list_change_log", "list_projects", "list_zooms", "open_project", "restore_backup", "scan_frames",
+	"set_captions", "set_chapters", "set_transcript", "transcribe_audio", "update_caption", "update_caption_settings", "update_captions",
 	"update_chapter_style", "update_zoom",
 ];
 let client;
@@ -43,6 +43,45 @@ test("advertises exactly the documented tools and the desktop silence defaults",
 	const { minDurationSec, noiseDb } = tools.find(tool => tool.name === "detect_silence").inputSchema.properties;
 	assert.equal(minDurationSec.default, 0.5);
 	assert.equal(noiseDb.default, -30);
+});
+
+test("summarizes large projects, edits captions atomically, and restores a retained backup", async () => {
+	const file = path.join(temp, "batch.leadcut");
+	const cues = Array.from({ length: 50 }, (_, index) => ({
+		id: `cue-${index}`, startMs: index * 100, endMs: (index + 1) * 100, text: "Before",
+	}));
+	const thumbnailPng = `data:image/png;base64,${"A".repeat(300_000)}`;
+	const project = {
+		version: 2, videoPath: "example.mp4", thumbnailPng,
+		editor: { clipRegions: [{ id: "clip", startMs: 0, endMs: 5000, sourceStartMs: 0 }], autoCaptions: cues },
+	};
+	const original = JSON.stringify(project);
+	await fs.writeFile(file, original);
+	const summary = await call("open_project", { project: file });
+	assert.equal(summary.durationMs, 5000);
+	assert.equal(summary.counts.autoCaptions, 50);
+	assert.ok(Buffer.byteLength(JSON.stringify(summary)) < 20_000);
+	assert.ok(!JSON.stringify(summary).includes("data:image"));
+	const page = await call("get_captions", { project: file, offset: 10, limit: 3 });
+	assert.deepEqual(page.cues.map(cue => cue.id), ["cue-10", "cue-11", "cue-12"]);
+	const args = {
+		project: file, timelineModel: "leadcut-sequence-v1", expectedRevision: summary.revision,
+		updates: cues.map(cue => ({ captionId: cue.id, text: "After" })),
+	};
+	const planned = await call("update_captions", args);
+	assert.equal(planned.diff.length, 50);
+	assert.equal(await fs.readFile(file, "utf8"), original);
+	const saved = await call("update_captions", { ...args, dryRun: false });
+	assert.equal(saved.diff.length, 50);
+	assert.equal(await fs.readFile(`${file}.bak`, "utf8"), original);
+	assert.ok(!(await fs.readFile(saved.backupPath, "utf8")).includes("data:image"));
+	const conflict = await client.callTool({ name: "update_captions", arguments: { ...args, dryRun: false } });
+	assert.equal(conflict.isError, true);
+	assert.equal(JSON.parse(conflict.content[0].text).currentRevision, saved.revision);
+	const { backups } = await call("list_backups", { project: file });
+	assert.equal(backups.length, 1);
+	await call("restore_backup", { project: file, backupId: backups[0].id, expectedRevision: saved.revision, dryRun: false });
+	assert.deepEqual(JSON.parse(await fs.readFile(file, "utf8")), project);
 });
 
 test("reads keyboard events from the source sidecar and returns an empty list when absent", async () => {

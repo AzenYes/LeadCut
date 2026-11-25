@@ -14,7 +14,7 @@ import { runSmokeExport } from "./smoke-leadcut-export.mjs";
 
 const clipSelector = '[data-timeline-item][data-variant="clip"]';
 const timelineSelector = '[data-testid="timeline-scroll"]';
-const reportingRoot = path.join(repoRoot, ".code", "benchmarks");
+const reportingRoot = path.join(repoRoot, "docs", "benchmarks");
 const executablePath = process.env.LEADCUT_BENCH_EXE || electron;
 const builtApp = !process.env.LEADCUT_BENCH_EXE;
 const environmentTimeoutMs = Number(process.env.LEADCUT_SMOKE_EXPORT_TIMEOUT_MS);
@@ -29,14 +29,28 @@ function sampleFrameIntervals({ durationMs, scrollAndZoom, timelineSelector }) {
 			return;
 		}
 		const startedAt = performance.now();
+		const video = scrollAndZoom ? null : [...document.querySelectorAll("video")].find(node => !node.paused);
+		const mediaStartedAt = video?.currentTime ?? 0;
+		const initialQuality = video?.getVideoPlaybackQuality();
+		let presentedFrames = 0;
+		let frameCallbackId;
+		if (video?.requestVideoFrameCallback) {
+			const record = (_now, metadata) => {
+				firstPresentedFrame ??= metadata.presentedFrames - 1;
+				presentedFrames = metadata.presentedFrames - firstPresentedFrame;
+				frameCallbackId = video.requestVideoFrameCallback(record);
+			};
+			let firstPresentedFrame;
+			frameCallbackId = video.requestVideoFrameCallback(record);
+		}
 		let previous = startedAt;
 		let lastScroll = startedAt;
 		let scrollCount = 0;
 		let frames = 0;
-		let drops = 0;
+		let longAnimationIntervals = 0;
 		function step(now) {
 			frames++;
-			if (now - previous > 50) drops++;
+			if (now - previous > 50) longAnimationIntervals++;
 			previous = now;
 			if (timeline && now - lastScroll >= 100) {
 				const direction = scrollCount % 4 < 2 ? 1 : -1;
@@ -54,9 +68,17 @@ function sampleFrameIntervals({ durationMs, scrollAndZoom, timelineSelector }) {
 				scrollCount++;
 				lastScroll = now;
 			}
-			if (now - startedAt >= durationMs)
-				resolve({ drops, frames, elapsedMs: now - startedAt });
-			else requestAnimationFrame(step);
+			if (now - startedAt >= durationMs) {
+				if (frameCallbackId !== undefined) video?.cancelVideoFrameCallback(frameCallbackId);
+				const quality = video?.getVideoPlaybackQuality();
+				resolve({
+					elapsedMs: now - startedAt,
+					frames, longAnimationIntervals, presentedFrames,
+					videoFrames: quality && initialQuality ? quality.totalVideoFrames - initialQuality.totalVideoFrames : 0,
+					videoDrops: quality && initialQuality ? quality.droppedVideoFrames - initialQuality.droppedVideoFrames : 0,
+					mediaElapsedMs: video ? (video.currentTime - mediaStartedAt) * 1000 : 0,
+				});
+			} else requestAnimationFrame(step);
 		}
 		requestAnimationFrame(step);
 	});
@@ -202,17 +224,15 @@ async function measureEditor(fixture, work) {
 			.catch(() => "");
 
 		await page.getByRole("button", { name: "Play", exact: true }).click();
+		await page.waitForFunction(() => [...document.querySelectorAll("video")].some(video => !video.paused));
 		const playback = await page.evaluate(sampleFrameIntervals, {
 			durationMs: 30000,
 			scrollAndZoom: false,
 			timelineSelector,
 		});
 		const pause = page.getByRole("button", { name: "Pause", exact: true });
-		if (await pause.isVisible()) {
-			// Use the transport's keyboard action while the playing preview is still updating.
-			await pause.press("Space");
-			await page.getByRole("button", { name: "Play", exact: true }).waitFor();
-		}
+		await pause.evaluateAll(buttons => { if (buttons[0] instanceof HTMLButtonElement) buttons[0].click(); });
+		await page.waitForFunction(() => [...document.querySelectorAll("video")].every(video => video.paused));
 
 		const timecode = page.getByRole("textbox", { name: "Timeline timecode" });
 		await timecode.fill("00:00:03.000");
@@ -242,7 +262,10 @@ async function measureEditor(fixture, work) {
 			openToPlayableMs,
 			waveformVisibleMs,
 			peakMemoryMb,
-			droppedFrameRatio: playback.drops / playback.frames,
+			droppedFrameRatio: playback.videoFrames > 0 ? playback.videoDrops / playback.videoFrames : null,
+			presentedFrames: playback.presentedFrames,
+			longAnimationIntervalRatio: playback.longAnimationIntervals / playback.frames,
+			playbackSpeedX: playback.mediaElapsedMs / playback.elapsedMs,
 			splitMs,
 			rippleDeleteMs,
 			scrollFps: scroll.frames / (scroll.elapsedMs / 1000),
@@ -270,17 +293,29 @@ async function measureExport(fixture, work) {
 		timeoutMs,
 		quality: "source",
 		fps: fixture.frameRate,
+		backend: "auto",
+		renderBackend: "",
 	});
 	return {
 		exportSpeedX: report.metrics?.frameCount / fixture.frameRate / (report.elapsedMs / 1000),
 		encoderName: report.metrics?.encoderName,
+		encodeBackend: report.metrics?.encodeBackend ?? "unknown",
+		exportRouteChanges: report.metrics?.routeChanges,
+		exportStages: {
+			renderSubmissionMs: report.metrics?.renderFrameMs,
+			framePreparationMs: report.metrics?.framePreparationMs,
+			encoderQueueWaitMs: report.metrics?.encodeWaitMs,
+			gpuRenderCompletionMs: report.metrics?.gpuRenderCompletionMs,
+			frameEncodeLatencyMs: report.metrics?.frameEncodeLatencyMs,
+		},
 	};
 }
 
 function assertMeasurements(run) {
 	for (const [name, value] of Object.entries(run)) {
-		if (name === "fixture" || name === "encoderName") continue;
-		if (!Number.isFinite(value) || (name !== "droppedFrameRatio" && value <= 0)) {
+		if (["fixture", "encoderName", "encodeBackend", "exportRouteChanges", "exportStages"].includes(name)) continue;
+		if (name === "droppedFrameRatio" && value === null) continue;
+		if (!Number.isFinite(value) || value < 0) {
 			throw new Error(`Invalid measurement for ${run.fixture}: ${name}=${value}`);
 		}
 	}
@@ -325,12 +360,15 @@ const markdownRows = runs.map((run) => [
 	run.openToPlayableMs.toFixed(0),
 	run.waveformVisibleMs.toFixed(0),
 	run.peakMemoryMb.toFixed(1),
-	`${(run.droppedFrameRatio * 100).toFixed(2)}%`,
+	run.droppedFrameRatio === null ? "—" : `${(run.droppedFrameRatio * 100).toFixed(2)}%`,
+	run.presentedFrames,
+	run.playbackSpeedX.toFixed(2),
 	run.splitMs.toFixed(1),
 	run.rippleDeleteMs.toFixed(1),
 	run.scrollFps.toFixed(1),
 	run.exportSpeedX.toFixed(2),
-	run.encoderName,
+	`${run.encodeBackend} / ${run.encoderName}`,
+	run.exportRouteChanges?.map(change => change.reason).join(", ") || "—",
 ]);
 await fs.writeFile(
 	markdownPath,
@@ -343,8 +381,8 @@ await fs.writeFile(
 		`- GPU ${machine.gpu}`,
 		`- 内存 ${machine.ram}`,
 		"",
-		"| 素材 | 可播放 ms | 波形 ms | 内存峰值 MiB | 掉帧率 | F2 ms | F3 ms | 滚动 FPS | 导出倍速 | 编码器 |",
-		"|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+		"| 素材 | 可播放 ms | 波形 ms | 内存峰值 MiB | 视频掉帧率 | 呈现帧数 | 播放倍速 | F2 ms | F3 ms | 滚动 FPS | 导出倍速 | 编码路由 | 回退原因 |",
+		"|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
 		...markdownRows.map((row) => `| ${row.join(" | ")} |`),
 		"",
 	].join("\n"),

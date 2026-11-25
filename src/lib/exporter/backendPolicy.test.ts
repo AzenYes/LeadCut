@@ -1,196 +1,96 @@
 import { describe, expect, it } from "vitest";
+import { normalizeLightningRuntimePlatform, planExportRoute } from "./backendPolicy";
 
-import {
-	getDefaultLightningRenderBackend,
-	normalizeLightningRuntimePlatform,
-	planLightningExportRoutes,
-	shouldPreferNativeAutoBackend,
-	shouldPreferNativeStaticLayoutBeforeBreeze,
-} from "./backendPolicy";
+const encoder = { scope: "encoder", platform: "win32", backendPreference: "auto" } as const;
+const staticLayout = {
+	scope: "static-layout", cudaSkipReason: null, d3d11SkipReason: null, gpuOnlyFeatures: [],
+} as const;
 
-describe("backendPolicy", () => {
-	it("normalizes common platform hints", () => {
-		expect(normalizeLightningRuntimePlatform("Win32")).toBe("win32");
-		expect(normalizeLightningRuntimePlatform("Linux x86_64")).toBe("linux");
-		expect(normalizeLightningRuntimePlatform("MacIntel")).toBe("darwin");
-		expect(normalizeLightningRuntimePlatform("unknown")).toBe("unknown");
+describe("planExportRoute", () => {
+	it.each([
+		["Win32", "win32"], ["Linux x86_64", "linux"], ["MacIntel", "darwin"], ["unknown", "unknown"],
+	])("normalizes %s to %s", (hint, platform) => {
+		expect(normalizeLightningRuntimePlatform(hint)).toBe(platform);
 	});
 
-	it("prefers native auto backend on desktop platforms with the fastest native path", () => {
-		expect(shouldPreferNativeAutoBackend("win32")).toBe(true);
-		expect(shouldPreferNativeAutoBackend("linux")).toBe(false);
-		expect(shouldPreferNativeAutoBackend("darwin")).toBe(true);
-		expect(shouldPreferNativeAutoBackend("unknown")).toBe(false);
-	});
-
-	it("keeps Lightning exports on the stable WebGL renderer by default", () => {
-		expect(getDefaultLightningRenderBackend()).toBe("webgl");
-	});
-
-	it("keeps Windows auto exports on the streaming route by default", () => {
-		expect(shouldPreferNativeStaticLayoutBeforeBreeze("win32", "auto")).toBe(false);
-		expect(shouldPreferNativeStaticLayoutBeforeBreeze("darwin", "auto")).toBe(false);
-
-		expect(
-			planLightningExportRoutes({
-				backendPreference: "auto",
-				platform: "win32",
-				nativeStaticLayoutAvailable: true,
-			}),
-		).toMatchObject({
-			selectedRoute: "breeze-stream",
-			decisions: [
-				{ route: "native-static-layout", status: "rejected" },
-				{ route: "breeze-stream", status: "selected" },
-				{ route: "webcodecs", status: "fallback" },
-			],
+	it.each(["win32", "darwin"] as const)("prefers Breeze streaming on %s auto exports", platform => {
+		expect(planExportRoute({ ...encoder, platform })).toMatchObject({
+			primary: "breeze-stream",
+			fallbacks: ["webcodecs"],
+			waitForMetadata: false,
 		});
 	});
 
-	it("ignores native static skip reasons for Windows auto routing", () => {
-		expect(
-			planLightningExportRoutes({
-				backendPreference: "auto",
-				platform: "win32",
-				nativeStaticLayoutAvailable: true,
-				nativeStaticLayoutSkipReasons: ["unsupported-caption-overlay"],
-			}),
-		).toEqual({
-			selectedRoute: "breeze-stream",
-			decisions: [
-				{
-					route: "native-static-layout",
-					status: "rejected",
-					reasons: ["platform-does-not-use-native-static-layout"],
-				},
-				{
-					route: "breeze-stream",
-					status: "selected",
-					reasons: ["platform-prefers-native-streaming"],
-				},
-				{
-					route: "webcodecs",
-					status: "fallback",
-					reasons: ["breeze-unavailable-fallback"],
-				},
-			],
+	it("waits for Windows source metadata when native mixed audio is available", () => {
+		expect(planExportRoute({ ...encoder, mixedAudioTransport: true })).toMatchObject({
+			primary: "breeze-stream", waitForMetadata: true,
+		});
+		expect(planExportRoute({ ...encoder, mixedAudioTransport: true, requiresFfmpegAudio: false })).toMatchObject({
+			primary: "breeze-stream", waitForMetadata: false,
 		});
 	});
 
-	it("documents the native static layout path when Breeze is selected explicitly", () => {
-		expect(
-			planLightningExportRoutes({
-				backendPreference: "breeze",
-				platform: "win32",
-				nativeStaticLayoutAvailable: true,
-			}),
-		).toEqual({
-			selectedRoute: "native-static-layout",
-			decisions: [
-				{
-					route: "native-static-layout",
-					status: "selected",
-					reasons: ["visually-compatible"],
-				},
-				{
-					route: "breeze-stream",
-					status: "fallback",
-					reasons: ["user-selected-breeze"],
-				},
-				{
-					route: "webcodecs",
-					status: "fallback",
-					reasons: ["breeze-unavailable-fallback"],
-				},
-			],
+	it("tries static layout first for Breeze or a CUDA opt-in", () => {
+		for (const plan of [
+			planExportRoute({ ...encoder, backendPreference: "breeze" }),
+			planExportRoute({ ...encoder, nvidiaCudaEnabled: true }),
+		]) {
+			expect(plan.primary).toBe("native-static-layout");
+			expect(plan.fallbacks).toEqual(["breeze-stream", "webcodecs"]);
+			expect(plan.waitForMetadata).toBe(true);
+		}
+		expect(planExportRoute({ ...encoder, backendPreference: "breeze", staticLayoutAttempted: true })).toMatchObject({
+			primary: "breeze-stream", reasons: { "native-static-layout": ["static-layout-already-attempted"] },
 		});
 	});
 
-	it("keeps explicit Breeze selected when native static layout is unavailable", () => {
-		expect(
-			planLightningExportRoutes({
-				backendPreference: "breeze",
-				platform: "win32",
-				nativeStaticLayoutAvailable: false,
-			}),
-		).toEqual({
-			selectedRoute: "breeze-stream",
-			decisions: [
-				{
-					route: "native-static-layout",
-					status: "rejected",
-					reasons: ["native-static-unavailable"],
-				},
-				{
-					route: "breeze-stream",
-					status: "selected",
-					reasons: ["user-selected-breeze"],
-				},
-				{
-					route: "webcodecs",
-					status: "fallback",
-					reasons: ["breeze-unavailable-fallback"],
-				},
-			],
+	it("honors WebCodecs when CUDA is enabled or Breeze must be retried", () => {
+		expect(planExportRoute({ ...encoder, backendPreference: "webcodecs", nvidiaCudaEnabled: true })).toMatchObject({
+			primary: "webcodecs", fallbacks: [], waitForMetadata: false, reasons: { webcodecs: ["explicit-webcodecs"] },
+		});
+		expect(planExportRoute({ ...encoder, backendPreference: "breeze", retryWithWebCodecs: "native-encoder" })).toMatchObject({
+			primary: "webcodecs", fallbacks: [], reasons: { webcodecs: ["retry-after:native-encoder"] },
 		});
 	});
 
-	it("records explicit Breeze native static layout skip reasons", () => {
-		expect(
-			planLightningExportRoutes({
-				backendPreference: "breeze",
-				platform: "win32",
-				nativeStaticLayoutAvailable: true,
-				nativeStaticLayoutSkipReasons: ["unsupported-audio-mix"],
-			}),
-		).toEqual({
-			selectedRoute: "breeze-stream",
-			decisions: [
-				{
-					route: "native-static-layout",
-					status: "rejected",
-					reasons: ["unsupported-audio-mix"],
-				},
-				{
-					route: "breeze-stream",
-					status: "selected",
-					reasons: ["user-selected-breeze"],
-				},
-				{
-					route: "webcodecs",
-					status: "fallback",
-					reasons: ["breeze-unavailable-fallback"],
-				},
-			],
+	it("resolves Linux native streaming after seeing whether audio needs FFmpeg", () => {
+		const linux = { ...encoder, platform: "linux", mixedAudioTransport: true } as const;
+		expect(planExportRoute(linux).waitForMetadata).toBe(true);
+		expect(planExportRoute({ ...linux, requiresFfmpegAudio: true })).toMatchObject({
+			primary: "breeze-stream", fallbacks: ["webcodecs"], waitForMetadata: false,
+		});
+		expect(planExportRoute({ ...linux, requiresFfmpegAudio: false })).toMatchObject({
+			primary: "webcodecs", fallbacks: [], waitForMetadata: false,
+		});
+		expect(planExportRoute({ ...linux, mixedAudioTransport: false })).toMatchObject({
+			primary: "webcodecs", fallbacks: ["breeze-stream"], preferBreezeToSoftware: true,
 		});
 	});
 
-	it("documents why macOS auto skips native static layout", () => {
-		expect(
-			planLightningExportRoutes({
-				backendPreference: "auto",
-				platform: "darwin",
-				nativeStaticLayoutAvailable: true,
-			}),
-		).toEqual({
-			selectedRoute: "breeze-stream",
-			decisions: [
-				{
-					route: "native-static-layout",
-					status: "rejected",
-					reasons: ["platform-does-not-use-native-static-layout"],
-				},
-				{
-					route: "breeze-stream",
-					status: "selected",
-					reasons: ["platform-prefers-native-streaming"],
-				},
-				{
-					route: "webcodecs",
-					status: "fallback",
-					reasons: ["breeze-unavailable-fallback"],
-				},
-			],
+	it("orders CUDA, D3D11 and FFmpeg when all three can render the layout", () => {
+		expect(planExportRoute({ ...staticLayout, gpuOnlyFeatures: [] })).toEqual({
+			primary: "nvidia-cuda-compositor",
+			fallbacks: ["windows-d3d11-compositor", "ffmpeg-static-layout"],
+			reasons: {
+				"nvidia-cuda-compositor": ["cuda-compositor-available"],
+				"windows-d3d11-compositor": ["d3d11-compositor-available"],
+				"ffmpeg-static-layout": ["ffmpeg-static-layout-available"],
+			},
+		});
+	});
+
+	it("excludes FFmpeg when GPU-dependent layers would disappear", () => {
+		const options = { ...staticLayout, cudaSkipReason: "env-disabled", gpuOnlyFeatures: ["cursor overlay"] };
+		expect(planExportRoute(options)).toMatchObject({
+			primary: "windows-d3d11-compositor",
+			fallbacks: [],
+			reasons: { "ffmpeg-static-layout": ["unsupported-layout:cursor overlay"] },
+		});
+		expect(planExportRoute({ ...options, d3d11SkipReason: "d3d11-helper-unavailable" })).toMatchObject({
+			primary: null, fallbacks: [],
+		});
+		expect(planExportRoute({ ...options, d3d11SkipReason: "d3d11-helper-unavailable", gpuOnlyFeatures: [] })).toMatchObject({
+			primary: "ffmpeg-static-layout", fallbacks: [],
 		});
 	});
 });

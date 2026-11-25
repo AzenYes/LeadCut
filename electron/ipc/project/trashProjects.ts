@@ -1,6 +1,7 @@
 import { uiText } from "../../uiI18n";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { agentBackupLinkPath } from "../../../services/leadcut-mcp/src/projectHistoryRetention";
 import { getProjectBackupPath } from "./atomicSave";
 import { editorLockPath } from "./editorLock";
 import { projectVersionPaths } from "./versionHistory";
@@ -34,6 +35,7 @@ export async function trashLibraryProjects(paths: unknown, deps: Dependencies) {
 				getProjectBackupPath(projectPath),
 				editorLockPath(projectPath),
 				...versions,
+				...versions.map(agentBackupLinkPath).filter(link => link !== null),
 			]) {
 				try {
 					await fs.access(sidecar);
