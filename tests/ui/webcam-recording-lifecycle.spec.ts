@@ -1,13 +1,17 @@
 import { expect, test } from "@playwright/test";
 import { installDesktopBridge, installDesktopBridgeOverrides } from "./bridge";
 
-for (const interruption of ["normal stop", "unexpected stop", "encoder error", "track ended"]) {
+for (const interruption of ["normal stop", "browser stop", "unexpected stop", "encoder error", "track ended"]) {
 	test(`webcam shares preview capture and preserves the video on ${interruption}`, async ({
 		page,
 	}) => {
 		await installDesktopBridge(page);
 		await installDesktopBridgeOverrides(page, (mode) => {
 			const success = async () => ({ success: true });
+			const browserCapture = mode === "browser stop";
+			const delayCamera = mode === "normal stop" || browserCapture;
+			const screenPath = "/custom-recordings/recording-2000.mp4";
+			const cameraPath = "/custom-recordings/recording-1999-webcam.mp4";
 			const cameraSaved = new Promise<void>(resolve => {
 				window.addEventListener("test-release-camera-file", () => resolve(), { once: true });
 			});
@@ -20,7 +24,7 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 					microphoneEnabled: false,
 					systemAudioEnabled: false,
 				}),
-				isNativeWindowsCaptureAvailable: async () => ({ available: true }),
+				isNativeWindowsCaptureAvailable: async () => ({ available: !browserCapture }),
 				startNativeScreenRecording: async () => {
 					document.documentElement.dataset.nativeStarted = "true";
 					return { success: true };
@@ -28,11 +32,18 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 				setRecordingState: success,
 				stopNativeScreenRecording: async () => {
 					document.documentElement.dataset.nativeStopped = "true";
-					return { success: true, path: "/recordings/screen.mp4" };
+					return { success: true, path: screenPath };
+				},
+				writeRecordingChunk: async () => {},
+				finishRecordingChunks: async () => {
+					document.documentElement.dataset.browserSaved = "true";
+					return { success: true, path: screenPath };
 				},
 				muxNativeWindowsRecording: success,
 				switchToEditor: async () => {
-					document.documentElement.dataset.editorOpened = "true";
+					const { dataset } = document.documentElement;
+					dataset.editorOpened = "true";
+					dataset.editorWebcam = dataset.sessionWebcam ?? "missing";
 					return { success: true };
 				},
 				hudOverlayClose: success,
@@ -40,12 +51,14 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 					const root = document.documentElement;
 					root.dataset.webcamSavedBytes = String(Number(root.dataset.webcamSavedBytes ?? 0) + data.byteLength);
 				},
-				finishWebcamFile: async (name: string) => {
-					if (mode === "normal stop") await cameraSaved;
-					return `/recordings/${name}`;
+				finishWebcamFile: async () => {
+					if (delayCamera) await cameraSaved;
+					return cameraPath;
 				},
-				setCurrentRecordingSession: async (session: { webcamPath?: string | null }, options?: { background?: string }) => {
-					if (options?.background === "camera") document.documentElement.dataset.sessionWebcam = session.webcamPath ?? "missing";
+				setCurrentRecordingSession: async (session: { videoPath: string; webcamPath?: string | null; timeOffsetMs?: number }, options?: { background?: string }) => {
+					if (!options?.background && session.videoPath === screenPath && Number.isFinite(session.timeOffsetMs)) {
+						document.documentElement.dataset.sessionWebcam = session.webcamPath ?? "missing";
+					}
 					return { success: true };
 				},
 			});
@@ -54,8 +67,10 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 			});
 			let cameraRequests = 0;
 			Object.defineProperty(navigator.mediaDevices, "getUserMedia", {
-				value: async () => {
-					document.documentElement.dataset.cameraRequests = String(++cameraRequests);
+				value: async (constraints: { video?: { mandatory?: { chromeMediaSource?: string } } }) => {
+					if (!constraints.video?.mandatory?.chromeMediaSource) {
+						document.documentElement.dataset.cameraRequests = String(++cameraRequests);
+					}
 					const canvas = document.createElement("canvas");
 					canvas.width = 320;
 					canvas.height = 180;
@@ -94,7 +109,8 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 		await expect(page.locator("html")).toHaveAttribute("data-camera-requests", "1");
 		// Accumulate actual encoded frames, then exercise both stop paths.
 		await page.waitForTimeout(1500);
-		if (interruption !== "normal stop") {
+		const delayedCamera = interruption === "normal stop" || interruption === "browser stop";
+		if (!delayedCamera) {
 			await page.evaluate(
 				(mode) =>
 					window.dispatchEvent(
@@ -118,15 +134,13 @@ for (const interruption of ["normal stop", "unexpected stop", "encoder error", "
 		} else {
 			await page.getByRole("button", { name: "Stop", exact: true }).click();
 		}
-		await expect(page.locator("html")).toHaveAttribute("data-native-stopped", "true");
-		await expect(page.locator("html")).toHaveAttribute("data-editor-opened", "true");
-		if (interruption === "normal stop") {
-			await expect(page.locator("html")).not.toHaveAttribute("data-session-webcam");
+		const screenSavedAttribute = interruption === "browser stop" ? "data-browser-saved" : "data-native-stopped";
+		await expect(page.locator("html")).toHaveAttribute(screenSavedAttribute, "true");
+		if (delayedCamera) {
+			await expect(page.locator("html")).not.toHaveAttribute("data-editor-opened");
 			await page.evaluate(() => window.dispatchEvent(new Event("test-release-camera-file")));
 		}
-		await expect
-			.poll(() => page.locator("html").getAttribute("data-session-webcam"))
-			.toMatch(/-webcam\.(mp4|webm)$/);
+		await expect(page.locator("html")).toHaveAttribute("data-editor-webcam", "/custom-recordings/recording-1999-webcam.mp4");
 		expect(
 			Number(await page.locator("html").getAttribute("data-webcam-saved-bytes")),
 		).toBeGreaterThan(1000);

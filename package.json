@@ -6,7 +6,7 @@
 	"license": "AGPL-3.0-only",
 	"upstream": "https://github.com/webadderallorg/Recordly",
 	"private": true,
-	"version": "0.1.3",
+	"version": "0.1.4",
 	"type": "module",
 	"scripts": {
 		"prebuild:waveform": "node scripts/prepare-leadcut-installer.mjs",

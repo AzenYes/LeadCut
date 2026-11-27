@@ -1042,22 +1042,6 @@ export function useScreenRecorder(openDeviceMenu?: "mic" | "webcam"): UseScreenR
 		return result ?? null;
 	}, []);
 
-	const linkFinishedWebcam = useCallback(async (videoPath: string, webcamPath: string | null) => {
-		if (!webcamPath) return;
-		try {
-			const result = await window.electronAPI.setCurrentRecordingSession({
-				videoPath,
-				webcamPath,
-				timeOffsetMs: webcamTimeOffsetMs.current,
-				hideOverlayCursorByDefault: hideEditorOverlayCursorByDefault.current,
-			}, { background: "camera" });
-			if (!result.success) throw new Error(uiText("recordingCameraSaveFailed"));
-		} catch (error) {
-			logError("webcam-save", error);
-			toast.warning(uiText("recordingCameraSaveFailed"));
-		}
-	}, [uiText]);
-
 	const warnWebcamUnavailable = useCallback((error?: unknown) => {
 		logError("webcam-unavailable", error);
 		setWebcamInterrupted(true);
@@ -1480,19 +1464,13 @@ export function useScreenRecorder(openDeviceMenu?: "mic" | "webcam"): UseScreenR
 				setFinalization({ stage: "preparing", savedPath: finalPath });
 				finishingRecordingAssets.current = true;
 				try {
-					await finalizeRecordingSession(finalPath, null);
-					const webcamReady = webcamPathPromise.then(webcamPath => linkFinishedWebcam(finalPath, webcamPath));
+					await finalizeRecordingSession(finalPath, await webcamPathPromise);
 					const microphoneReady = storeMicrophoneSidecar(micStreamPromise, finalPath, fallbackStartDelayMs, fallbackTrackSettings);
 					const muxReady = isNativeWindows ? window.electronAPI.muxNativeWindowsRecording(expectedDurationMs) : Promise.resolve(null);
-					const audioReady = Promise.allSettled([microphoneReady, muxReady]).then(async results => {
-						for (const result of results) {
-							if (result.status === "rejected") logError("recording-audio-finalize", result.reason);
-						}
-						await window.electronAPI.setCurrentRecordingSession({ videoPath: finalPath }, { background: "audio" });
-					});
-					for (const result of await Promise.allSettled([webcamReady, audioReady])) {
-						if (result.status === "rejected") logError("recording-stop", result.reason);
+					for (const result of await Promise.allSettled([microphoneReady, muxReady])) {
+						if (result.status === "rejected") logError("recording-audio-finalize", result.reason);
 					}
+					await window.electronAPI.setCurrentRecordingSession({ videoPath: finalPath }, { background: "audio" });
 					console.log(`[PERF:RENDERER] Background Stop Sequence: COMPLETED in ${(performance.now() - stopStart).toFixed(2)}ms`);
 				} catch (error) {
 					await notifyRecordingFinalizationFailure(getErrorMessage(error));
@@ -2337,9 +2315,8 @@ export function useScreenRecorder(openDeviceMenu?: "mic" | "webcam"): UseScreenR
 						const finalVideoPath = videoResult.path;
 						finishingRecordingAssets.current = true;
 						try {
-							await finalizeRecordingSession(finalVideoPath, null);
 							const webcamPath = await (pendingWebcamPathPromise.current ?? resolvedWebcamPath.current);
-							await linkFinishedWebcam(finalVideoPath, webcamPath);
+							await finalizeRecordingSession(finalVideoPath, webcamPath);
 						} finally {
 							finishingRecordingAssets.current = false;
 							window.electronAPI.hudOverlayClose?.();

@@ -1022,29 +1022,13 @@ export function registerProjectHandlers(takeStartupProject?: (senderId: number) 
 				timeOffsetMs?: number;
 				hideOverlayCursorByDefault?: boolean;
 			},
-			options?: { preserveProjectPath?: boolean; background?: "camera" | "audio" },
+			options?: { preserveProjectPath?: boolean; background?: "audio" },
 		) => {
 			const normalizedVideoPath =
 				normalizeVideoSourcePath(session.videoPath) ?? session.videoPath;
 			if (options?.background) {
-				if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) return { success: false };
-				if (options.background === "camera") {
-					const [videoPath, webcamPath] = await Promise.all([
-						resolveApprovedLocalMediaPath(normalizedVideoPath),
-						session.webcamPath ? resolveApprovedLocalMediaPath(session.webcamPath) : null,
-					]);
-					if (!videoPath || !webcamPath || path.dirname(videoPath) !== path.dirname(webcamPath) ||
-						!/^recording-\d+\.(mp4|webm)$/.test(path.basename(videoPath)) ||
-						!/^recording-\d+-webcam\.(mp4|webm)$/.test(path.basename(webcamPath))) return { success: false };
-					const completedSession = {
-						videoPath: normalizedVideoPath,
-						webcamPath,
-						timeOffsetMs: normalizeRecordingTimeOffsetMs(session.timeOffsetMs),
-						hideOverlayCursorByDefault: normalizeBoolean(session.hideOverlayCursorByDefault),
-					};
-					await persistRecordingSessionManifest(completedSession);
-					if (currentVideoPath !== normalizedVideoPath || currentProjectPath) return { success: true };
-					setCurrentRecordingSession(completedSession);
+				if (options.background !== "audio" || !event.senderFrame || event.senderFrame !== event.sender.mainFrame) {
+					return { success: false };
 				}
 				if (currentVideoPath === normalizedVideoPath && currentRecordingSession) {
 					for (const window of BrowserWindow.getAllWindows()) {

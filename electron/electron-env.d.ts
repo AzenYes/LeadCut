@@ -721,7 +721,7 @@ interface Window {
 			callback: (state: { recording: boolean; sourceName: string }) => void,
 		) => () => void;
 		onRecordingSessionChanged: (
-			callback: (session: RendererRecordingSessionData | null, background?: "camera" | "audio") => void,
+			callback: (session: RendererRecordingSessionData | null, background?: "audio") => void,
 		) => () => void;
 		onRecordingAudioLost?: (callback: (track: "mic" | "system") => void) => () => void;
 		onRecordingInterrupted: (
@@ -885,7 +885,7 @@ interface Window {
 				timeOffsetMs?: number;
 				hideOverlayCursorByDefault?: boolean;
 			},
-			options?: { preserveProjectPath?: boolean; background?: "camera" | "audio" },
+			options?: { preserveProjectPath?: boolean; background?: "audio" },
 		) => Promise<{ success: boolean }>;
 		getCurrentRecordingSession: () => Promise<{
 			success: boolean;

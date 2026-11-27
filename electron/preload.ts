@@ -976,15 +976,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
 			timeOffsetMs?: number;
 			hideOverlayCursorByDefault?: boolean;
 		},
-		options?: { preserveProjectPath?: boolean; background?: "camera" | "audio" },
+		options?: { preserveProjectPath?: boolean; background?: "audio" },
 	) => {
 		return ipcRenderer.invoke("set-current-recording-session", session, options);
 	},
-	onRecordingSessionChanged: (callback: (session: RecordingSessionData | null, background?: "camera" | "audio") => void) => {
+	onRecordingSessionChanged: (callback: (session: RecordingSessionData | null, background?: "audio") => void) => {
 		const listener = (
 			_event: Electron.IpcRendererEvent,
 			payload: RecordingSessionData | null,
-			background?: "camera" | "audio",
+			background?: "audio",
 		) => callback(payload, background);
 		ipcRenderer.on("recording-session-changed", listener);
 		return () => ipcRenderer.removeListener("recording-session-changed", listener);
