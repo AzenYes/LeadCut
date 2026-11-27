@@ -32,7 +32,7 @@ download https://codeload.github.com/FFmpeg/nv-codec-headers/tar.gz/refs/tags/n1
   2fefaa227d2a3b4170797796425a59d1dd2ed5fd231db9b4244468ba327acd0b nv-codec-headers.tar.gz nv-codec-headers
 download https://codeload.github.com/intel/libvpl/tar.gz/refs/tags/v2.10.2 \
   ad956ea7ecf14614325f59dfb44cc5ba08e2fcac373342d61c7db152ac651253 libvpl.tar.gz libvpl
-download https://www.zlib.net/fossils/zlib-1.3.1.tar.gz \
+download https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz \
   9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23 zlib.tar.gz zlib
 download https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz \
   686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5 dav1d.tar.xz dav1d

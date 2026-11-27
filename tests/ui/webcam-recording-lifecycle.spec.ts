@@ -34,7 +34,7 @@ for (const interruption of ["normal stop", "browser stop", "unexpected stop", "e
 					document.documentElement.dataset.nativeStopped = "true";
 					return { success: true, path: screenPath };
 				},
-				writeRecordingChunk: async () => {},
+				writeRecordingChunk: async () => undefined,
 				finishRecordingChunks: async () => {
 					document.documentElement.dataset.browserSaved = "true";
 					return { success: true, path: screenPath };

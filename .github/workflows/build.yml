@@ -10,6 +10,7 @@ on:
       - ".github/workflows/build.yml"
       - "electron/native/project-thumbnail/**"
       - "scripts/build-project-thumbnail.mjs"
+      - "scripts/build-windows-media-tools.sh"
 
 permissions:
   contents: read
